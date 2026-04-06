@@ -103,3 +103,6 @@ GEMINI.md
 # Mantle-compiled agent config (generated, do not commit)
 .agents/
 .pi/
+
+# Handoff docs (ephemeral agent notes — local only)
+handoffs/
