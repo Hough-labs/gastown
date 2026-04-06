@@ -99,3 +99,7 @@ docs/fork-info/
 
 # Gas Town (added by gt)
 GEMINI.md
+
+# Mantle-compiled agent config (generated, do not commit)
+.agents/
+.pi/
