@@ -1042,6 +1042,10 @@ func embeddedBeadsVersion() string {
 			if version := normalizeSemver(dep.Replace.Version); version != "" {
 				return version
 			}
+			// Local replace with no parseable version (e.g. "(devel)"):
+			// skip the original module version — it does not reflect
+			// what is actually linked into the binary.
+			return ""
 		}
 		return normalizeSemver(dep.Version)
 	}
