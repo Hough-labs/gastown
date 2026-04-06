@@ -1,4 +1,17 @@
 #!/bin/bash
+# Pre-push hook — two responsibilities:
+#
+# 1. On anvil branch: regenerate patches/ and fold into HEAD before pushing.
+#    Ensures patches/ always reflects the current divergence from upstream/main.
+#
+# 2. On all branches: enforce Gas Town branch policy and integration guardrails.
+#    (Upstream logic — do not remove.)
+
+# Note: patches/ is managed manually. Before pushing new commits from anvil, run:
+#   make patches && git add patches/ && git commit --amend --no-edit
+
+# ── Gas Town branch policy ────────────────────────────────────────────────────
+
 # Block PRs by preventing pushes to arbitrary feature branches.
 # Gas Town agents push to main (crew) or polecat/* branches (polecats).
 # PRs are for external contributors only.
@@ -61,7 +74,7 @@ while read local_ref local_sha remote_ref remote_sha; do
   fi
 
   case "$branch" in
-    "${default_branch}"|beads-sync|polecat/*|integration/*)
+    "${default_branch}"|beads-sync|polecat/*|integration/*|anvil)
       # Allowed branches
       ;;
     *)
