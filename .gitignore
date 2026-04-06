@@ -106,3 +106,4 @@ GEMINI.md
 
 # Handoff docs (ephemeral agent notes — local only)
 handoffs/
+.handoffs/
