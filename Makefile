@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag clean test test-e2e-container check-up-to-date patches upgrade
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -92,6 +92,7 @@ ifndef SKIP_FORWARD_CHECK
 endif
 
 install: check-up-to-date build
+	@git config core.hooksPath .githooks
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
@@ -165,6 +166,24 @@ check-version-tag:
 		exit 1; \
 	fi; \
 	echo "check-version-tag: OK (tag $$TAG matches Version=$$CODE_VERSION)"
+
+# Export current local commits (anvil..upstream/main divergence) to patches/.
+# Run this after adding or editing a local patch commit.
+#   make patches
+patches:
+	@echo "Exporting patches from anvil -> upstream/main divergence..."
+	@rm -f patches/*.patch
+	@git format-patch upstream/main..HEAD --output-directory patches/
+	@echo "Patches written to patches/:"
+	@ls patches/*.patch 2>/dev/null | sed 's|patches/||'
+
+# Upgrade to latest upstream and replay local patches.
+# Fetches upstream/main, resets anvil to it, then applies patches/*.patch.
+# Shows incoming commits, handles conflicts with clear instructions, and
+# offers to build+install on success.
+#   make upgrade
+upgrade:
+	@bash scripts/upgrade-anvil.sh
 
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
