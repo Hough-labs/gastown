@@ -103,3 +103,4 @@ docs/fork-info/
 
 # Handoff docs (ephemeral agent notes — local only)
 handoffs/
+.handoffs/
