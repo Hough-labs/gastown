@@ -359,11 +359,12 @@ func readDaemonEnvVar(path, key string) string {
 }
 
 // IsRemote returns true when the config points to a non-local Dolt server.
-// Empty host, "127.0.0.1", "localhost", "::1", and "[::1]" are all considered local.
-// Hostnames that resolve to a loopback address are also treated as local.
+// Empty host, "127.0.0.1", "localhost", "::1", "[::1]", and "0.0.0.0" (bind-all)
+// are all considered local. Hostnames that resolve to a loopback address are also
+// treated as local.
 func (c *Config) IsRemote() bool {
 	switch strings.ToLower(c.Host) {
-	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+	case "", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0":
 		return false
 	}
 	// Resolve hostname and check if it points to loopback.
@@ -402,17 +403,19 @@ func (c *Config) userDSN() string {
 }
 
 // EffectiveHost returns the configured host, defaulting to "127.0.0.1" when empty.
+// "0.0.0.0" (bind-all) is also rewritten to "127.0.0.1" for client connections —
+// the server listens on all interfaces but local clients still connect via loopback.
 func (c *Config) EffectiveHost() string {
-	if c.Host == "" {
+	if c.Host == "" || c.Host == "0.0.0.0" {
 		return "127.0.0.1"
 	}
 	return c.Host
 }
 
-// HostPort returns "host:port", defaulting host to "127.0.0.1" when empty.
+// HostPort returns "host:port", defaulting host to "127.0.0.1" when empty or "0.0.0.0".
 func (c *Config) HostPort() string {
 	host := c.Host
-	if host == "" {
+	if host == "" || host == "0.0.0.0" {
 		host = "127.0.0.1"
 	}
 	return fmt.Sprintf("%s:%d", host, c.Port)
