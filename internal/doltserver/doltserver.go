@@ -277,6 +277,14 @@ func DefaultConfig(townRoot string) *Config {
 
 	if h := os.Getenv("GT_DOLT_HOST"); h != "" {
 		config.Host = h
+	} else if townRoot != "" {
+		// Fallback: read GT_DOLT_HOST from daemon/daemon.env so the bind host
+		// survives daemon-triggered Dolt restarts (mirrors GT_DOLT_LOGLEVEL
+		// fallback below). Without this, a daemon restart would silently
+		// rebind dolt to localhost and break cross-machine clients.
+		if h := readDaemonEnvVar(filepath.Join(townRoot, "daemon", "daemon.env"), "GT_DOLT_HOST"); h != "" {
+			config.Host = h
+		}
 	}
 
 	// Port precedence: config.yaml > env var > default
