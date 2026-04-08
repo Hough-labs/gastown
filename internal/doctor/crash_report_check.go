@@ -90,6 +90,13 @@ func (c *CrashReportCheck) Run(ctx *CheckContext) *CheckResult {
 
 			name := entry.Name()
 
+			// Only consider actual crash reports (.ips). Skip .diag files,
+			// which are performance microstackshots ("disk writes", "hang",
+			// etc.) — not crashes, just diagnostic telemetry.
+			if !strings.HasSuffix(name, ".ips") {
+				continue
+			}
+
 			// Check if this is a crash report for a relevant process
 			var matchedProcess string
 			nameLower := strings.ToLower(name)
