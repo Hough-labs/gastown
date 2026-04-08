@@ -315,6 +315,11 @@ func (c *PatrolNotStuckCheck) checkStuckWispsDolt(rigPath string, rigName string
 	}
 
 	r := csv.NewReader(strings.NewReader(string(output)))
+	// bd can write auto-push warnings to stdout alongside the CSV payload
+	// (e.g., "Warning: dolt auto-push failed..."), producing rows with the
+	// wrong number of fields. Accept variable field counts and let the
+	// per-record `len(rec) < 4` check below drop the noise.
+	r.FieldsPerRecord = -1
 	records, err := r.ReadAll()
 	if err != nil {
 		return nil, fmt.Errorf("csv parse: %w", err)
