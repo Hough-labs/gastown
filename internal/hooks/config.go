@@ -213,6 +213,8 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// forget to call gt done before the session ends. The polecat-stop-check
 		// command is idempotent — it checks heartbeat state and branch commits
 		// before deciding whether to run gt done.
+		// Also records costs (keeps claude-settings doctor check happy, which
+		// expects `costs record` in every Stop hook).
 		"polecats": {
 			Stop: []HookEntry{
 				{
@@ -221,6 +223,10 @@ func DefaultOverrides() map[string]*HooksConfig {
 						{
 							Type:    "command",
 							Command: hookChain(pathSetup, "gt tap polecat-stop-check"),
+						},
+						{
+							Type:    "command",
+							Command: hookChain(pathSetup, "gt costs record &"),
 						},
 					},
 				},
