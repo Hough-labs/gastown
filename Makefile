@@ -3,7 +3,10 @@
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
-INSTALL_DIR := $(HOME)/.local/bin
+INSTALL_DIR := $(shell go env GOBIN)
+ifeq ($(INSTALL_DIR),)
+INSTALL_DIR := $(HOME)/go/bin
+endif
 E2E_IMAGE ?= gastown-test
 E2E_BUILD_FLAGS ?=
 E2E_RUN_FLAGS ?= --rm
@@ -104,10 +107,10 @@ install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
+	@# Nuke any stale binaries from previous install locations
+	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
+		if [ -f "$$bad" ] && [ "$$bad" != "$(INSTALL_DIR)/$(BINARY)" ]; then \
+			echo "Removing stale $$bad"; \
 			rm -f "$$bad"; \
 		fi; \
 	done
@@ -136,10 +139,10 @@ safe-install: check-up-to-date check-forward-only build
 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
-	@# Nuke any stale go-install binaries that shadow the canonical location
-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
-			echo "Removing stale $$bad (use make install, not go install)"; \
+	@# Nuke any stale binaries from previous install locations
+	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
+		if [ -f "$$bad" ] && [ "$$bad" != "$(INSTALL_DIR)/$(BINARY)" ]; then \
+			echo "Removing stale $$bad"; \
 			rm -f "$$bad"; \
 		fi; \
 	done
