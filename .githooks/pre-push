@@ -134,8 +134,8 @@ while read local_ref local_sha remote_ref remote_sha; do
   fi
 done
 
-# --- Build and install to mise GOBIN ---
-echo "gastown: rebuilding and installing to mise..."
+# --- Build and install to ~/go/bin ---
+echo "gastown: rebuilding and installing to ~/go/bin..."
 make install
 
 exit 0
