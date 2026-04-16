@@ -1,7 +1,7 @@
-From bf34836ca8043a51e29bf18b23d1edc11a6ad080 Mon Sep 17 00:00:00 2001
+From 4ba02193b5c5590f42702d534c26acafc3ddbe59 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 7 Apr 2026 15:02:46 -0400
-Subject: [PATCH 06/16] fix(doltserver): treat 0.0.0.0 (bind-all) as local in
+Subject: [PATCH 06/17] fix(doltserver): treat 0.0.0.0 (bind-all) as local in
  IsRemote
 
 GT_DOLT_HOST=0.0.0.0 lets Dolt bind all interfaces (reachable over
@@ -13,7 +13,7 @@ client connections so local clients still hit loopback.
  1 file changed, 9 insertions(+), 6 deletions(-)
 
 diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
-index 10b8d3f1..65e11030 100644
+index d0a92747..efcc9cd4 100644
 --- a/internal/doltserver/doltserver.go
 +++ b/internal/doltserver/doltserver.go
 @@ -359,11 +359,12 @@ func readDaemonEnvVar(path, key string) string {

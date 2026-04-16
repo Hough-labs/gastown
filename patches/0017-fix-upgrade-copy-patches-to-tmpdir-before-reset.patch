@@ -1,0 +1,51 @@
+From 7a3a145d0982b23ce8e8142cd6f4d6226a93eaf4 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 16 Apr 2026 19:42:47 -0400
+Subject: [PATCH 17/17] fix(upgrade): copy patches to tmpdir before reset
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same fix as beads — git reset wipes patches/ since upstream doesn't
+track it. Copy to tmpdir first, use --3way for resolvable conflicts.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ scripts/upgrade-anvil.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/upgrade-anvil.sh b/scripts/upgrade-anvil.sh
+index 5ce287fa..7d9b8d85 100755
+--- a/scripts/upgrade-anvil.sh
++++ b/scripts/upgrade-anvil.sh
+@@ -58,6 +58,10 @@ echo ""
+ 
+ # ── Reset and replay ─────────────────────────────────────────────────────────
+ 
++PATCH_TMPDIR=$(mktemp -d)
++trap 'rm -rf "$PATCH_TMPDIR"' EXIT
++cp -f patches/*.patch "$PATCH_TMPDIR/"
++
+ info "Resetting anvil to upstream/main..."
+ git reset --hard upstream/main --quiet
+ ok "Reset to $(git rev-parse --short HEAD) ($(git log -1 --format='%s'))"
+@@ -67,14 +71,14 @@ info "Replaying $PATCH_COUNT local patches..."
+ echo ""
+ 
+ PATCH_NUM=0
+-for patch in patches/*.patch; do
++for patch in "$PATCH_TMPDIR"/*.patch; do
+     PATCH_NUM=$((PATCH_NUM + 1))
+     SUBJECT=$(grep '^Subject:' "$patch" | sed 's/Subject: \[PATCH[^]]*\] //')
+     printf "  ${DIM}Applying %d/%d: %s${RST}\n" "$PATCH_NUM" "$PATCH_COUNT" "$SUBJECT"
+ done
+ echo ""
+ 
+-if ! git am patches/*.patch; then
++if ! git am --3way "$PATCH_TMPDIR"/*.patch; then
+     echo ""
+     die "$(cat <<'EOF'
+ Patch conflict — resolve then continue:
+-- 
+2.50.1 (Apple Git-155)
+

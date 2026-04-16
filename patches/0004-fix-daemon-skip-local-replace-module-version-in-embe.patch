@@ -1,7 +1,7 @@
-From aae1903df435c5854b770089eeff42234ecb2caf Mon Sep 17 00:00:00 2001
+From f56c9f71a30cdea6fa7f910fb6237b0c88cccd37 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 07:41:04 -0400
-Subject: [PATCH 04/16] fix(daemon): skip local-replace module version in
+Subject: [PATCH 04/17] fix(daemon): skip local-replace module version in
  embeddedBeadsVersion
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1993,10 +1993,10 @@ index 5a54a638..7095a958 100644
 +rsc.io/quote/v3 v3.1.0/go.mod h1:yEA65RcK8LyAZtP9Kv3t0HmxON59tX3rD+tICJqUlj0=
 +rsc.io/sampler v1.3.0/go.mod h1:T1hPZKmBbMNahiBKFy5HrXp6adAjACjK9JXDnKaTXpA=
 diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
-index b7fb155f..fa63e6b5 100755
+index cb41a701..6ae8153b 100755
 --- a/internal/daemon/daemon.go
 +++ b/internal/daemon/daemon.go
-@@ -1028,6 +1028,10 @@ func embeddedBeadsVersion() string {
+@@ -1042,6 +1042,10 @@ func embeddedBeadsVersion() string {
  			if version := normalizeSemver(dep.Replace.Version); version != "" {
  				return version
  			}

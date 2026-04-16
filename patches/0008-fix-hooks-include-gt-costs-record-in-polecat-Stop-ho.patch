@@ -1,7 +1,7 @@
-From ba8bfa8b0144a08161e1a45a4c8f451f816029bd Mon Sep 17 00:00:00 2001
+From ce08eef0458585340212b70c211a5dd948f16af3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Apr 2026 08:52:26 -0400
-Subject: [PATCH 08/16] fix(hooks): include gt costs record in polecat Stop
+Subject: [PATCH 08/17] fix(hooks): include gt costs record in polecat Stop
  hook
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
