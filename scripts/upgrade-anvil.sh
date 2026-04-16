@@ -58,6 +58,10 @@ echo ""
 
 # ── Reset and replay ─────────────────────────────────────────────────────────
 
+PATCH_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$PATCH_TMPDIR"' EXIT
+cp -f patches/*.patch "$PATCH_TMPDIR/"
+
 info "Resetting anvil to upstream/main..."
 git reset --hard upstream/main --quiet
 ok "Reset to $(git rev-parse --short HEAD) ($(git log -1 --format='%s'))"
@@ -67,14 +71,14 @@ info "Replaying $PATCH_COUNT local patches..."
 echo ""
 
 PATCH_NUM=0
-for patch in patches/*.patch; do
+for patch in "$PATCH_TMPDIR"/*.patch; do
     PATCH_NUM=$((PATCH_NUM + 1))
     SUBJECT=$(grep '^Subject:' "$patch" | sed 's/Subject: \[PATCH[^]]*\] //')
     printf "  ${DIM}Applying %d/%d: %s${RST}\n" "$PATCH_NUM" "$PATCH_COUNT" "$SUBJECT"
 done
 echo ""
 
-if ! git am patches/*.patch; then
+if ! git am --3way "$PATCH_TMPDIR"/*.patch; then
     echo ""
     die "$(cat <<'EOF'
 Patch conflict — resolve then continue:
