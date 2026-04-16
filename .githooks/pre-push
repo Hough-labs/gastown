@@ -1,14 +1,43 @@
 #!/bin/bash
 # Pre-push hook — two responsibilities:
 #
-# 1. On anvil branch: regenerate patches/ and fold into HEAD before pushing.
-#    Ensures patches/ always reflects the current divergence from upstream/main.
+# 1. On anvil branch: validate patches/ is current before pushing.
 #
 # 2. On all branches: enforce Gas Town branch policy and integration guardrails.
 #    (Upstream logic — do not remove.)
 
-# Note: patches/ is managed manually. Before pushing new commits from anvil, run:
-#   make patches && git add patches/ && git commit --amend --no-edit
+# ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
+BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+if [ "$BRANCH_NAME" = "anvil" ]; then
+    PATCH_TMPDIR=$(mktemp -d)
+    git format-patch upstream/main..HEAD --output-directory "$PATCH_TMPDIR" -- . ':!patches/' >/dev/null 2>&1
+    EXPECTED=$(ls "$PATCH_TMPDIR"/*.patch 2>/dev/null | wc -l | tr -d ' ')
+    ACTUAL=$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        rm -rf "$PATCH_TMPDIR"
+        echo ""
+        echo "pre-push: patches/ has $ACTUAL patches but $EXPECTED expected. Run:"
+        echo "  make patches && git add patches/ && git commit --amend --no-edit"
+        echo "Then push again."
+        exit 1
+    fi
+    STALE=0
+    for f in "$PATCH_TMPDIR"/*.patch; do
+        base=$(basename "$f")
+        if [ ! -f "patches/$base" ] || ! diff <(tail -n +2 "patches/$base") <(tail -n +2 "$f") >/dev/null 2>&1; then
+            STALE=1
+            break
+        fi
+    done
+    rm -rf "$PATCH_TMPDIR"
+    if [ "$STALE" = "1" ]; then
+        echo ""
+        echo "pre-push: patches/ is stale. Run:"
+        echo "  make patches && git add patches/ && git commit --amend --no-edit"
+        echo "Then push again."
+        exit 1
+    fi
+fi
 
 # ── Gas Town branch policy ────────────────────────────────────────────────────
 
