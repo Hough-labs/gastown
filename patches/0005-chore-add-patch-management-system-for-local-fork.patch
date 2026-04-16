@@ -1,0 +1,224 @@
+From 800dc4de4ce085eb469e48968df89f097e9ff873 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 6 Apr 2026 07:42:49 -0400
+Subject: [PATCH 05/16] chore: add patch management system for local fork
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirrors the pattern from beads/anvil. Lets us maintain a small set of
+local patches on top of upstream/main and upgrade cleanly:
+
+- patches/       — git format-patch exports of anvil..upstream/main
+- make patches   — regenerate patches/ from current divergence
+- make upgrade   — fetch upstream, reset, replay patches via git am
+- scripts/upgrade-anvil.sh — guided upgrade with conflict instructions
+- .githooks/pre-push — auto-refresh patches/ on push from anvil
+
+Also preserves upstream's existing pre-push branch policy and integration
+guardrail logic, and adds 'anvil' to the allowed branch list.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .githooks/pre-push       |  15 +++++-
+ Makefile                 |  21 +++++++-
+ scripts/upgrade-anvil.sh | 113 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 147 insertions(+), 2 deletions(-)
+ create mode 100755 scripts/upgrade-anvil.sh
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index fc1d22f7..24a14eb9 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -1,4 +1,17 @@
+ #!/bin/bash
++# Pre-push hook — two responsibilities:
++#
++# 1. On anvil branch: regenerate patches/ and fold into HEAD before pushing.
++#    Ensures patches/ always reflects the current divergence from upstream/main.
++#
++# 2. On all branches: enforce Gas Town branch policy and integration guardrails.
++#    (Upstream logic — do not remove.)
++
++# Note: patches/ is managed manually. Before pushing new commits from anvil, run:
++#   make patches && git add patches/ && git commit --amend --no-edit
++
++# ── Gas Town branch policy ────────────────────────────────────────────────────
++
+ # Block PRs by preventing pushes to arbitrary feature branches.
+ # Gas Town agents push to main (crew) or polecat/* branches (polecats).
+ # PRs are for external contributors only.
+@@ -35,7 +48,7 @@ while read local_ref local_sha remote_ref remote_sha; do
+   branch="${remote_ref#refs/heads/}"
+ 
+   case "$branch" in
+-    "${default_branch}"|beads-sync|polecat/*|integration/*)
++    "${default_branch}"|beads-sync|polecat/*|integration/*|anvil)
+       # Allowed branches
+       ;;
+     *)
+diff --git a/Makefile b/Makefile
+index 34138a49..92b180dc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag clean test test-e2e-container check-up-to-date
++.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag clean test test-e2e-container check-up-to-date patches upgrade
+ 
+ BINARY := gt
+ BINARY_DESKTOP := gt-desktop
+@@ -92,6 +92,7 @@ ifndef SKIP_FORWARD_CHECK
+ endif
+ 
+ install: check-up-to-date build
++	@git config core.hooksPath .githooks
+ 	@mkdir -p $(INSTALL_DIR)
+ 	@rm -f $(INSTALL_DIR)/$(BINARY)
+ 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+@@ -166,6 +167,24 @@ check-version-tag:
+ 	fi; \
+ 	echo "check-version-tag: OK (tag $$TAG matches Version=$$CODE_VERSION)"
+ 
++# Export current local commits (anvil..upstream/main divergence) to patches/.
++# Run this after adding or editing a local patch commit.
++#   make patches
++patches:
++	@echo "Exporting patches from anvil -> upstream/main divergence..."
++	@rm -f patches/*.patch
++	@git format-patch upstream/main..HEAD --output-directory patches/
++	@echo "Patches written to patches/:"
++	@ls patches/*.patch 2>/dev/null | sed 's|patches/||'
++
++# Upgrade to latest upstream and replay local patches.
++# Fetches upstream/main, resets anvil to it, then applies patches/*.patch.
++# Shows incoming commits, handles conflicts with clear instructions, and
++# offers to build+install on success.
++#   make upgrade
++upgrade:
++	@bash scripts/upgrade-anvil.sh
++
+ clean:
+ 	rm -f $(BUILD_DIR)/$(BINARY)
+ 
+diff --git a/scripts/upgrade-anvil.sh b/scripts/upgrade-anvil.sh
+new file mode 100755
+index 00000000..5ce287fa
+--- /dev/null
++++ b/scripts/upgrade-anvil.sh
+@@ -0,0 +1,113 @@
++#!/usr/bin/env bash
++# scripts/upgrade-anvil.sh — upgrade anvil to latest upstream and replay patches
++#
++# Usage: make upgrade
++#
++# What it does:
++#   1. Guards: clean tree, correct branch
++#   2. Shows what's incoming from upstream
++#   3. Resets anvil to upstream/main
++#   4. Replays patches/*.patch via git am
++#   5. On conflict: prints clear resume/abort instructions and exits 1
++#   6. On success: offers to build and install
++
++set -euo pipefail
++
++RED='\033[0;31m'
++GRN='\033[0;32m'
++YLW='\033[0;33m'
++BLU='\033[0;34m'
++DIM='\033[2m'
++RST='\033[0m'
++
++info()  { echo -e "${BLU}▸${RST} $*"; }
++ok()    { echo -e "${GRN}✓${RST} $*"; }
++warn()  { echo -e "${YLW}⚠${RST} $*"; }
++die()   { echo -e "${RED}✗${RST} $*" >&2; exit 1; }
++dim()   { echo -e "${DIM}$*${RST}"; }
++
++# ── Guards ───────────────────────────────────────────────────────────────────
++
++BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null) || die "Not on a git branch"
++[ "$BRANCH" = "anvil" ] || die "Must be on the anvil branch (currently on: $BRANCH)"
++
++if ! git diff --quiet || ! git diff --cached --quiet; then
++    die "Working tree is dirty. Commit or stash changes before upgrading."
++fi
++
++PATCH_COUNT=$(find patches/ -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
++[ "$PATCH_COUNT" -gt 0 ] || die "No patches found in patches/ — run 'make patches' first"
++
++# ── Fetch and preview ────────────────────────────────────────────────────────
++
++info "Fetching upstream..."
++git fetch upstream --quiet
++
++INCOMING=$(git log --oneline HEAD..upstream/main 2>/dev/null)
++INCOMING_COUNT=$(echo "$INCOMING" | grep -c . || true)
++
++if [ "$INCOMING_COUNT" -eq 0 ]; then
++    ok "Already up to date with upstream/main"
++    exit 0
++fi
++
++echo ""
++echo -e "${BLU}Incoming from upstream ($INCOMING_COUNT commits):${RST}"
++echo "$INCOMING" | while read -r line; do dim "  $line"; done
++echo ""
++
++# ── Reset and replay ─────────────────────────────────────────────────────────
++
++info "Resetting anvil to upstream/main..."
++git reset --hard upstream/main --quiet
++ok "Reset to $(git rev-parse --short HEAD) ($(git log -1 --format='%s'))"
++
++echo ""
++info "Replaying $PATCH_COUNT local patches..."
++echo ""
++
++PATCH_NUM=0
++for patch in patches/*.patch; do
++    PATCH_NUM=$((PATCH_NUM + 1))
++    SUBJECT=$(grep '^Subject:' "$patch" | sed 's/Subject: \[PATCH[^]]*\] //')
++    printf "  ${DIM}Applying %d/%d: %s${RST}\n" "$PATCH_NUM" "$PATCH_COUNT" "$SUBJECT"
++done
++echo ""
++
++if ! git am patches/*.patch; then
++    echo ""
++    die "$(cat <<'EOF'
++Patch conflict — resolve then continue:
++
++  1. Edit the conflicting file(s)
++  2. git add <file>
++  3. git am --continue
++
++To bail out entirely:
++  git am --abort
++  git reset --hard upstream/main
++EOF
++)"
++fi
++
++echo ""
++ok "All $PATCH_COUNT patches applied"
++ok "anvil is now at $(git rev-parse --short HEAD)"
++echo ""
++
++# ── Optional build ───────────────────────────────────────────────────────────
++
++if [ -t 0 ]; then
++    read -rp "$(echo -e "${BLU}▸${RST} Build and install now? [Y/n] ")" REPLY
++    REPLY=${REPLY:-Y}
++    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
++        echo ""
++        make install
++    fi
++else
++    dim "  (non-interactive — skipping build prompt)"
++    dim "  Run 'make install' when ready"
++fi
++
++echo ""
++ok "Upgrade complete."
+-- 
+2.50.1 (Apple Git-155)
+

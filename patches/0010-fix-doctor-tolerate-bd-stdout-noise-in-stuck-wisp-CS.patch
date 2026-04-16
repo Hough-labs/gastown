@@ -1,0 +1,41 @@
+From 741b0bd48dd467cfc93494b96fdb91ed7680b3f9 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 8 Apr 2026 09:21:31 -0400
+Subject: [PATCH 10/16] fix(doctor): tolerate bd stdout noise in stuck-wisp CSV
+ parse
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+bd sometimes writes auto-push warnings (e.g. 'Warning: dolt
+auto-push failed...') to stdout alongside the CSV payload when
+run with --csv. Strict csv.Reader treats the warning line as a
+row with the wrong field count and fails the entire parse, which
+the patrol-not-stuck check then reports as a stuck wisp — one
+false positive per rig with auto-push noise.
+
+Accept variable field counts (FieldsPerRecord = -1) and rely on
+the existing `len(rec) < 4` guard to drop malformed rows.
+---
+ internal/doctor/patrol_check.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/internal/doctor/patrol_check.go b/internal/doctor/patrol_check.go
+index 85165cbf..fc0412f1 100644
+--- a/internal/doctor/patrol_check.go
++++ b/internal/doctor/patrol_check.go
+@@ -315,6 +315,11 @@ func (c *PatrolNotStuckCheck) checkStuckWispsDolt(rigPath string, rigName string
+ 	}
+ 
+ 	r := csv.NewReader(strings.NewReader(string(output)))
++	// bd can write auto-push warnings to stdout alongside the CSV payload
++	// (e.g., "Warning: dolt auto-push failed..."), producing rows with the
++	// wrong number of fields. Accept variable field counts and let the
++	// per-record `len(rec) < 4` check below drop the noise.
++	r.FieldsPerRecord = -1
+ 	records, err := r.ReadAll()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("csv parse: %w", err)
+-- 
+2.50.1 (Apple Git-155)
+

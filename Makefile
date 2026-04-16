@@ -173,7 +173,7 @@ check-version-tag:
 patches:
 	@echo "Exporting patches from anvil -> upstream/main divergence..."
 	@rm -f patches/*.patch
-	@git format-patch upstream/main..HEAD --output-directory patches/
+	@git format-patch upstream/main..HEAD --output-directory patches/ -- . ':!patches/'
 	@echo "Patches written to patches/:"
 	@ls patches/*.patch 2>/dev/null | sed 's|patches/||'
 

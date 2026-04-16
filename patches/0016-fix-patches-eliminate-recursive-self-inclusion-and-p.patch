@@ -1,0 +1,106 @@
+From 98379876dc76ed77299880f71d9f50a03b3ca084 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 16 Apr 2026 19:20:48 -0400
+Subject: [PATCH 16/16] fix(patches): eliminate recursive self-inclusion and
+ pre-push amend bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same fix as beads — two compounding bugs:
+1. format-patch included patches/ dir, causing recursive bloat
+2. Pre-push amend changed SHA after git captured push range, causing
+   perpetual local/origin divergence
+
+Fix: pathspec exclusion in format-patch, validation-only pre-push check.
+Patches drop from 9.8k → 1k total lines.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ .githooks/pre-push | 39 ++++++++++++++++++++++++++++-----------
+ Makefile           |  2 +-
+ 2 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index bcd5f0a7..b75865bb 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -1,25 +1,44 @@
+ #!/bin/bash
+ # Pre-push hook — three responsibilities:
+ #
+-# 1. On anvil branch: regenerate patches/ and fold into HEAD, rebuild+install
+-#    locally, then kick off a remote rebuild on Anvil so both machines converge.
++# 1. On anvil branch: validate patches/ is current, rebuild+install locally,
++#    then kick off a remote rebuild on Anvil so both machines converge.
+ #
+ # 2. On all branches: enforce Gas Town branch policy and integration guardrails.
+ #    (Upstream logic — do not remove.)
+ #
+ # 3. After upstream policy checks pass: rebuild and install.
+ 
+-# ── Anvil branch housekeeping: regenerate patches/ and fold into HEAD ────────
++# ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
+ BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+ if [ "$BRANCH_NAME" = "anvil" ]; then
+-    if ! make patches --quiet; then
+-        echo "pre-push: make patches failed" >&2
++    PATCH_TMPDIR=$(mktemp -d)
++    git format-patch upstream/main..HEAD --output-directory "$PATCH_TMPDIR" -- . ':!patches/' >/dev/null 2>&1
++    EXPECTED=$(ls "$PATCH_TMPDIR"/*.patch 2>/dev/null | wc -l | tr -d ' ')
++    ACTUAL=$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
++    if [ "$EXPECTED" != "$ACTUAL" ]; then
++        rm -rf "$PATCH_TMPDIR"
++        echo ""
++        echo "pre-push: patches/ has $ACTUAL patches but $EXPECTED expected. Run:"
++        echo "  make patches && git add patches/ && git commit --amend --no-edit"
++        echo "Then push again."
+         exit 1
+     fi
+-    if ! git diff --quiet patches/; then
+-        git add patches/
+-        git commit --amend --no-edit --quiet
+-        echo "pre-push: patches/ refreshed and folded into HEAD"
++    STALE=0
++    for f in "$PATCH_TMPDIR"/*.patch; do
++        base=$(basename "$f")
++        if [ ! -f "patches/$base" ] || ! diff <(tail -n +2 "patches/$base") <(tail -n +2 "$f") >/dev/null 2>&1; then
++            STALE=1
++            break
++        fi
++    done
++    rm -rf "$PATCH_TMPDIR"
++    if [ "$STALE" = "1" ]; then
++        echo ""
++        echo "pre-push: patches/ is stale. Run:"
++        echo "  make patches && git add patches/ && git commit --amend --no-edit"
++        echo "Then push again."
++        exit 1
+     fi
+ fi
+ 
+@@ -122,8 +141,6 @@ while read local_ref local_sha remote_ref remote_sha; do
+ done
+ 
+ # --- Build and install to ~/go/bin ---
+-# After amending HEAD with patches/, local is ahead of origin/anvil, so bypass
+-# the up-to-date guard (we're the ones advancing origin via this push).
+ echo "gastown: rebuilding and installing to ~/go/bin..."
+ SKIP_UPDATE_CHECK=1 make install
+ 
+diff --git a/Makefile b/Makefile
+index fe549abd..80dbaceb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -173,7 +173,7 @@ check-version-tag:
+ patches:
+ 	@echo "Exporting patches from anvil -> upstream/main divergence..."
+ 	@rm -f patches/*.patch
+-	@git format-patch upstream/main..HEAD --output-directory patches/
++	@git format-patch upstream/main..HEAD --output-directory patches/ -- . ':!patches/'
+ 	@echo "Patches written to patches/:"
+ 	@ls patches/*.patch 2>/dev/null | sed 's|patches/||'
+ 
+-- 
+2.50.1 (Apple Git-155)
+
