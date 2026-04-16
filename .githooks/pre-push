@@ -1,14 +1,27 @@
 #!/bin/bash
-# Pre-push hook — two responsibilities:
+# Pre-push hook — three responsibilities:
 #
-# 1. On anvil branch: regenerate patches/ and fold into HEAD before pushing.
-#    Ensures patches/ always reflects the current divergence from upstream/main.
+# 1. On anvil branch: regenerate patches/ and fold into HEAD, rebuild+install
+#    locally, then kick off a remote rebuild on Anvil so both machines converge.
 #
 # 2. On all branches: enforce Gas Town branch policy and integration guardrails.
 #    (Upstream logic — do not remove.)
+#
+# 3. After upstream policy checks pass: rebuild and install.
 
-# Note: patches/ is managed manually. Before pushing new commits from anvil, run:
-#   make patches && git add patches/ && git commit --amend --no-edit
+# ── Anvil branch housekeeping: regenerate patches/ and fold into HEAD ────────
+BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+if [ "$BRANCH_NAME" = "anvil" ]; then
+    if ! make patches --quiet; then
+        echo "pre-push: make patches failed" >&2
+        exit 1
+    fi
+    if ! git diff --quiet patches/; then
+        git add patches/
+        git commit --amend --no-edit --quiet
+        echo "pre-push: patches/ refreshed and folded into HEAD"
+    fi
+fi
 
 # ── Gas Town branch policy ────────────────────────────────────────────────────
 
@@ -109,7 +122,36 @@ while read local_ref local_sha remote_ref remote_sha; do
 done
 
 # --- Build and install to ~/go/bin ---
+# After amending HEAD with patches/, local is ahead of origin/anvil, so bypass
+# the up-to-date guard (we're the ones advancing origin via this push).
 echo "gastown: rebuilding and installing to ~/go/bin..."
-make install
+SKIP_UPDATE_CHECK=1 make install
+
+# --- Sync to Anvil ---
+# Only trigger from Hammer (Darwin) on anvil branch. Background job polls
+# origin/anvil until it sees our pushed SHA, then SSHes anvil to pull+build.
+# Failure is logged, not fatal — the local push still succeeds.
+if [ "$BRANCH_NAME" = "anvil" ] && [ "$(uname -s)" = "Darwin" ]; then
+    EXPECTED_SHA=$(git rev-parse HEAD)
+    LOG="$HOME/.cache/sync-anvil.log"
+    mkdir -p "$(dirname "$LOG")"
+    (
+        exec >>"$LOG" 2>&1
+        echo "[$(date '+%F %T')] gastown sync-anvil: waiting for origin/anvil to reach $EXPECTED_SHA"
+        for _ in $(seq 1 30); do
+            REMOTE_SHA=$(git ls-remote --quiet origin refs/heads/anvil 2>/dev/null | awk '{print $1}')
+            if [ "$REMOTE_SHA" = "$EXPECTED_SHA" ]; then
+                echo "[$(date '+%F %T')] gastown sync-anvil: origin reached $EXPECTED_SHA — triggering remote build"
+                ssh -o BatchMode=yes anvil "cd ~/code/forks/gastownhall/gastown && git fetch origin anvil --quiet && git reset --hard origin/anvil --quiet && make install"
+                echo "[$(date '+%F %T')] gastown sync-anvil: done"
+                exit 0
+            fi
+            sleep 2
+        done
+        echo "[$(date '+%F %T')] gastown sync-anvil: timeout — origin/anvil did not advance. Run manually on anvil: cd ~/code/forks/gastownhall/gastown && git pull && make install"
+    ) </dev/null &
+    disown
+    echo "pre-push: anvil sync backgrounded (tail $LOG for progress)"
+fi
 
 exit 0
