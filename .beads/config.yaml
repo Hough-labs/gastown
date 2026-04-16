@@ -44,4 +44,17 @@ types.custom: "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merg
 
 prefix: 
 issue-prefix: 
-dolt.idle-timeout: "0"
+
+# Dolt on Anvil k8s — 'anvil' hostname uses Happy Eyeballs:
+# Thunderbolt (169.254.100.1) first, Tailscale (100.99.108.41) fallback
+dolt.mode: "server"
+dolt.host: "anvil"
+dolt.port: 3306
+dolt.database: "gastown"
+dolt.auto-start: false
+dolt.auto-push: "off"
+
+# Backup disabled — dolt server is remote (k8s on Anvil)
+backup:
+  enabled: false
+
