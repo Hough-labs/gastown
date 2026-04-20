@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# scripts/upgrade-anvil.sh — upgrade anvil to latest upstream and replay patches
+# scripts/upgrade-anvil.sh — rebase local patches onto latest upstream.
 #
 # Usage: make upgrade
 #
-# What it does:
-#   1. Guards: clean tree, correct branch
-#   2. Shows what's incoming from upstream
-#   3. Resets anvil to upstream/main
-#   4. Replays patches/*.patch via git am
-#   5. On conflict: prints clear resume/abort instructions and exits 1
-#   6. On success: offers to build and install
+# Rebase-based (no local reset --hard). Remote anvil still gets reset --hard to
+# origin/anvil via the pre-push hook — that's required to keep the remote
+# checkout in sync with origin, and happens over ssh, not locally.
+#
+# Flow:
+#   1. Guards: clean tree, correct branch, upstream reachable
+#   2. Fetch upstream, show incoming commits
+#   3. git rebase upstream/main (preserves local patch commits; conflicts pause)
+#   4. make patches (regen from new SHAs) + amend last commit if diff
+#   5. Optional interactive push (force-with-lease) to trigger deploy
 
 set -euo pipefail
 
@@ -43,8 +46,8 @@ PATCH_COUNT=$(find patches/ -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l | tr
 info "Fetching upstream..."
 git fetch upstream --quiet
 
-INCOMING=$(git log --oneline HEAD..upstream/main 2>/dev/null)
-INCOMING_COUNT=$(echo "$INCOMING" | grep -c . || true)
+INCOMING=$(git log --oneline HEAD..upstream/main 2>/dev/null || true)
+INCOMING_COUNT=$(echo -n "$INCOMING" | grep -c '^' || true)
 
 if [ "$INCOMING_COUNT" -eq 0 ]; then
     ok "Already up to date with upstream/main"
@@ -53,64 +56,65 @@ fi
 
 echo ""
 echo -e "${BLU}Incoming from upstream ($INCOMING_COUNT commits):${RST}"
-echo "$INCOMING" | while read -r line; do dim "  $line"; done
+echo "$INCOMING" | head -20 | while read -r line; do dim "  $line"; done
+[ "$INCOMING_COUNT" -gt 20 ] && dim "  ... and $((INCOMING_COUNT - 20)) more"
 echo ""
 
-# ── Reset and replay ─────────────────────────────────────────────────────────
+# ── Rebase local patches onto upstream/main ──────────────────────────────────
 
-PATCH_TMPDIR=$(mktemp -d)
-trap 'rm -rf "$PATCH_TMPDIR"' EXIT
-cp -f patches/*.patch "$PATCH_TMPDIR/"
-
-info "Resetting anvil to upstream/main..."
-git reset --hard upstream/main --quiet
-ok "Reset to $(git rev-parse --short HEAD) ($(git log -1 --format='%s'))"
-
-echo ""
-info "Replaying $PATCH_COUNT local patches..."
+LOCAL_COMMITS=$(git rev-list --count upstream/main..HEAD)
+info "Rebasing $LOCAL_COMMITS local patch commit(s) onto upstream/main..."
 echo ""
 
-PATCH_NUM=0
-for patch in "$PATCH_TMPDIR"/*.patch; do
-    PATCH_NUM=$((PATCH_NUM + 1))
-    SUBJECT=$(grep '^Subject:' "$patch" | sed 's/Subject: \[PATCH[^]]*\] //')
-    printf "  ${DIM}Applying %d/%d: %s${RST}\n" "$PATCH_NUM" "$PATCH_COUNT" "$SUBJECT"
-done
-echo ""
-
-if ! git am --3way "$PATCH_TMPDIR"/*.patch; then
+if ! git rebase upstream/main; then
     echo ""
     die "$(cat <<'EOF'
-Patch conflict — resolve then continue:
+Rebase conflict — resolve then continue:
 
   1. Edit the conflicting file(s)
   2. git add <file>
-  3. git am --continue
+  3. git rebase --continue
 
-To bail out entirely:
-  git am --abort
-  git reset --hard upstream/main
+To bail out (safe — no reset --hard has occurred):
+  git rebase --abort
 EOF
 )"
 fi
 
-echo ""
-ok "All $PATCH_COUNT patches applied"
-ok "anvil is now at $(git rev-parse --short HEAD)"
+ok "All $LOCAL_COMMITS patches preserved — anvil now at $(git describe --tags HEAD 2>/dev/null || git rev-parse --short HEAD)"
 echo ""
 
-# ── Optional build ───────────────────────────────────────────────────────────
+# ── Regenerate patches/ from new SHAs ────────────────────────────────────────
+
+info "Regenerating patches/ from new SHAs..."
+make patches >/dev/null
+
+if ! git diff --quiet patches/; then
+    info "Amending tip commit with refreshed patches/..."
+    git add patches/
+    git commit --amend --no-edit --quiet
+    ok "Amended — tree clean"
+else
+    dim "  patches/ already current (no amend needed)"
+fi
+echo ""
+
+# ── Optional push ────────────────────────────────────────────────────────────
 
 if [ -t 0 ]; then
-    read -rp "$(echo -e "${BLU}▸${RST} Build and install now? [Y/n] ")" REPLY
+    read -rp "$(echo -e "${BLU}▸${RST} Push to origin and deploy (force-with-lease)? [Y/n] ")" REPLY
     REPLY=${REPLY:-Y}
     if [[ "$REPLY" =~ ^[Yy]$ ]]; then
         echo ""
-        make install
+        git push --force-with-lease origin anvil
+        echo ""
+        info "Anvil sync backgrounded — tail: ~/.cache/sync-anvil.log"
+    else
+        dim "  Skipped. Run: git push --force-with-lease origin anvil"
     fi
 else
-    dim "  (non-interactive — skipping build prompt)"
-    dim "  Run 'make install' when ready"
+    dim "  (non-interactive — skipping push prompt)"
+    dim "  Run: git push --force-with-lease origin anvil"
 fi
 
 echo ""

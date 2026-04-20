@@ -1,7 +1,7 @@
 From f56c9f71a30cdea6fa7f910fb6237b0c88cccd37 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 07:41:04 -0400
-Subject: [PATCH 04/18] fix(daemon): skip local-replace module version in
+Subject: [PATCH 04/19] fix(daemon): skip local-replace module version in
  embeddedBeadsVersion
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

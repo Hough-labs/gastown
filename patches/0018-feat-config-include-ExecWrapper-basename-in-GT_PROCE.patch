@@ -1,7 +1,7 @@
-From 7539a99317815d24fc77aac2752f9960bab9dbaf Mon Sep 17 00:00:00 2001
+From f3dc664959fa9dfe6fdea2e12171edff12c1b142 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 20 Apr 2026 12:57:24 -0400
-Subject: [PATCH 18/18] feat(config): include ExecWrapper basename in
+Subject: [PATCH 18/19] feat(config): include ExecWrapper basename in
  GT_PROCESS_NAMES
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
