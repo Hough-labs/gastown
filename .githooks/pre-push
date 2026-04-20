@@ -155,11 +155,27 @@ if [ "$BRANCH_NAME" = "anvil" ] && [ "$(uname -s)" = "Darwin" ]; then
     (
         exec >>"$LOG" 2>&1
         echo "[$(date '+%F %T')] gastown sync-anvil: waiting for origin/anvil to reach $EXPECTED_SHA"
+        # Remote script: pull, rebuild, restart daemon, sync plugins. Guards skip
+        # pieces that don't apply (no gt-daemon service, no town dir).
+        REMOTE_CMD='
+set -e
+cd ~/code/forks/gastownhall/gastown
+git fetch origin anvil --quiet
+git reset --hard origin/anvil --quiet
+make install
+if systemctl --user is-enabled gt-daemon >/dev/null 2>&1; then
+    systemctl --user restart gt-daemon
+    echo "gt-daemon restarted ($(systemctl --user show gt-daemon -p MainPID --value))"
+fi
+if [ -d "$HOME/gt" ]; then
+    (cd "$HOME/gt" && ~/go/bin/gt plugin sync --source "$HOME/code/forks/gastownhall/gastown/plugins")
+fi
+'
         for _ in $(seq 1 30); do
             REMOTE_SHA=$(git ls-remote --quiet origin refs/heads/anvil 2>/dev/null | awk '{print $1}')
             if [ "$REMOTE_SHA" = "$EXPECTED_SHA" ]; then
-                echo "[$(date '+%F %T')] gastown sync-anvil: origin reached $EXPECTED_SHA — triggering remote build"
-                ssh -o BatchMode=yes anvil "cd ~/code/forks/gastownhall/gastown && git fetch origin anvil --quiet && git reset --hard origin/anvil --quiet && make install"
+                echo "[$(date '+%F %T')] gastown sync-anvil: origin reached $EXPECTED_SHA — triggering remote deploy"
+                ssh -o BatchMode=yes anvil "$REMOTE_CMD"
                 echo "[$(date '+%F %T')] gastown sync-anvil: done"
                 exit 0
             fi
