@@ -175,9 +175,15 @@ fi
             REMOTE_SHA=$(git ls-remote --quiet origin refs/heads/anvil 2>/dev/null | awk '{print $1}')
             if [ "$REMOTE_SHA" = "$EXPECTED_SHA" ]; then
                 echo "[$(date '+%F %T')] gastown sync-anvil: origin reached $EXPECTED_SHA — triggering remote deploy"
-                ssh -o BatchMode=yes anvil "$REMOTE_CMD"
-                echo "[$(date '+%F %T')] gastown sync-anvil: done"
-                exit 0
+                # Pipe to bash -s: anvil's default shell is fish, but REMOTE_CMD is bash.
+                printf '%s\n' "$REMOTE_CMD" | ssh -o BatchMode=yes anvil bash -s
+                RC=$?
+                if [ "$RC" -eq 0 ]; then
+                    echo "[$(date '+%F %T')] gastown sync-anvil: done"
+                else
+                    echo "[$(date '+%F %T')] gastown sync-anvil: remote deploy failed (rc=$RC)"
+                fi
+                exit "$RC"
             fi
             sleep 2
         done

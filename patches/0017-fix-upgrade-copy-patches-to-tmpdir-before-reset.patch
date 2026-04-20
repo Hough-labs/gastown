@@ -1,7 +1,7 @@
 From 86df9fa9d20c9fe542a5525028d412a5c44f92a9 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 16 Apr 2026 19:42:47 -0400
-Subject: [PATCH 17/19] fix(upgrade): copy patches to tmpdir before reset
+Subject: [PATCH 17/20] fix(upgrade): copy patches to tmpdir before reset
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
