@@ -2268,6 +2268,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
 	// so we resolve process names from both agent name and actual command.
 	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command)
+	if len(rc.ExecWrapper) > 0 {
+		// The wrapper (e.g. kubectl, daytona) is the foreground process in the
+		// tmux pane, so tmux liveness detection needs its basename too.
+		processNames = append(processNames, filepath.Base(rc.ExecWrapper[0]))
+	}
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
@@ -2521,6 +2526,11 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	}
 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
 	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command)
+	if len(rc.ExecWrapper) > 0 {
+		// The wrapper (e.g. kubectl, daytona) is the foreground process in the
+		// tmux pane, so tmux liveness detection needs its basename too.
+		processNamesOverride = append(processNamesOverride, filepath.Base(rc.ExecWrapper[0]))
+	}
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNamesOverride, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {

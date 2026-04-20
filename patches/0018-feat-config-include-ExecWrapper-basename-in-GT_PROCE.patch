@@ -1,0 +1,156 @@
+From 7539a99317815d24fc77aac2752f9960bab9dbaf Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 20 Apr 2026 12:57:24 -0400
+Subject: [PATCH 18/18] feat(config): include ExecWrapper basename in
+ GT_PROCESS_NAMES
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+G5 from sandboxed-polecat-execution design. When a wrapper like kubectl
+or daytona fronts the agent binary, the wrapper becomes the foreground
+process in the tmux pane. tmux liveness detection reads GT_PROCESS_NAMES
+to decide when a session is idle — without the wrapper's basename in
+that list, nudges and idle detection misfire.
+
+Append filepath.Base(rc.ExecWrapper[0]) to GT_PROCESS_NAMES at both
+ResolveProcessNames call sites in loader.go (BuildStartupCommand and
+BuildStartupCommandWithAgentOverride).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ internal/config/loader.go      | 10 ++++
+ internal/config/loader_test.go | 89 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+)
+
+diff --git a/internal/config/loader.go b/internal/config/loader.go
+index ceb070ca..afca6eb0 100644
+--- a/internal/config/loader.go
++++ b/internal/config/loader.go
+@@ -2268,6 +2268,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
+ 	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
+ 	// so we resolve process names from both agent name and actual command.
+ 	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command)
++	if len(rc.ExecWrapper) > 0 {
++		// The wrapper (e.g. kubectl, daytona) is the foreground process in the
++		// tmux pane, so tmux liveness detection needs its basename too.
++		processNames = append(processNames, filepath.Base(rc.ExecWrapper[0]))
++	}
+ 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
+ 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
+ 	for k, v := range rc.Env {
+@@ -2521,6 +2526,11 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
+ 	}
+ 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
+ 	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command)
++	if len(rc.ExecWrapper) > 0 {
++		// The wrapper (e.g. kubectl, daytona) is the foreground process in the
++		// tmux pane, so tmux liveness detection needs its basename too.
++		processNamesOverride = append(processNamesOverride, filepath.Base(rc.ExecWrapper[0]))
++	}
+ 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNamesOverride, ",")
+ 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
+ 	for k, v := range rc.Env {
+diff --git a/internal/config/loader_test.go b/internal/config/loader_test.go
+index 9094dae1..07071fb5 100644
+--- a/internal/config/loader_test.go
++++ b/internal/config/loader_test.go
+@@ -5430,6 +5430,95 @@ func TestBuildStartupCommandWithAgentOverride_ExecWrapper(t *testing.T) {
+ 	}
+ }
+ 
++// TestBuildStartupCommand_ExecWrapperProcessNames verifies that when an
++// ExecWrapper is configured, its basename is appended to GT_PROCESS_NAMES so
++// tmux liveness detection can see the wrapper as the foreground pane process.
++func TestBuildStartupCommand_ExecWrapperProcessNames(t *testing.T) {
++	t.Parallel()
++	townRoot := t.TempDir()
++	rigPath := filepath.Join(townRoot, "testrig")
++
++	rigSettings := NewRigSettings()
++	rigSettings.Runtime = &RuntimeConfig{
++		Command:     "claude",
++		ExecWrapper: []string{"/usr/local/bin/kubectl", "exec", "pod", "--"},
++	}
++	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
++		t.Fatalf("SaveRigSettings: %v", err)
++	}
++
++	cmd := BuildStartupCommand(map[string]string{"GT_ROLE": "polecat"}, rigPath, "hello")
++
++	if !strings.Contains(cmd, "GT_PROCESS_NAMES=") {
++		t.Fatalf("expected GT_PROCESS_NAMES in command, got: %q", cmd)
++	}
++	// Extract the GT_PROCESS_NAMES= value and assert "kubectl" is a member.
++	const key = "GT_PROCESS_NAMES="
++	start := strings.Index(cmd, key) + len(key)
++	end := strings.IndexAny(cmd[start:], " \t")
++	if end == -1 {
++		end = len(cmd) - start
++	}
++	value := cmd[start : start+end]
++	found := false
++	for _, name := range strings.Split(value, ",") {
++		if name == "kubectl" {
++			found = true
++			break
++		}
++	}
++	if !found {
++		t.Errorf("expected GT_PROCESS_NAMES to contain wrapper basename %q, got: %q", "kubectl", value)
++	}
++}
++
++// TestBuildStartupCommandWithAgentOverride_ExecWrapperProcessNames mirrors the
++// coverage above for the agent-override startup-command path.
++func TestBuildStartupCommandWithAgentOverride_ExecWrapperProcessNames(t *testing.T) {
++	t.Parallel()
++	townRoot := t.TempDir()
++	rigPath := filepath.Join(townRoot, "testrig")
++
++	rigSettings := NewRigSettings()
++	rigSettings.Runtime = &RuntimeConfig{
++		Command:     "claude",
++		ExecWrapper: []string{"/usr/local/bin/kubectl", "exec", "pod", "--"},
++	}
++	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
++		t.Fatalf("SaveRigSettings: %v", err)
++	}
++
++	cmd, err := BuildStartupCommandWithAgentOverride(
++		map[string]string{"GT_ROLE": "polecat"},
++		rigPath, "hello", "",
++	)
++	if err != nil {
++		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
++	}
++
++	const key = "GT_PROCESS_NAMES="
++	idx := strings.Index(cmd, key)
++	if idx == -1 {
++		t.Fatalf("expected GT_PROCESS_NAMES in command, got: %q", cmd)
++	}
++	start := idx + len(key)
++	end := strings.IndexAny(cmd[start:], " \t")
++	if end == -1 {
++		end = len(cmd) - start
++	}
++	value := cmd[start : start+end]
++	found := false
++	for _, name := range strings.Split(value, ",") {
++		if name == "kubectl" {
++			found = true
++			break
++		}
++	}
++	if !found {
++		t.Errorf("expected GT_PROCESS_NAMES to contain wrapper basename %q, got: %q", "kubectl", value)
++	}
++}
++
+ // --- Tests for GH#3153: --agent override skips --settings flag ---
+ 
+ func TestWithRoleSettingsFlag_IdempotencyGuard(t *testing.T) {
+-- 
+2.50.1 (Apple Git-155)
+

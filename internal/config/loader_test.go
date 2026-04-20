@@ -5430,6 +5430,95 @@ func TestBuildStartupCommandWithAgentOverride_ExecWrapper(t *testing.T) {
 	}
 }
 
+// TestBuildStartupCommand_ExecWrapperProcessNames verifies that when an
+// ExecWrapper is configured, its basename is appended to GT_PROCESS_NAMES so
+// tmux liveness detection can see the wrapper as the foreground pane process.
+func TestBuildStartupCommand_ExecWrapperProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	rigSettings := NewRigSettings()
+	rigSettings.Runtime = &RuntimeConfig{
+		Command:     "claude",
+		ExecWrapper: []string{"/usr/local/bin/kubectl", "exec", "pod", "--"},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(map[string]string{"GT_ROLE": "polecat"}, rigPath, "hello")
+
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=") {
+		t.Fatalf("expected GT_PROCESS_NAMES in command, got: %q", cmd)
+	}
+	// Extract the GT_PROCESS_NAMES= value and assert "kubectl" is a member.
+	const key = "GT_PROCESS_NAMES="
+	start := strings.Index(cmd, key) + len(key)
+	end := strings.IndexAny(cmd[start:], " \t")
+	if end == -1 {
+		end = len(cmd) - start
+	}
+	value := cmd[start : start+end]
+	found := false
+	for _, name := range strings.Split(value, ",") {
+		if name == "kubectl" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected GT_PROCESS_NAMES to contain wrapper basename %q, got: %q", "kubectl", value)
+	}
+}
+
+// TestBuildStartupCommandWithAgentOverride_ExecWrapperProcessNames mirrors the
+// coverage above for the agent-override startup-command path.
+func TestBuildStartupCommandWithAgentOverride_ExecWrapperProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	rigSettings := NewRigSettings()
+	rigSettings.Runtime = &RuntimeConfig{
+		Command:     "claude",
+		ExecWrapper: []string{"/usr/local/bin/kubectl", "exec", "pod", "--"},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "polecat"},
+		rigPath, "hello", "",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	const key = "GT_PROCESS_NAMES="
+	idx := strings.Index(cmd, key)
+	if idx == -1 {
+		t.Fatalf("expected GT_PROCESS_NAMES in command, got: %q", cmd)
+	}
+	start := idx + len(key)
+	end := strings.IndexAny(cmd[start:], " \t")
+	if end == -1 {
+		end = len(cmd) - start
+	}
+	value := cmd[start : start+end]
+	found := false
+	for _, name := range strings.Split(value, ",") {
+		if name == "kubectl" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected GT_PROCESS_NAMES to contain wrapper basename %q, got: %q", "kubectl", value)
+	}
+}
+
 // --- Tests for GH#3153: --agent override skips --settings flag ---
 
 func TestWithRoleSettingsFlag_IdempotencyGuard(t *testing.T) {
