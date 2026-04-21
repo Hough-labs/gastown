@@ -455,6 +455,11 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 // fail immediately (binary not found, syntax error, etc.). Expects remain-on-exit
 // to already be enabled on the session. Checks the exit status after a brief delay.
 // Only returns an error for non-zero exits (command failures), not clean exits (status 0).
+//
+// Leaves remain-on-exit enabled on success so downstream readiness checks
+// (WaitForCommand, WaitForRuntimeReady) can still observe post-window failures —
+// e.g. an ExecWrapper that survives ~1s, then exits when the wrapped agent
+// can't find its settings file inside a sandbox.
 func (t *Tmux) checkSessionAfterCreate(name, command string) error {
 	checkPaneDead := func() (bool, error) {
 		paneDead, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead}")
@@ -486,9 +491,40 @@ func (t *Tmux) checkSessionAfterCreate(name, command string) error {
 		return err
 	}
 
-	// Pane is alive — restore default (no need to keep dead sessions around)
-	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "off")
 	return nil
+}
+
+// isPaneDead returns (true, "<exit status>") if the session's pane has exited.
+// Status is the raw tmux #{pane_dead_status} field; may be "" if tmux hasn't
+// populated it. Any error querying tmux is treated as "not dead" so callers
+// don't abort on transient tmux-server hiccups.
+func (t *Tmux) isPaneDead(session string) (bool, string) {
+	paneDead, err := t.run("display-message", "-p", "-t", session, "#{pane_dead}")
+	if err != nil {
+		return false, ""
+	}
+	if strings.TrimSpace(paneDead) != "1" {
+		return false, ""
+	}
+	status, _ := t.run("display-message", "-p", "-t", session, "#{pane_dead_status}")
+	return true, strings.TrimSpace(status)
+}
+
+// paneDeathError builds a rich error for a pane that has died during startup.
+// Includes the exit status and a tail of the pane capture so the operator can
+// see why the wrapped agent refused to run (missing settings, auth failure,
+// container not ready, etc.) instead of the generic "session may not exist".
+func (t *Tmux) paneDeathError(session, status, context string) error {
+	content, _ := t.CapturePane(session, 40)
+	trimmed := strings.TrimSpace(content)
+	if status == "" {
+		status = "unknown"
+	}
+	if trimmed == "" {
+		return fmt.Errorf("session %q pane died (exit status %s) %s", session, status, context)
+	}
+	return fmt.Errorf("session %q pane died (exit status %s) %s; pane tail:\n%s",
+		session, status, context, trimmed)
 }
 
 // EnsureSessionFresh ensures a session is available and healthy.
@@ -3100,6 +3136,9 @@ func (t *Tmux) resolveSessionProcessNamesChecked(session string) ([]string, erro
 // This handles agents wrapped in shell scripts (e.g., c2claude wrapping
 // claude-original) where exec env does not replace the shell as the pane
 // foreground process. Replaces process-tree probing (IsAgentAlive) per gt-sk5u.
+//
+// Fails fast (with captured pane content) if the pane dies before the agent
+// starts — prevents false-positive success when a wrapped command exits mid-startup.
 func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
 	// ZFC: Clear agent-ready sentinel to prevent stale values from previous
 	// agent runs. The agent's SessionStart hook (gt prime --hook) sets this
@@ -3109,6 +3148,9 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout 
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if dead, status := t.isPaneDead(session); dead {
+			return t.paneDeathError(session, status, "before agent started")
+		}
 		cmd, err := t.GetPaneCommand(session)
 		if err != nil {
 			time.Sleep(constants.PollInterval)
@@ -3134,6 +3176,32 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout 
 		time.Sleep(constants.PollInterval)
 	}
 	return fmt.Errorf("timeout waiting for command (still running excluded command)")
+}
+
+// WaitForAgentReady waits for the agent's SessionStart hook to set
+// GT_AGENT_READY=1 on the session environment. Returns an error if the pane
+// dies (wrapper crashed, agent exec failed) or the timeout elapses.
+//
+// Preferred over WaitForCommand for sessions started with an ExecWrapper:
+// pane_current_command reports the wrapper binary (kubectl, daytona, exitbox),
+// not the agent, so command-based probing yields a false-positive success while
+// the agent is still initializing — or has already failed — inside the sandbox.
+// The agent-ready sentinel is the only honest signal for wrapped startup.
+func (t *Tmux) WaitForAgentReady(session string, timeout time.Duration) error {
+	// Clear the sentinel so a stale value from a prior run can't fake success.
+	_, _ = t.run("set-environment", "-u", "-t", session, EnvAgentReady)
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if dead, status := t.isPaneDead(session); dead {
+			return t.paneDeathError(session, status, "before agent signaled ready")
+		}
+		if ready, err := t.GetEnvironment(session, EnvAgentReady); err == nil && ready == "1" {
+			return nil
+		}
+		time.Sleep(constants.PollInterval)
+	}
+	return fmt.Errorf("timeout waiting for agent-ready signal (GT_AGENT_READY=1) from session %q", session)
 }
 
 // WaitForShellReady polls until the pane is running a shell command.
@@ -3302,6 +3370,12 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// Fast-fail if the pane died (wrapped runtime crashed mid-startup,
+		// e.g. claude can't find --settings path inside a sandbox). Without
+		// this, we'd block the full timeout on a command that already failed.
+		if dead, status := t.isPaneDead(session); dead {
+			return t.paneDeathError(session, status, "before runtime prompt appeared")
+		}
 		// Capture last few lines of the pane
 		lines, err := t.CapturePaneLines(session, 10)
 		if err != nil {

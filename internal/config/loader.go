@@ -65,7 +65,7 @@ func SaveTownConfig(path string, config *TownConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -74,7 +74,7 @@ func SaveTownConfig(path string, config *TownConfig) error {
 		return fmt.Errorf("encoding config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -124,7 +124,7 @@ func SaveRigsConfig(path string, config *RigsConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -133,7 +133,7 @@ func SaveRigsConfig(path string, config *RigsConfig) error {
 		return fmt.Errorf("encoding config: %w", err)
 	}
 
-	if err := atomicfile.WriteFile(path, data, 0600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -193,7 +193,7 @@ func SaveRigConfig(path string, config *RigConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -202,7 +202,7 @@ func SaveRigConfig(path string, config *RigConfig) error {
 		return fmt.Errorf("encoding config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: config files don't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: config files don't contain secrets
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -444,7 +444,7 @@ func SaveRigSettings(path string, settings *RigSettings) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -453,7 +453,7 @@ func SaveRigSettings(path string, settings *RigSettings) error {
 		return fmt.Errorf("encoding settings: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: settings files don't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: settings files don't contain secrets
 		return fmt.Errorf("writing settings: %w", err)
 	}
 
@@ -488,7 +488,7 @@ func SaveMayorConfig(path string, config *MayorConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -497,7 +497,7 @@ func SaveMayorConfig(path string, config *MayorConfig) error {
 		return fmt.Errorf("encoding config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: config files don't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: config files don't contain secrets
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -556,7 +556,7 @@ func SaveDaemonPatrolConfig(path string, config *DaemonPatrolConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -565,7 +565,7 @@ func SaveDaemonPatrolConfig(path string, config *DaemonPatrolConfig) error {
 		return fmt.Errorf("encoding daemon patrol config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: config files don't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: config files don't contain secrets
 		return fmt.Errorf("writing daemon patrol config: %w", err)
 	}
 
@@ -685,7 +685,7 @@ func AddRigToDaemonPatrols(townRoot string, rigName string) error {
 		return fmt.Errorf("encoding daemon config: %w", err)
 	}
 
-	if err := os.WriteFile(path, append(out, '\n'), 0644); err != nil { //nolint:gosec // G306: config file
+	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil { //nolint:gosec // G306: config file
 		return fmt.Errorf("writing daemon config: %w", err)
 	}
 
@@ -782,7 +782,7 @@ func RemoveRigFromDaemonPatrols(townRoot string, rigName string) error {
 		return fmt.Errorf("encoding daemon config: %w", err)
 	}
 
-	if err := os.WriteFile(path, append(out, '\n'), 0644); err != nil { //nolint:gosec // G306: config file
+	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil { //nolint:gosec // G306: config file
 		return fmt.Errorf("writing daemon config: %w", err)
 	}
 
@@ -817,7 +817,7 @@ func SaveAccountsConfig(path string, config *AccountsConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -826,7 +826,7 @@ func SaveAccountsConfig(path string, config *AccountsConfig) error {
 		return fmt.Errorf("encoding accounts config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: accounts config doesn't contain sensitive credentials
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: accounts config doesn't contain sensitive credentials
 		return fmt.Errorf("writing accounts config: %w", err)
 	}
 
@@ -964,7 +964,7 @@ func SaveMessagingConfig(path string, config *MessagingConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -973,7 +973,7 @@ func SaveMessagingConfig(path string, config *MessagingConfig) error {
 		return fmt.Errorf("encoding messaging config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: messaging config doesn't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: messaging config doesn't contain secrets
 		return fmt.Errorf("writing messaging config: %w", err)
 	}
 
@@ -1096,7 +1096,7 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 		return fmt.Errorf("%w: got %d, max supported %d", ErrInvalidVersion, settings.Version, CurrentTownSettingsVersion)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -1105,7 +1105,7 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 		return fmt.Errorf("encoding settings: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: settings files don't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: settings files don't contain secrets
 		return fmt.Errorf("writing settings: %w", err)
 	}
 
@@ -2321,7 +2321,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 			townRoot = os.TempDir()
 		}
 		scriptDir := filepath.Join(townRoot, "daemon", "scripts")
-		_ = os.MkdirAll(scriptDir, 0755)
+		_ = os.MkdirAll(scriptDir, 0o755)
 		role := resolvedEnv["GT_ROLE"]
 		if role == "" {
 			role = "agent"
@@ -2330,7 +2330,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		safeRole := strings.ReplaceAll(role, "/", "-")
 		scriptPath := filepath.Join(scriptDir, safeRole+"-startup.ps1")
 		scriptContent := strings.Join(scriptLines, "\n") + "\n"
-		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o644); err != nil {
 			// Fallback: inline command (may fail if too long)
 			cmd = strings.Join(scriptLines, "; ")
 		} else {
@@ -2574,7 +2574,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 			townRoot = os.TempDir()
 		}
 		scriptDir := filepath.Join(townRoot, "daemon", "scripts")
-		_ = os.MkdirAll(scriptDir, 0755)
+		_ = os.MkdirAll(scriptDir, 0o755)
 		role := resolvedEnv["GT_ROLE"]
 		if role == "" {
 			role = "agent"
@@ -2582,7 +2582,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		safeRole := strings.ReplaceAll(role, "/", "-")
 		scriptPath := filepath.Join(scriptDir, safeRole+"-startup.ps1")
 		scriptContent := strings.Join(scriptLines, "\n") + "\n"
-		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o644); err != nil {
 			cmd = strings.Join(scriptLines, "; ")
 		} else {
 			cmd = "& " + psQuote(scriptPath)
@@ -2727,6 +2727,14 @@ func resolveExecWrapper(rigPath string) []string {
 	return nil
 }
 
+// ResolveExecWrapper is the exported form of resolveExecWrapper, for callers
+// that need to branch on whether a rig runs its agents through a sandbox/container
+// wrapper. Start paths (witness, refinery, polecat) use this to pick the right
+// tmux readiness signal — GT_AGENT_READY vs pane_current_command.
+func ResolveExecWrapper(rigPath string) []string {
+	return resolveExecWrapper(rigPath)
+}
+
 // ExpectedPaneCommands returns tmux pane command names that indicate the runtime is running.
 // Claude can report as "node" (older versions) or "claude" (newer versions).
 // Other runtimes typically report their executable name.
@@ -2843,7 +2851,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -2852,7 +2860,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
 		return fmt.Errorf("encoding escalation config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: escalation config doesn't contain secrets
+	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306: escalation config doesn't contain secrets
 		return fmt.Errorf("writing escalation config: %w", err)
 	}
 

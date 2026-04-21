@@ -250,11 +250,19 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "witness", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
 
-	// Wait for Claude to start - fatal if Claude fails to launch
-	if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
+	// Wait for Claude to start - fatal if Claude fails to launch.
+	// For wrapped rigs (ExecWrapper set — e.g. devbox/daytona/exitbox), the
+	// pane foreground is the wrapper, not the agent, so pane_current_command
+	// probing returns a false positive. Require the agent-ready sentinel instead.
+	var startWaitErr error
+	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
+		startWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
+	} else {
+		startWaitErr = t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout)
+	}
+	if startWaitErr != nil {
 		_ = t.KillSessionWithProcesses(sessionID)
-		return fmt.Errorf("waiting for witness to start: %w", err)
+		return fmt.Errorf("waiting for witness to start: %w", startWaitErr)
 	}
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
