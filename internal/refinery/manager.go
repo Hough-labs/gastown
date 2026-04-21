@@ -240,12 +240,18 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
 	_ = t.AcceptStartupDialogs(sessionID)
 
-	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch
-	// WaitForRuntimeReady waits for the runtime to be ready
-	if err := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
+	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch.
+	// For wrapped rigs, the runtime-prompt probe can't see past the wrapper
+	// (kubectl/daytona/exitbox stdio), so require the agent-ready sentinel instead.
+	var refineryWaitErr error
+	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
+		refineryWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
+	} else {
+		refineryWaitErr = t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
+	}
+	if refineryWaitErr != nil {
 		_ = t.KillSessionWithProcesses(sessionID)
-		return fmt.Errorf("waiting for refinery to start: %w", err)
+		return fmt.Errorf("waiting for refinery to start: %w", refineryWaitErr)
 	}
 
 	// Start nudge-queue poller (gt-dgf). Claude's UserPromptSubmit hook only
@@ -289,7 +295,7 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
 	}
 
 	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(refineryRigDir), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(refineryRigDir), 0o755); err != nil {
 		return fmt.Errorf("creating refinery dir: %w", err)
 	}
 

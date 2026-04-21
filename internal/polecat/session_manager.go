@@ -527,8 +527,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
 	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 
-	// Wait for Claude to start (non-fatal)
-	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	// Wait for Claude to start (non-fatal).
+	// For wrapped rigs, pane_current_command reports the wrapper, not the agent —
+	// switch to the agent-ready sentinel so we don't false-positive on kubectl/daytona
+	// while the wrapped claude is still starting or has already crashed.
+	wrapped := len(config.ResolveExecWrapper(m.rig.Path)) > 0
+	if wrapped {
+		debugSession("WaitForAgentReady", m.tmux.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout))
+	} else {
+		debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	}
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
 	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
@@ -536,7 +544,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Wait for runtime to be fully ready at the prompt (not just started).
 	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
-	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	// For wrapped rigs the prompt-based probe is pointless (already covered by
+	// WaitForAgentReady above).
+	if !wrapped {
+		debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	}
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
