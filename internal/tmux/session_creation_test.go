@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // Tests for the two-step session creation (new-session + respawn-pane) and
@@ -159,6 +161,92 @@ func TestWaitForCommand_Timeout(t *testing.T) {
 	err := tm.WaitForCommand(session, []string{"bash", "zsh", "sh"}, 500*time.Millisecond)
 	if err == nil {
 		t.Error("WaitForCommand should timeout when shell is still running")
+	}
+}
+
+// TestWaitForCommand_PaneDeathFailsFast reproduces the ExecWrapper silent-failure
+// bug: a command that survives NewSessionWithCommand's 50ms+250ms health window
+// but exits shortly after (like `kubectl exec` into a pod where claude dies on
+// missing settings). Before the fix, NewSessionWithCommand disabled remain-on-exit
+// on success — tmux then destroyed the pane and WaitForCommand hung for the full
+// timeout. With remain-on-exit preserved and pane_dead checked in-loop, this now
+// returns a rich error with the exit status.
+//
+// The exclude list includes "sleep" so WaitForCommand stays in its polling loop
+// (where the new pane-dead check fires) rather than short-circuiting when sh's
+// child `sleep` becomes the pane foreground — a quirk of this test harness,
+// not the real wrapped-agent scenario (there, the wrapper binary `kubectl` is
+// likewise stuck as the pane foreground).
+func TestWaitForCommand_PaneDeathFailsFast(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-panedeath-" + t.Name()
+	_ = tm.KillSession(session)
+	defer func() { _ = tm.KillSession(session) }()
+
+	if err := tm.NewSessionWithCommand(session, "", `sh -c 'sleep 0.4; exit 1'`); err != nil {
+		t.Fatalf("session creation: %v", err)
+	}
+
+	// Exclude SupportedShells (matching real witness/polecat usage) plus "sleep"
+	// so the test polls through the sh→sleep handoff on hosts with any default
+	// login shell (bash/zsh/fish). Without "sleep" the false-positive "not a
+	// shell" path would short-circuit before the pane dies.
+	excludes := append([]string{}, constants.SupportedShells...)
+	excludes = append(excludes, "sleep")
+	err := tm.WaitForCommand(session, excludes, 5*time.Second)
+	if err == nil {
+		t.Fatal("WaitForCommand should return an error when pane dies before agent starts")
+	}
+	if !strings.Contains(err.Error(), "pane died") {
+		t.Errorf("error should mention pane death, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit status") {
+		t.Errorf("error should include exit status, got: %v", err)
+	}
+}
+
+// TestWaitForAgentReady_PaneDeath verifies the wrapper-aware path fails loud
+// when the pane dies before the SessionStart hook can signal readiness.
+func TestWaitForAgentReady_PaneDeath(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-agentready-dead-" + t.Name()
+	_ = tm.KillSession(session)
+	defer func() { _ = tm.KillSession(session) }()
+
+	if err := tm.NewSessionWithCommand(session, "", `sh -c 'sleep 0.5; exit 2'`); err != nil {
+		t.Fatalf("session creation: %v", err)
+	}
+
+	err := tm.WaitForAgentReady(session, 5*time.Second)
+	if err == nil {
+		t.Fatal("WaitForAgentReady should return an error when pane dies")
+	}
+	if !strings.Contains(err.Error(), "pane died") {
+		t.Errorf("error should mention pane death, got: %v", err)
+	}
+}
+
+// TestWaitForAgentReady_Signal verifies the wrapper-aware path returns nil
+// as soon as GT_AGENT_READY=1 is set, even when pane_current_command would
+// still match a shell / wrapper.
+func TestWaitForAgentReady_Signal(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-agentready-ok-" + t.Name()
+	_ = tm.KillSession(session)
+	defer func() { _ = tm.KillSession(session) }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 10"); err != nil {
+		t.Fatalf("session creation: %v", err)
+	}
+
+	// Simulate the SessionStart hook setting the sentinel after a short delay.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_ = tm.SetEnvironment(session, EnvAgentReady, "1")
+	}()
+
+	if err := tm.WaitForAgentReady(session, 3*time.Second); err != nil {
+		t.Fatalf("WaitForAgentReady should succeed once sentinel is set: %v", err)
 	}
 }
 
