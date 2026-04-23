@@ -1,7 +1,7 @@
 From 6f8ee6140fd82e20d42d44fe545d71932587453c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 07:42:49 -0400
-Subject: [PATCH 05/21] chore: add patch management system for local fork
+Subject: [PATCH 05/22] chore: add patch management system for local fork
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

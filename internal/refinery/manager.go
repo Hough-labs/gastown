@@ -245,14 +245,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	_ = t.AcceptStartupDialogs(sessionID)
 
 	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch.
-	// For wrapped rigs, the runtime-prompt probe can't see past the wrapper
-	// (kubectl/daytona/exitbox stdio), so require the agent-ready sentinel instead.
-	var refineryWaitErr error
-	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
-		refineryWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
-	} else {
-		refineryWaitErr = t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
-	}
+	// Refinery runs on metal (never wrapped), so the runtime-prompt probe is the
+	// correct readiness signal regardless of rig exec_wrapper settings.
+	refineryWaitErr := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
 	if refineryWaitErr != nil {
 		_ = t.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("waiting for refinery to start: %w", refineryWaitErr)

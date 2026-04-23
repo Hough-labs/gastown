@@ -2240,9 +2240,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	}
 
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
-	// ExecWrapper is a deployment-level setting (sandbox/container) independent of agent choice.
+	// ExecWrapper is a deployment-level setting (sandbox/container) independent of agent choice,
+	// but gated on role: only polecat/crew run inside the sandbox pod; witness, refinery,
+	// mayor, and deacon always run on metal.
 	if len(rc.ExecWrapper) == 0 {
-		rc.ExecWrapper = resolveExecWrapper(rigPath)
+		rc.ExecWrapper = resolveExecWrapperForRole(rigPath, envVars["GT_ROLE"])
 	}
 
 	// Copy env vars to avoid mutating caller map
@@ -2499,8 +2501,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	rc = withRoleSettingsFlag(rc, role, rigPath)
 
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
+	// Gated on role: only polecat/crew are wrapped (sandbox pod). Witness, refinery,
+	// mayor, and deacon run on metal and must not be wrapped.
 	if len(rc.ExecWrapper) == 0 {
-		rc.ExecWrapper = resolveExecWrapper(rigPath)
+		rc.ExecWrapper = resolveExecWrapperForRole(rigPath, envVars["GT_ROLE"])
 	}
 
 	// Copy env vars to avoid mutating caller map
@@ -2722,10 +2726,24 @@ func resolveExecWrapper(rigPath string) []string {
 	return nil
 }
 
+// resolveExecWrapperForRole returns the rig's exec_wrapper only for roles that
+// belong inside a sandbox pod. Witness, refinery, mayor, and deacon run on
+// metal (one per rig on the host) and must never be wrapped; only polecat and
+// crew sessions are per-bead/per-session and live in the sandbox.
+func resolveExecWrapperForRole(rigPath, role string) []string {
+	switch role {
+	case constants.RolePolecat, constants.RoleCrew:
+		return resolveExecWrapper(rigPath)
+	default:
+		return nil
+	}
+}
+
 // ResolveExecWrapper is the exported form of resolveExecWrapper, for callers
 // that need to branch on whether a rig runs its agents through a sandbox/container
-// wrapper. Start paths (witness, refinery, polecat) use this to pick the right
-// tmux readiness signal — GT_AGENT_READY vs pane_current_command.
+// wrapper. Polecat start paths use this to pick the right tmux readiness signal —
+// GT_AGENT_READY vs pane_current_command. Witness/refinery no longer use it
+// since they always run on metal.
 func ResolveExecWrapper(rigPath string) []string {
 	return resolveExecWrapper(rigPath)
 }

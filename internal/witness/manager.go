@@ -240,15 +240,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
 
 	// Wait for Claude to start - fatal if Claude fails to launch.
-	// For wrapped rigs (ExecWrapper set — e.g. devbox/daytona/exitbox), the
-	// pane foreground is the wrapper, not the agent, so pane_current_command
-	// probing returns a false positive. Require the agent-ready sentinel instead.
-	var startWaitErr error
-	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
-		startWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
-	} else {
-		startWaitErr = t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout)
-	}
+	// Witness runs on metal (never wrapped), so shell-prompt probing is the
+	// correct readiness signal regardless of rig exec_wrapper settings.
+	startWaitErr := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout)
 	if startWaitErr != nil {
 		_ = t.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("waiting for witness to start: %w", startWaitErr)
