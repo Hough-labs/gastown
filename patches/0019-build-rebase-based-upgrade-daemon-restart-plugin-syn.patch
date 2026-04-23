@@ -1,7 +1,7 @@
 From 7a3f41c68dc5e6282e785fe7c3388dbf9158cd8b Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 20 Apr 2026 13:34:13 -0400
-Subject: [PATCH 19/22] build: rebase-based upgrade +
+Subject: [PATCH 19/23] build: rebase-based upgrade +
  daemon-restart/plugin-sync on anvil
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

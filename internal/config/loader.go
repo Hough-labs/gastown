@@ -2730,13 +2730,16 @@ func resolveExecWrapper(rigPath string) []string {
 // belong inside a sandbox pod. Witness, refinery, mayor, and deacon run on
 // metal (one per rig on the host) and must never be wrapped; only polecat and
 // crew sessions are per-bead/per-session and live in the sandbox.
-func resolveExecWrapperForRole(rigPath, role string) []string {
-	switch role {
-	case constants.RolePolecat, constants.RoleCrew:
+//
+// compoundRole is the GT_ROLE env value, which AgentEnv writes in compound
+// form (e.g. "devbox/polecats/obsidian", "devbox/crew/mel", "devbox/witness").
+// We match on the "/polecats/" and "/crew/" segments rather than the raw role
+// name because that's the format that actually reaches this call site.
+func resolveExecWrapperForRole(rigPath, compoundRole string) []string {
+	if strings.Contains(compoundRole, "/polecats/") || strings.Contains(compoundRole, "/crew/") {
 		return resolveExecWrapper(rigPath)
-	default:
-		return nil
 	}
+	return nil
 }
 
 // ResolveExecWrapper is the exported form of resolveExecWrapper, for callers
