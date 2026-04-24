@@ -1,7 +1,7 @@
 From eaec3eb659857c51116c511f8201e4930179130f Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 16 Apr 2026 19:03:38 -0400
-Subject: [PATCH 14/24] build: sweep mise cleanup; regen patches + sync Anvil
+Subject: [PATCH 14/25] build: sweep mise cleanup; regen patches + sync Anvil
  on push
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
