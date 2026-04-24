@@ -1,7 +1,7 @@
 From e26a69b81135a9845a97de07a3050dca96863d64 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 16:29:22 -0400
-Subject: [PATCH 26/28] fix(upgrade): also unregister StaleDoltPortCheck from
+Subject: [PATCH 26/30] fix(upgrade): also unregister StaleDoltPortCheck from
  gt upgrade
 
 Companion to the prior commit. gt upgrade runs FixStreaming on its own

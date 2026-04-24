@@ -1,7 +1,7 @@
 From e8bc2182a02e8bd9dabad4180e1b1e1f01e073dc Mon Sep 17 00:00:00 2001
 From: deacon <git@hough.ink>
 Date: Fri, 24 Apr 2026 16:53:14 -0400
-Subject: [PATCH 27/28] Fix: gt deacon heartbeat now updates bead label
+Subject: [PATCH 27/30] Fix: gt deacon heartbeat now updates bead label
  atomically
 
 The heartbeat command was writing to heartbeat.json but not updating the

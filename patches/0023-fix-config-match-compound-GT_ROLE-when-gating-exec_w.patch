@@ -1,7 +1,7 @@
 From 3fcc0e124710956cc5a99752874791f37f44eb39 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 22 Apr 2026 22:16:06 -0400
-Subject: [PATCH 23/28] fix(config): match compound GT_ROLE when gating
+Subject: [PATCH 23/30] fix(config): match compound GT_ROLE when gating
  exec_wrapper
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

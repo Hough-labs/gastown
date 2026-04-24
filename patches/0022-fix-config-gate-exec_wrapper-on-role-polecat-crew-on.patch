@@ -1,7 +1,7 @@
 From d27542ca78b7a6ad62d7accc0283859af6d08876 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 22 Apr 2026 22:01:15 -0400
-Subject: [PATCH 22/28] fix(config): gate exec_wrapper on role (polecat/crew
+Subject: [PATCH 22/30] fix(config): gate exec_wrapper on role (polecat/crew
  only)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

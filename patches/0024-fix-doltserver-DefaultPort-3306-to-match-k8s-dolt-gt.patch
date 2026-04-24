@@ -1,7 +1,7 @@
 From 9bd24f75ff0be3b0abda6a7359d9ae8d35c7e09c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 23 Apr 2026 22:56:25 -0400
-Subject: [PATCH 24/28] fix(doltserver): DefaultPort 3306 to match k8s dolt
+Subject: [PATCH 24/30] fix(doltserver): DefaultPort 3306 to match k8s dolt
  (gt-9q4j)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

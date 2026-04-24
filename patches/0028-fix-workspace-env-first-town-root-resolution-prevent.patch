@@ -1,7 +1,7 @@
-From 9918b79aa591707b33ed2b003d9d899e185556a1 Mon Sep 17 00:00:00 2001
+From 48e7295f4522ea9f9edf52ecbedc7f6bf946b84b Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 17:33:23 -0400
-Subject: [PATCH 28/28] fix(workspace): env-first town-root resolution prevents
+Subject: [PATCH 28/30] fix(workspace): env-first town-root resolution prevents
  phantom-town split-brain
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
