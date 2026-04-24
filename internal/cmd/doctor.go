@@ -194,8 +194,10 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewOverlayHealthCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
-	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
-	d.Register(doctor.NewStaleDoltPortCheck())      // Check for stale Dolt port files
+	// RigConfigSyncCheck and StaleDoltPortCheck unregistered on this fork:
+	// both auto-fix toward a local .dolt-data/config.yaml, but our canonical
+	// Dolt lives in k8s (dolt.databases.svc.cluster.local:3306). Their Fix()
+	// would rewrite metadata.json away from the k8s server.
 	d.Register(doctor.NewStaleSQLServerInfoCheck()) // Check for stale sql-server.info files (GH#2770)
 	d.Register(doctor.NewPrefixMismatchCheck())
 	d.Register(doctor.NewDatabasePrefixCheck())
