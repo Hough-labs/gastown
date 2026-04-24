@@ -1,0 +1,229 @@
+From bc92f050a612f23f6e5daee00f5b209e7c9077ea Mon Sep 17 00:00:00 2001
+From: maloferriol <maloferriol@gmail.com>
+Date: Sun, 12 Apr 2026 22:24:02 +0200
+Subject: [PATCH 022/110] fix: sling retry noise, convoy cross-rig routing,
+ mail error detection (#3511)
+
+* fix: reduce sling retry noise and fix convoy cross-rig routing
+
+1. SetAgentStateWithRetry: reduce retries from 10 (2min) to 3 (3.5s).
+   Agent state is monitoring-only; caller already treats errors as
+   warn-only. Avoids blocking interactive `gt sling` on persistent
+   Dolt failures. (hq-bfp7, hq-htfi)
+
+2. bdListChildren: use resolveBeadDir instead of beadsDirForID. The
+   latter returns the .beads directory itself, causing bd to look for
+   .beads/.beads/ which doesn't exist. Also strip BEADS_DIR from env,
+   consistent with bdShow/bdDepList. (hq-db5)
+
+3. createStagedConvoy: replace raw exec.Command with BdCmd builder
+   using Dir()+StripBeadsDir(), preventing inherited BEADS_DIR from
+   routing bd to the wrong database. (hq-db5)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+Executed-By: mayor
+
+* fix: match bd "no issue found" error in mail not-found detection
+
+bd returns "no issue found matching" for missing beads, but the mail
+package only checked for "not found" substring. This prevented the
+cross-rig fallback from triggering when looking up wisps (sh-wisp-*)
+that route to shipyard but live in hq.
+
+Add "no issue found" as an additional match pattern in all
+ContainsError checks across mailbox.go and delivery.go.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+Executed-By: mayor
+---
+ internal/cmd/convoy_stage.go             | 16 ++++++++++++----
+ internal/cmd/convoy_test_helpers_test.go |  2 +-
+ internal/mail/delivery.go                |  2 +-
+ internal/mail/mailbox.go                 | 16 ++++++++--------
+ internal/polecat/manager.go              | 15 ++++++++++++---
+ 5 files changed, 34 insertions(+), 17 deletions(-)
+
+diff --git a/internal/cmd/convoy_stage.go b/internal/cmd/convoy_stage.go
+index 3b9992d6..0a016a5b 100644
+--- a/internal/cmd/convoy_stage.go
++++ b/internal/cmd/convoy_stage.go
+@@ -726,9 +726,11 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
+ 	}
+ 
+ 	// Set the staged status.
+-	statusCmd := exec.Command("bd", "update", convoyID, "--status="+status)
+-	statusCmd.Dir = townBeads
+-	if out, err := statusCmd.CombinedOutput(); err != nil {
++	// Strip BEADS_DIR so bd discovers the correct database from Dir()
++	// rather than using an inherited (possibly wrong) override.
++	if out, err := BdCmd("update", convoyID, "--status="+status).
++		Dir(townBeads).StripBeadsDir().WithAutoCommit().
++		CombinedOutput(); err != nil {
+ 		return "", fmt.Errorf("bd update convoy status: %w\noutput: %s", err, out)
+ 	}
+ 
+@@ -1491,8 +1493,14 @@ func bdDepList(beadID string) ([]bdDepResult, error) {
+ // routes.jsonl so this works regardless of the caller's working directory.
+ func bdListChildren(parentID string) ([]bdShowResult, error) {
+ 	cmd := exec.Command("bd", "list", "--parent="+parentID, "--json")
+-	if dir := beadsDirForID(parentID); dir != "" {
++	// Route to the correct rig database via prefix resolution.
++	// resolveBeadDir returns the parent of .beads (the working directory bd
++	// expects), unlike beadsDirForID which returns the .beads directory itself.
++	// Also strip BEADS_DIR to prevent inherited overrides from interfering
++	// with bd's workspace detection (consistent with bdShow/bdDepList).
++	if dir := resolveBeadDir(parentID); dir != "" && dir != "." {
+ 		cmd.Dir = dir
++		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
+ 	}
+ 	out, err := cmd.Output()
+ 	if err != nil {
+diff --git a/internal/cmd/convoy_test_helpers_test.go b/internal/cmd/convoy_test_helpers_test.go
+index d3186d5d..f34c0f79 100644
+--- a/internal/cmd/convoy_test_helpers_test.go
++++ b/internal/cmd/convoy_test_helpers_test.go
+@@ -407,7 +407,7 @@ func (d *testDAG) Setup(t *testing.T) (townRoot, logPath string) {
+ 	}
+ 
+ 	// Create rig .beads directories referenced by routes so that
+-	// beadsDirForID() can resolve them and bdListChildren() can chdir.
++	// resolveBeadDir() can resolve them and bdListChildren() can chdir.
+ 	for _, b := range d.beads {
+ 		if b.Rig != "" {
+ 			rigBeadsDir := filepath.Join(townRoot, b.Rig, ".beads")
+diff --git a/internal/mail/delivery.go b/internal/mail/delivery.go
+index 63fc3b59..86a9d103 100644
+--- a/internal/mail/delivery.go
++++ b/internal/mail/delivery.go
+@@ -98,7 +98,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
+ 		if err == nil {
+ 			continue // bd label add silently succeeds on duplicate labels.
+ 		}
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found")) {
+ 			return ErrMessageNotFound
+ 		}
+ 		return err
+diff --git a/internal/mail/mailbox.go b/internal/mail/mailbox.go
+index 57a362cd..933b8a70 100644
+--- a/internal/mail/mailbox.go
++++ b/internal/mail/mailbox.go
+@@ -490,7 +490,7 @@ func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
+ 	defer cancel()
+ 	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+ 	if err != nil {
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") || bdErr.ContainsError("no issue found")) {
+ 			return nil, ErrMessageNotFound
+ 		}
+ 		return nil, err
+@@ -566,7 +566,7 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
+ 		To: m.identity,
+ 	}, err)
+ 	if err != nil {
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
+ 			return ErrMessageNotFound
+ 		}
+ 		return err
+@@ -626,14 +626,14 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
+ 	defer cancel()
+ 	_, err := runBdCommand(ctx, args, m.workDir, primary)
+ 	if err != nil {
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
+ 			if primary != m.beadsDir {
+ 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
+ 				ctx2, cancel2 := bdWriteCtx()
+ 				defer cancel2()
+ 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
+ 				if err2 != nil {
+-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
++					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
+ 						return ErrMessageNotFound
+ 					}
+ 					return err2
+@@ -671,14 +671,14 @@ func (m *Mailbox) markUnreadOnlyBeads(id string) error {
+ 	defer cancel()
+ 	_, err := runBdCommand(ctx, args, m.workDir, primary)
+ 	if err != nil {
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
+ 			if primary != m.beadsDir {
+ 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
+ 				ctx2, cancel2 := bdWriteCtx()
+ 				defer cancel2()
+ 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
+ 				if err2 != nil {
+-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
++					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
+ 						return ErrMessageNotFound
+ 					}
+ 					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("does not have label") {
+@@ -720,14 +720,14 @@ func (m *Mailbox) markUnreadBeads(id string) error {
+ 	defer cancel()
+ 	_, err := runBdCommand(ctx, args, m.workDir, primary)
+ 	if err != nil {
+-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
++		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
+ 			if primary != m.beadsDir {
+ 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
+ 				ctx2, cancel2 := bdWriteCtx()
+ 				defer cancel2()
+ 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
+ 				if err2 != nil {
+-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
++					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
+ 						return ErrMessageNotFound
+ 					}
+ 					return err2
+diff --git a/internal/polecat/manager.go b/internal/polecat/manager.go
+index edda76c1..78a1649e 100644
+--- a/internal/polecat/manager.go
++++ b/internal/polecat/manager.go
+@@ -38,6 +38,15 @@ const (
+ 	doltMaxRetries  = 10
+ 	doltBaseBackoff = 500 * time.Millisecond
+ 	doltBackoffMax  = 30 * time.Second
++
++	// doltStateRetries is a reduced retry count for SetAgentStateWithRetry.
++	// Agent state is a monitoring concern, not a correctness requirement (see
++	// comment on SetAgentStateWithRetry). 10 retries with exponential backoff
++	// wastes ~2 minutes on persistent failures, blocking `gt sling` for no
++	// benefit since the caller already treats errors as warn-only.
++	// 3 retries (total backoff ~3.5s) is sufficient to ride out transient
++	// Dolt hiccups without punishing interactive workflows.
++	doltStateRetries = 3
+ )
+ 
+ // doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
+@@ -339,7 +348,7 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
+ // Fails fast on configuration/initialization errors (gt-2ra).
+ func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
+ 	var lastErr error
+-	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
++	for attempt := 1; attempt <= doltStateRetries; attempt++ {
+ 		err := m.SetAgentState(name, state)
+ 		if err == nil {
+ 			return nil
+@@ -349,13 +358,13 @@ func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
+ 		if isDoltConfigError(err) {
+ 			return fmt.Errorf("setting agent state failed (DB not initialized — not retrying): %w", err)
+ 		}
+-		if attempt < doltMaxRetries {
++		if attempt < doltStateRetries {
+ 			backoff := doltBackoff(attempt)
+ 			style.PrintWarning("SetAgentState attempt %d failed, retrying in %v: %v", attempt, backoff, err)
+ 			time.Sleep(backoff)
+ 		}
+ 	}
+-	return fmt.Errorf("setting agent state after %d attempts: %w", doltMaxRetries, lastErr)
++	return fmt.Errorf("setting agent state after %d attempts: %w", doltStateRetries, lastErr)
+ }
+ 
+ // assigneeID returns the beads assignee identifier for a polecat.
+-- 
+2.43.0
+

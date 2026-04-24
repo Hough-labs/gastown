@@ -1,0 +1,286 @@
+From 01c3edde3f4e12eb37d8c03a6e2c9d494e2fcfaa Mon Sep 17 00:00:00 2001
+From: Andrew Boldi <andrewjboldi@gmail.com>
+Date: Sun, 12 Apr 2026 13:45:11 -0700
+Subject: [PATCH 048/110] fix(nudge): normalize trailing slash in nudge targets
+ (#3591)
+
+* Add rig add API endpoint and whitelist for enclave dashboard
+
+- Add `rig add` to AllowedCommands whitelist (with confirmation required)
+- Add /api/rig/add endpoint that supports local bare repo creation
+  for use within Nitro Enclaves where GitHub access is not available
+- Local repo flow: mkdir + git init --bare + clone + initial commit + push
+- Invalidate options cache after rig creation so rig list updates
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+* fix(nudge): normalize trailing slash in nudge targets
+
+The mail system uses "mayor/" and "deacon/" as canonical addresses, but
+runNudge's role shortcut check expects bare names ("mayor", "deacon").
+When the refinery engineer sends `gt nudge "mayor/" ...`, the trailing
+slash causes it to bypass the role shortcut and hit parseAddress, which
+splits "mayor/" into ["mayor", ""] and rejects the empty second
+component. This silently drops all refinery-to-mayor nudges (post-merge,
+branch-missing, merge-failure notifications).
+
+Fix: TrimSuffix the trailing "/" early in runNudge before role resolution.
+
+Also fixes pre-existing build error in compact_report_test.go
+(wispTypeToCategory signature gained a second parameter).
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ internal/cmd/compact_report_test.go |  28 ++++----
+ internal/cmd/nudge.go               |   6 ++
+ internal/cmd/nudge_test.go          |  35 ++++++++++
+ internal/web/api.go                 | 104 ++++++++++++++++++++++++++++
+ internal/web/commands.go            |   1 +
+ 5 files changed, 161 insertions(+), 13 deletions(-)
+
+diff --git a/internal/cmd/compact_report_test.go b/internal/cmd/compact_report_test.go
+index 9a646a32..94cfe608 100644
+--- a/internal/cmd/compact_report_test.go
++++ b/internal/cmd/compact_report_test.go
+@@ -10,25 +10,27 @@ import (
+ func TestWispTypeToCategory(t *testing.T) {
+ 	tests := []struct {
+ 		wispType string
++		title    string
+ 		want     string
+ 	}{
+-		{"heartbeat", "Heartbeats"},
+-		{"ping", "Heartbeats"},
+-		{"patrol", "Patrols"},
+-		{"gc_report", "Patrols"},
+-		{"error", "Errors"},
+-		{"recovery", "Errors"},
+-		{"escalation", "Errors"},
+-		{"", "Untyped"},
+-		{"unknown", "Untyped"},
+-		{"default", "Untyped"},
++		{"heartbeat", "", "Heartbeats"},
++		{"ping", "", "Heartbeats"},
++		{"patrol", "", "Patrols"},
++		{"gc_report", "", "Patrols"},
++		{"error", "", "Errors"},
++		{"recovery", "", "Errors"},
++		{"escalation", "", "Errors"},
++		{"", "", "Untyped"},
++		{"unknown", "", "Untyped"},
++		{"default", "", "Untyped"},
++		{"", "Patrol report", "Patrols"},
+ 	}
+ 
+ 	for _, tc := range tests {
+-		t.Run(tc.wispType, func(t *testing.T) {
+-			got := wispTypeToCategory(tc.wispType, "")
++		t.Run(tc.wispType+"/"+tc.title, func(t *testing.T) {
++			got := wispTypeToCategory(tc.wispType, tc.title)
+ 			if got != tc.want {
+-				t.Errorf("wispTypeToCategory(%q, \"\") = %q, want %q", tc.wispType, got, tc.want)
++				t.Errorf("wispTypeToCategory(%q, %q) = %q, want %q", tc.wispType, tc.title, got, tc.want)
+ 			}
+ 		})
+ 	}
+diff --git a/internal/cmd/nudge.go b/internal/cmd/nudge.go
+index e585abba..f284aad0 100644
+--- a/internal/cmd/nudge.go
++++ b/internal/cmd/nudge.go
+@@ -379,6 +379,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
+ 
+ 	target := args[0]
+ 
++	// Normalize trailing slash: the mail system uses "mayor/" and "deacon/"
++	// as canonical addresses, but nudge role shortcuts expect bare names.
++	// Without this, "mayor/" falls through to parseAddress which rejects
++	// the empty second component, silently dropping the nudge.
++	target = strings.TrimSuffix(target, "/")
++
+ 	// Handle --stdin: read message from stdin (avoids shell quoting issues)
+ 	if nudgeStdinFlag {
+ 		if nudgeMessageFlag != "" {
+diff --git a/internal/cmd/nudge_test.go b/internal/cmd/nudge_test.go
+index a7f5fd05..1b50cffc 100644
+--- a/internal/cmd/nudge_test.go
++++ b/internal/cmd/nudge_test.go
+@@ -444,6 +444,41 @@ func TestIdleWatcherPollInterval(t *testing.T) {
+ 	}
+ }
+ 
++func TestNudgeTrailingSlashNormalization(t *testing.T) {
++	// The mail system uses "mayor/" and "deacon/" as canonical addresses.
++	// runNudge must strip the trailing slash so these match the role shortcuts.
++	// Without normalization, "mayor/" falls through to parseAddress which
++	// rejects it ("invalid address format"), silently dropping the nudge.
++	origMode := nudgeModeFlag
++	origPriority := nudgePriorityFlag
++	origMessage := nudgeMessageFlag
++	origStdin := nudgeStdinFlag
++	origTimeout := waitIdleTimeout
++	defer func() {
++		nudgeModeFlag = origMode
++		nudgePriorityFlag = origPriority
++		nudgeMessageFlag = origMessage
++		nudgeStdinFlag = origStdin
++		waitIdleTimeout = origTimeout
++	}()
++
++	waitIdleTimeout = 200 * time.Millisecond
++	nudgeStdinFlag = false
++	nudgeMessageFlag = "test"
++	nudgePriorityFlag = "normal"
++	nudgeModeFlag = NudgeModeImmediate
++
++	for _, target := range []string{"mayor/", "deacon/", "witness/", "refinery/"} {
++		t.Run(target, func(t *testing.T) {
++			err := runNudge(nudgeCmd, []string{target, "hello"})
++			// Will fail on tmux/session lookup, but must NOT fail on address parsing.
++			if err != nil && strings.Contains(err.Error(), "invalid address format") {
++				t.Errorf("trailing-slash target %q was rejected as invalid address: %v", target, err)
++			}
++		})
++	}
++}
++
+ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
+ 	// watchAndDeliver should exit immediately when queue is empty
+ 	// (someone else drained it). We test this by calling with a
+diff --git a/internal/web/api.go b/internal/web/api.go
+index 1ddfacb5..16071544 100644
+--- a/internal/web/api.go
++++ b/internal/web/api.go
+@@ -131,6 +131,8 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		h.handleIssueUpdate(w, r)
+ 	case path == "/pr/show" && r.Method == http.MethodGet:
+ 		h.handlePRShow(w, r)
++	case path == "/rig/add" && r.Method == http.MethodPost:
++		h.handleRigAdd(w, r)
+ 	case path == "/crew" && r.Method == http.MethodGet:
+ 		h.handleCrew(w, r)
+ 	case path == "/ready" && r.Method == http.MethodGet:
+@@ -2167,3 +2169,105 @@ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
+ 	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
+ 	return fmt.Sprintf("%x", h256[:8])
+ }
++
++// handleRigAdd creates a new rig, optionally with a local bare repo.
++func (h *APIHandler) handleRigAdd(w http.ResponseWriter, r *http.Request) {
++	var req struct {
++		Name    string `json:"name"`
++		RepoURL string `json:"repo_url,omitempty"`
++		Local   bool   `json:"local,omitempty"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		h.sendError(w, "Invalid request body", http.StatusBadRequest)
++		return
++	}
++	if req.Name == "" {
++		h.sendError(w, "Rig name is required", http.StatusBadRequest)
++		return
++	}
++	if !isValidRigName(req.Name) {
++		h.sendError(w, "Invalid rig name: must be alphanumeric/underscore only", http.StatusBadRequest)
++		return
++	}
++
++	repoURL := req.RepoURL
++	if req.Local || repoURL == "" {
++		// Create a local bare repo with an initial commit
++		localRepoPath := fmt.Sprintf("/tmp/gastown-repos/%s.git", req.Name)
++
++		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
++		defer cancel()
++
++		// Create bare repo
++		mkdirCmd := exec.CommandContext(ctx, "mkdir", "-p", localRepoPath)
++		if out, err := mkdirCmd.CombinedOutput(); err != nil {
++			h.sendError(w, fmt.Sprintf("Failed to create repo dir: %s %v", string(out), err), http.StatusInternalServerError)
++			return
++		}
++
++		initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
++		initCmd.Dir = localRepoPath
++		if out, err := initCmd.CombinedOutput(); err != nil {
++			h.sendError(w, fmt.Sprintf("Failed to init bare repo: %s %v", string(out), err), http.StatusInternalServerError)
++			return
++		}
++
++		// Clone, create initial commit, push
++		tmpDir := fmt.Sprintf("/tmp/gastown-repos/.tmp-%s", req.Name)
++		cloneCmd := exec.CommandContext(ctx, "git", "clone", localRepoPath, tmpDir)
++		if out, err := cloneCmd.CombinedOutput(); err != nil {
++			h.sendError(w, fmt.Sprintf("Failed to clone: %s %v", string(out), err), http.StatusInternalServerError)
++			return
++		}
++		defer func() {
++			_ = exec.CommandContext(context.Background(), "rm", "-rf", tmpDir).Run()
++		}()
++
++		commitCmd := exec.CommandContext(ctx, "git", "commit", "--allow-empty", "-m", "Initial commit")
++		commitCmd.Dir = tmpDir
++		if out, err := commitCmd.CombinedOutput(); err != nil {
++			h.sendError(w, fmt.Sprintf("Failed to create initial commit: %s %v", string(out), err), http.StatusInternalServerError)
++			return
++		}
++
++		pushCmd := exec.CommandContext(ctx, "git", "push", "origin", "HEAD:main")
++		pushCmd.Dir = tmpDir
++		if out, err := pushCmd.CombinedOutput(); err != nil {
++			h.sendError(w, fmt.Sprintf("Failed to push: %s %v", string(out), err), http.StatusInternalServerError)
++			return
++		}
++
++		repoURL = localRepoPath
++	} else if !isValidGitURL(repoURL) {
++		h.sendError(w, "Invalid git URL", http.StatusBadRequest)
++		return
++	}
++
++	// Run gt rig add
++	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
++	defer cancel()
++
++	output, err := h.runGtCommand(ctx, 55*time.Second, []string{"rig", "add", req.Name, repoURL})
++	if err != nil {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusInternalServerError)
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"success": false,
++			"error":   err.Error(),
++			"output":  output,
++		})
++		return
++	}
++
++	// Invalidate options cache so rig list updates
++	h.optionsCacheMu.Lock()
++	h.optionsCache = nil
++	h.optionsCacheMu.Unlock()
++
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]any{
++		"success": true,
++		"message": fmt.Sprintf("Rig '%s' created successfully", req.Name),
++		"output":  output,
++	})
++}
+diff --git a/internal/web/commands.go b/internal/web/commands.go
+index 26373528..32529bb8 100644
+--- a/internal/web/commands.go
++++ b/internal/web/commands.go
+@@ -70,6 +70,7 @@ var AllowedCommands = map[string]CommandMeta{
+ 	"convoy add":     {Confirm: true, Desc: "Add issue to convoy", Category: "Convoys", Args: "<convoy-id> <issue>", ArgType: "convoys"},
+ 
+ 	// Rig actions
++	"rig add":   {Confirm: true, Desc: "Add rig", Category: "Rigs", Args: "<rig-name> <git-url>"},
+ 	"rig boot":  {Confirm: true, Desc: "Boot rig", Category: "Rigs", Args: "<rig-name>", ArgType: "rigs"},
+ 	"rig start": {Confirm: true, Desc: "Start rig", Category: "Rigs", Args: "<rig-name>", ArgType: "rigs"},
+ 
+-- 
+2.43.0
+

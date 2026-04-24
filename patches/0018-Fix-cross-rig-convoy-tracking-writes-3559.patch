@@ -1,0 +1,628 @@
+From a1c2f63e7761c16b6db9d7a23c2c616700a79990 Mon Sep 17 00:00:00 2001
+From: David Kim <1606756+davidmwkim@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 16:23:51 -0400
+Subject: [PATCH 018/110] Fix cross-rig convoy tracking writes (#3559)
+
+---
+ internal/cmd/convoy.go                  | 56 ++++----------
+ internal/cmd/convoy_bd_routing_test.go  | 97 ++++++++++++++++++------
+ internal/cmd/convoy_stage.go            | 25 ++-----
+ internal/cmd/formula.go                 | 15 +---
+ internal/cmd/sling_batch_test.go        | 25 +++++--
+ internal/cmd/sling_convoy.go            | 16 +---
+ internal/cmd/synthesis.go               |  7 +-
+ internal/cmd/tracking_relations.go      | 99 +++++++++++++++++++++++++
+ internal/cmd/tracking_relations_test.go | 31 ++++++++
+ 9 files changed, 252 insertions(+), 119 deletions(-)
+ create mode 100644 internal/cmd/tracking_relations.go
+ create mode 100644 internal/cmd/tracking_relations_test.go
+
+diff --git a/internal/cmd/convoy.go b/internal/cmd/convoy.go
+index 3bf5d381..90a3e009 100644
+--- a/internal/cmd/convoy.go
++++ b/internal/cmd/convoy.go
+@@ -235,7 +235,7 @@ Examples:
+   # Auto-discover issues from an epic's children:
+   gt convoy create --from-epic gt-epic-abc
+   gt convoy create --from-epic gt-epic-abc --owned --merge=direct`,
+-	Args: cobra.ArbitraryArgs,
++	Args:         cobra.ArbitraryArgs,
+ 	SilenceUsage: true,
+ 	RunE:         runConvoyCreate,
+ }
+@@ -247,7 +247,7 @@ var convoyStatusCmd = &cobra.Command{
+ 
+ Displays convoy metadata, tracked issues, and completion progress.
+ Without an ID, shows status of all active convoys.`,
+-	Args: cobra.MaximumNArgs(1),
++	Args:         cobra.MaximumNArgs(1),
+ 	SilenceUsage: true,
+ 	RunE:         runConvoyStatus,
+ }
+@@ -277,7 +277,7 @@ If the convoy is closed, it will be automatically reopened.
+ Examples:
+   gt convoy add hq-cv-abc gt-new-issue
+   gt convoy add hq-cv-abc gt-issue1 gt-issue2 gt-issue3`,
+-	Args: cobra.MinimumNArgs(2),
++	Args:         cobra.MinimumNArgs(2),
+ 	SilenceUsage: true,
+ 	RunE:         runConvoyAdd,
+ }
+@@ -298,7 +298,7 @@ Examples:
+   gt convoy check              # Check all open convoys
+   gt convoy check hq-cv-abc    # Check specific convoy
+   gt convoy check --dry-run    # Preview what would close without acting`,
+-	Args: cobra.MaximumNArgs(1),
++	Args:         cobra.MaximumNArgs(1),
+ 	SilenceUsage: true,
+ 	RunE:         runConvoyCheck,
+ }
+@@ -340,7 +340,7 @@ Examples:
+   gt convoy close hq-cv-abc --force                   # Force close abandoned convoy
+   gt convoy close hq-cv-abc --reason="no longer needed" --force
+   gt convoy close hq-cv-xyz --notify mayor/`,
+-	Args: cobra.ExactArgs(1),
++	Args:         cobra.ExactArgs(1),
+ 	SilenceUsage: true,
+ 	RunE:         runConvoyClose,
+ }
+@@ -719,26 +719,11 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
+ 
+ 	// Notify address is stored in description (line 166-168) and read from there
+ 
+-	// Run dep add from town root so bd routes correctly across rigs via
+-	// routes.jsonl. getTownBeadsDir() already returns the town root.
+-	// StripBeadsDir prevents inherited BEADS_DIR from overriding routing.
+-
+ 	// Add 'tracks' relations for each tracked issue
+ 	trackedCount := 0
+ 	for _, issueID := range trackedIssues {
+-		// Use --type=tracks for non-blocking tracking relation
+-		var depStderr bytes.Buffer
+-		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
+-			WithAutoCommit().
+-			Dir(townBeads).
+-			StripBeadsDir().
+-			Stderr(&depStderr).
+-			Run(); err != nil {
+-			errMsg := strings.TrimSpace(depStderr.String())
+-			if errMsg == "" {
+-				errMsg = err.Error()
+-			}
+-			style.PrintWarning("couldn't track %s: %s", issueID, errMsg)
++		if err := addTrackingRelationFn(townBeads, convoyID, issueID); err != nil {
++			style.PrintWarning("couldn't track %s: %s", issueID, err)
+ 		} else {
+ 			trackedCount++
+ 		}
+@@ -839,24 +824,11 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
+ 		fmt.Printf("%s Reopened convoy %s\n", style.Bold.Render("↺"), convoyID)
+ 	}
+ 
+-	// Run dep add from town root so bd routes correctly across rigs via
+-	// routes.jsonl. getTownBeadsDir() already returns the town root.
+-
+ 	// Add 'tracks' relations for each issue
+ 	addedCount := 0
+ 	for _, issueID := range issuesToAdd {
+-		var depStderr bytes.Buffer
+-		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
+-			Dir(townBeads).
+-			WithAutoCommit().
+-			StripBeadsDir().
+-			Stderr(&depStderr).
+-			Run(); err != nil {
+-			errMsg := strings.TrimSpace(depStderr.String())
+-			if errMsg == "" {
+-				errMsg = err.Error()
+-			}
+-			style.PrintWarning("couldn't add %s: %s", issueID, errMsg)
++		if err := addTrackingRelationFn(townBeads, convoyID, issueID); err != nil {
++			style.PrintWarning("couldn't add %s: %s", issueID, err)
+ 		} else {
+ 			addedCount++
+ 		}
+@@ -2173,11 +2145,11 @@ func formatConvoyStatus(status string) string {
+ 
+ // trackedIssueInfo holds info about an issue being tracked by a convoy.
+ type trackedIssueInfo struct {
+-	ID        string `json:"id"`
+-	Title     string `json:"title"`
+-	Status    string `json:"status"`
+-	Type      string `json:"dependency_type"`
+-	IssueType string `json:"issue_type"`
++	ID        string   `json:"id"`
++	Title     string   `json:"title"`
++	Status    string   `json:"status"`
++	Type      string   `json:"dependency_type"`
++	IssueType string   `json:"issue_type"`
+ 	Blocked   bool     `json:"blocked,omitempty"`    // True if issue currently has blockers
+ 	Assignee  string   `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
+ 	Labels    []string `json:"labels,omitempty"`     // Bead labels (propagated from trackedDependency)
+diff --git a/internal/cmd/convoy_bd_routing_test.go b/internal/cmd/convoy_bd_routing_test.go
+index af1b9f1d..df93691e 100644
+--- a/internal/cmd/convoy_bd_routing_test.go
++++ b/internal/cmd/convoy_bd_routing_test.go
+@@ -212,11 +212,9 @@ esac
+ 	}
+ }
+ 
+-// TestConvoyCreate_DepAddUsesTownRoot verifies that `dep add` during convoy
+-// create runs from the town root (not its parent), so bd's prefix routing
+-// can resolve cross-rig beads via routes.jsonl. This was the root cause of
+-// "no beads database found" when tracking beads from other rigs. (GH#2960)
+-func TestConvoyCreate_DepAddUsesTownRoot(t *testing.T) {
++// TestConvoyCreate_UsesTrackingHelper verifies convoy create delegates tracking
++// to the in-process helper instead of shelling out to `bd dep add`.
++func TestConvoyCreate_UsesTrackingHelper(t *testing.T) {
+ 	if runtime.GOOS == "windows" {
+ 		t.Skip("skipping on windows - shell stubs")
+ 	}
+@@ -231,22 +229,21 @@ func TestConvoyCreate_DepAddUsesTownRoot(t *testing.T) {
+ 	_ = os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(typesList), 0644)
+ 	_ = os.WriteFile(filepath.Join(beadsDir, ".gt-statuses-configured"), []byte("staged_ready,staged_warnings"), 0644)
+ 
+-	// Track which directory dep add runs from.
+-	depLogPath := filepath.Join(t.TempDir(), "dep-add.log")
++	var helperTownRoot, helperConvoyID, helperIssueID string
++	oldAddTracking := addTrackingRelationFn
++	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
++		helperTownRoot = townRoot
++		helperConvoyID = convoyID
++		helperIssueID = issueID
++		return nil
++	}
++	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
+ 
+-	scriptBody := fmt.Sprintf(`
++	scriptBody := `
+ case "$1" in
+   create)
+     echo '[{"id":"hq-cv-test"}]'
+     ;;
+-  dep)
+-    # Log the working directory for dep add calls
+-    echo "$PWD" >> %s
+-    if [ "$PWD" != "%s" ]; then
+-      echo "dep add: expected town root %s, got $PWD" >&2
+-      exit 1
+-    fi
+-    ;;
+   init|config)
+     exit 0
+     ;;
+@@ -254,7 +251,7 @@ case "$1" in
+     echo '[]'
+     ;;
+ esac
+-`, depLogPath, expectedWD, expectedWD)
++`
+ 	writeRoutingBdStub(t, scriptBody)
+ 
+ 	// Override the entropy source for deterministic convoy IDs.
+@@ -269,13 +266,67 @@ esac
+ 		t.Fatalf("runConvoyCreate: %v", err)
+ 	}
+ 
+-	// Verify dep add was called from the town root
+-	logData, err := os.ReadFile(depLogPath)
++	if helperTownRoot != expectedWD {
++		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, expectedWD)
++	}
++	if helperConvoyID != "hq-cv-pqrst" {
++		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, "hq-cv-pqrst")
++	}
++	if helperIssueID != "mo-2sh.1" {
++		t.Errorf("tracking helper issueID = %q, want %q", helperIssueID, "mo-2sh.1")
++	}
++}
++
++func TestConvoyAdd_UsesTrackingHelper(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on windows - shell stubs")
++	}
++
++	townRoot, expectedWD := makeRoutingTownWorkspace(t)
++	chdirConvoyTest(t, townRoot)
++
++	var helperTownRoot, helperConvoyID string
++	var helperIssues []string
++	oldAddTracking := addTrackingRelationFn
++	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
++		helperTownRoot = townRoot
++		helperConvoyID = convoyID
++		helperIssues = append(helperIssues, issueID)
++		return nil
++	}
++	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
++
++	scriptBody := fmt.Sprintf(`
++case "$*" in
++  "show hq-cv-test --json")
++    if [ "$PWD" != "%s" ]; then
++      echo "expected town root, got $PWD" >&2
++      exit 1
++    fi
++    echo '[{"id":"hq-cv-test","title":"Test Convoy","status":"open","issue_type":"convoy"}]'
++    ;;
++  *)
++    echo "unexpected bd args: $*" >&2
++    exit 1
++    ;;
++esac
++`, expectedWD)
++	writeRoutingBdStub(t, scriptBody)
++
++	_, err := captureConvoyStdoutErr(t, func() error {
++		return runConvoyAdd(nil, []string{"hq-cv-test", "ag-95s.1", "ag-95s.2"})
++	})
+ 	if err != nil {
+-		t.Fatalf("dep add was never called (no log file): %v", err)
++		t.Fatalf("runConvoyAdd: %v", err)
++	}
++
++	if helperTownRoot != expectedWD {
++		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, expectedWD)
++	}
++	if helperConvoyID != "hq-cv-test" {
++		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, "hq-cv-test")
+ 	}
+-	logged := strings.TrimSpace(string(logData))
+-	if logged != expectedWD {
+-		t.Errorf("dep add ran from %q, want town root %q", logged, expectedWD)
++	if got := strings.Join(helperIssues, ","); got != "ag-95s.1,ag-95s.2" {
++		t.Errorf("tracking helper issues = %q, want %q", got, "ag-95s.1,ag-95s.2")
+ 	}
+ }
+diff --git a/internal/cmd/convoy_stage.go b/internal/cmd/convoy_stage.go
+index e8f8aa77..3b9992d6 100644
+--- a/internal/cmd/convoy_stage.go
++++ b/internal/cmd/convoy_stage.go
+@@ -45,9 +45,9 @@ func init() {
+ 
+ // StageResult is the top-level JSON output for gt convoy stage --json.
+ type StageResult struct {
+-	Status           string          `json:"status"`              // "staged_ready", "staged_warnings", or "error"
+-	ConvoyID         string          `json:"convoy_id"`           // empty if errors prevented creation
+-	Restaged         bool            `json:"restaged"`            // true if an existing convoy was updated in place
++	Status           string          `json:"status"`                       // "staged_ready", "staged_warnings", or "error"
++	ConvoyID         string          `json:"convoy_id"`                    // empty if errors prevented creation
++	Restaged         bool            `json:"restaged"`                     // true if an existing convoy was updated in place
+ 	ValidationBeadID string          `json:"validation_bead_id,omitempty"` // capstone validation bead (epic input only)
+ 	Errors           []FindingJSON   `json:"errors"`
+ 	Warnings         []FindingJSON   `json:"warnings"`
+@@ -733,15 +733,9 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
+ 	}
+ 
+ 	// Track each slingable bead via bd dep add.
+-	// Cross-rig tracking may fail because bd validates both IDs exist in the
+-	// same database (beads v0.62 removed cross-rig routing). Non-fatal: the
+-	// convoy still works without tracking deps.
+ 	for _, beadID := range slingableIDs {
+-		if out, err := BdCmd("dep", "add", convoyID, beadID, "--type=tracks").
+-			Dir(townBeads).WithAutoCommit().StripBeadsDir().
+-			CombinedOutput(); err != nil {
++		if err := addTrackingRelationFn(townBeads, convoyID, beadID); err != nil {
+ 			fmt.Printf("  Warning: could not track %s in convoy: %v\n", beadID, err)
+-			_ = out
+ 		}
+ 	}
+ 
+@@ -774,14 +768,10 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
+ 	}
+ 
+ 	// Add new beads not currently tracked.
+-	// Cross-rig tracking may fail (bd validates both IDs in same DB). Non-fatal.
+ 	for _, id := range desiredIDs {
+ 		if !currentIDs[id] {
+-			if out, err := BdCmd("dep", "add", existingConvoyID, id, "--type=tracks").
+-				Dir(townBeads).WithAutoCommit().StripBeadsDir().
+-				CombinedOutput(); err != nil {
++			if err := addTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+ 				fmt.Printf("  Warning: could not track %s in convoy: %v\n", id, err)
+-				_ = out
+ 			}
+ 		}
+ 	}
+@@ -789,11 +779,8 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
+ 	// Remove stale beads no longer in the DAG.
+ 	for id := range currentIDs {
+ 		if !desiredSet[id] {
+-			if out, err := BdCmd("dep", "remove", existingConvoyID, id, "--type=tracks").
+-				Dir(townBeads).WithAutoCommit().StripBeadsDir().
+-				CombinedOutput(); err != nil {
++			if err := removeTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+ 				fmt.Printf("  Warning: could not untrack %s from convoy: %v\n", id, err)
+-				_ = out
+ 			}
+ 		}
+ 	}
+diff --git a/internal/cmd/formula.go b/internal/cmd/formula.go
+index 691977bc..d8c9cb09 100644
+--- a/internal/cmd/formula.go
++++ b/internal/cmd/formula.go
+@@ -588,10 +588,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
+ 		}
+ 
+ 		// Track the leg with the convoy
+-		if err := BdCmd("dep", "add", convoyID, legBeadID, "--type=tracks").
+-			WithAutoCommit().
+-			Dir(townBeads).
+-			Run(); err != nil {
++		if err := addTrackingRelationFn(townBeads, convoyID, legBeadID); err != nil {
+ 			fmt.Printf("%s Failed to track leg %s: %v\n",
+ 				style.Dim.Render("Warning:"), leg.ID, err)
+ 		}
+@@ -630,10 +627,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
+ 				style.Dim.Render("Warning:"), err)
+ 		} else {
+ 			// Track synthesis with convoy
+-			_ = BdCmd("dep", "add", convoyID, synthesisBeadID, "--type=tracks").
+-				WithAutoCommit().
+-				Dir(townBeads).
+-				Run()
++			_ = addTrackingRelationFn(townBeads, convoyID, synthesisBeadID)
+ 
+ 			// Add dependencies: synthesis depends on all legs
+ 			for _, legBeadID := range legBeads {
+@@ -808,10 +802,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
+ 		}
+ 
+ 		// Track the step with the workflow
+-		_ = BdCmd("dep", "add", workflowID, stepBeadID, "--type=tracks").
+-			WithAutoCommit().
+-			Dir(townBeads).
+-			Run()
++		_ = addTrackingRelationFn(townBeads, workflowID, stepBeadID)
+ 
+ 		// Wire dependencies: this step depends on its needs
+ 		for _, needID := range step.Needs {
+diff --git a/internal/cmd/sling_batch_test.go b/internal/cmd/sling_batch_test.go
+index 666b6b04..b314d2db 100644
+--- a/internal/cmd/sling_batch_test.go
++++ b/internal/cmd/sling_batch_test.go
+@@ -859,7 +859,8 @@ func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath strin
+ }
+ 
+ // TestCreateAutoConvoy_BasicSuccess verifies that createAutoConvoy creates a
+-// convoy with "Work: <title>" title, adds a tracking dep, and returns hq-cv-* ID.
++// convoy with "Work: <title>" title, delegates tracking to the helper, and
++// returns an hq-cv-* ID.
+ func TestCreateAutoConvoy_BasicSuccess(t *testing.T) {
+ 	if runtime.GOOS == "windows" {
+ 		t.Skip("skipping on windows")
+@@ -878,6 +879,16 @@ exit 0
+ 		t.Fatalf("rewrite bd stub: %v", err)
+ 	}
+ 
++	var helperTownRoot, helperConvoyID, helperBeadID string
++	oldAddTracking := addTrackingRelationFn
++	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
++		helperTownRoot = townRoot
++		helperConvoyID = convoyID
++		helperBeadID = issueID
++		return nil
++	}
++	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
++
+ 	convoyID, err := createAutoConvoy("gt-aaa", "Fix the widget", false, "mr", "")
+ 	if err != nil {
+ 		t.Fatalf("createAutoConvoy() error: %v", err)
+@@ -898,12 +909,14 @@ exit 0
+ 		t.Errorf("create should include 'Work: Fix the widget' in args:\n%s", logContent)
+ 	}
+ 
+-	// Verify dep add was called
+-	if !strings.Contains(logContent, "dep add") {
+-		t.Errorf("expected dep add command in log:\n%s", logContent)
++	if helperTownRoot != townRoot {
++		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, townRoot)
++	}
++	if helperConvoyID != convoyID {
++		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, convoyID)
+ 	}
+-	if !strings.Contains(logContent, "gt-aaa") {
+-		t.Errorf("dep add should reference gt-aaa:\n%s", logContent)
++	if helperBeadID != "gt-aaa" {
++		t.Errorf("tracking helper issueID = %q, want %q", helperBeadID, "gt-aaa")
+ 	}
+ }
+ 
+diff --git a/internal/cmd/sling_convoy.go b/internal/cmd/sling_convoy.go
+index 820e163c..7d718d62 100644
+--- a/internal/cmd/sling_convoy.go
++++ b/internal/cmd/sling_convoy.go
+@@ -348,10 +348,9 @@ func createBatchConvoy(beadIDs []string, rigName string, owned bool, mergeStrate
+ 	// Use WithAutoCommit for the same reason as above.
+ 	var tracked []string
+ 	for _, beadID := range beadIDs {
+-		depArgs := []string{"dep", "add", convoyID, beadID, "--type=tracks"}
+-		if out, err := BdCmd(depArgs...).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
++		if err := addTrackingRelationFn(townRoot, convoyID, beadID); err != nil {
+ 			// Log but continue — partial tracking is better than no tracking
+-			fmt.Printf("  Warning: could not track %s in convoy: %v\nOutput: %s\n", beadID, err, out)
++			fmt.Printf("  Warning: could not track %s in convoy: %v\n", beadID, err)
+ 		} else {
+ 			tracked = append(tracked, beadID)
+ 		}
+@@ -411,15 +410,8 @@ func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy, baseB
+ 	}
+ 
+ 	// Add tracking relation: convoy tracks the issue.
+-	// bd dep add validates both IDs exist in the same database, which fails for
+-	// cross-rig beads (e.g., gas-xyz tracked by an hq-cv- convoy). Since beads
+-	// v0.62 removed cross-rig routing from bd, this validation cannot be satisfied
+-	// for rig-prefixed beads. We treat tracking failure as non-fatal: the convoy
+-	// still works, the witness and daemon provide backup tracking, and PR #3166
+-	// will replace this with the Go module API which can route cross-rig.
+-	depArgs := []string{"dep", "add", convoyID, beadID, "--type=tracks"}
+-	if out, err := BdCmd(depArgs...).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
+-		fmt.Printf("Warning: Could not create auto-convoy tracking: %v\noutput: %s\n", err, out)
++	if err := addTrackingRelationFn(townRoot, convoyID, beadID); err != nil {
++		fmt.Printf("Warning: Could not create auto-convoy tracking: %v\n", err)
+ 	}
+ 
+ 	return convoyID, nil
+diff --git a/internal/cmd/synthesis.go b/internal/cmd/synthesis.go
+index a1c4ace0..8db08ea0 100644
+--- a/internal/cmd/synthesis.go
++++ b/internal/cmd/synthesis.go
+@@ -598,11 +598,8 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
+ 		return "", fmt.Errorf("parsing created bead: %w", err)
+ 	}
+ 
+-	// Add tracking relation: convoy tracks synthesis
+-	depArgs := []string{"dep", "add", convoyID, result.ID, "--type=tracks"}
+-	depCmd := exec.Command("bd", depArgs...)
+-	depCmd.Dir = townBeads
+-	_ = depCmd.Run() // Non-fatal if this fails
++	// Add tracking relation: convoy tracks synthesis.
++	_ = addTrackingRelationFn(townBeads, convoyID, result.ID) // Non-fatal if this fails
+ 
+ 	return result.ID, nil
+ }
+diff --git a/internal/cmd/tracking_relations.go b/internal/cmd/tracking_relations.go
+new file mode 100644
+index 00000000..31273a7b
+--- /dev/null
++++ b/internal/cmd/tracking_relations.go
+@@ -0,0 +1,99 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"strings"
++	"time"
++
++	beadsdk "github.com/steveyegge/beads"
++	"github.com/steveyegge/gastown/internal/beads"
++)
++
++var (
++	addTrackingRelationFn    = addTrackingRelation
++	removeTrackingRelationFn = removeTrackingRelation
++)
++
++func addTrackingRelation(townRoot, trackerID, issueID string) error {
++	if err := mutateTrackingRelationViaStore(townRoot, trackerID, issueID, true); err != nil {
++		return fallbackTrackingRelation(townRoot, trackerID, issueID, true, err)
++	}
++	return nil
++}
++
++func removeTrackingRelation(townRoot, trackerID, issueID string) error {
++	if err := mutateTrackingRelationViaStore(townRoot, trackerID, issueID, false); err != nil {
++		return fallbackTrackingRelation(townRoot, trackerID, issueID, false, err)
++	}
++	return nil
++}
++
++func mutateTrackingRelationViaStore(townRoot, trackerID, issueID string, add bool) error {
++	resolvedBeads := beads.ResolveBeadsDir(townRoot)
++	if resolvedBeads == "" {
++		return fmt.Errorf("resolving town beads dir")
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	b := beads.NewWithBeadsDir(townRoot, resolvedBeads)
++	store, cleanup, err := b.OpenStore(ctx)
++	if err != nil {
++		return err
++	}
++	defer cleanup()
++
++	targetID := trackingDependsOnID(townRoot, issueID)
++	actor := os.Getenv("BD_ACTOR")
++	if actor == "" {
++		actor = detectSender()
++	}
++
++	if add {
++		dep := &beadsdk.Dependency{
++			IssueID:     trackerID,
++			DependsOnID: targetID,
++			Type:        beadsdk.DependencyType("tracks"),
++		}
++		return store.AddDependency(ctx, dep, actor)
++	}
++
++	return store.RemoveDependency(ctx, trackerID, targetID, actor)
++}
++
++func fallbackTrackingRelation(townRoot, trackerID, issueID string, add bool, storeErr error) error {
++	args := []string{"dep", "add", trackerID, issueID, "--type=tracks"}
++	if !add {
++		args = []string{"dep", "remove", trackerID, issueID, "--type=tracks"}
++	}
++
++	if out, err := BdCmd(args...).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
++		output := strings.TrimSpace(string(out))
++		if output == "" {
++			return fmt.Errorf("tracking relation via store failed: %w; fallback bd path failed: %w", storeErr, err)
++		}
++		return fmt.Errorf("tracking relation via store failed: %w; fallback bd path failed: %w; output: %s", storeErr, err, output)
++	}
++
++	return nil
++}
++
++func trackingDependsOnID(townRoot, issueID string) string {
++	if strings.HasPrefix(issueID, "external:") {
++		return issueID
++	}
++
++	prefix := beads.ExtractPrefix(issueID)
++	if prefix == "" {
++		return issueID
++	}
++
++	if rigName := beads.GetRigNameForPrefix(townRoot, prefix); rigName != "" {
++		return fmt.Sprintf("external:%s:%s", strings.TrimSuffix(prefix, "-"), issueID)
++	}
++
++	return issueID
++}
+diff --git a/internal/cmd/tracking_relations_test.go b/internal/cmd/tracking_relations_test.go
+new file mode 100644
+index 00000000..0b953529
+--- /dev/null
++++ b/internal/cmd/tracking_relations_test.go
+@@ -0,0 +1,31 @@
++package cmd
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestTrackingDependsOnID_CrossRigWrapsExternal(t *testing.T) {
++	townRoot := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
++		t.Fatalf("mkdir .beads: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{\"prefix\":\"ag-\",\"path\":\"agentcompany/.beads\"}\n"), 0o644); err != nil {
++		t.Fatalf("write routes.jsonl: %v", err)
++	}
++
++	got := trackingDependsOnID(townRoot, "ag-95s.1")
++	want := "external:ag:ag-95s.1"
++	if got != want {
++		t.Fatalf("trackingDependsOnID() = %q, want %q", got, want)
++	}
++}
++
++func TestTrackingDependsOnID_HQStaysLocal(t *testing.T) {
++	townRoot := t.TempDir()
++	got := trackingDependsOnID(townRoot, "hq-cv-test")
++	if got != "hq-cv-test" {
++		t.Fatalf("trackingDependsOnID() = %q, want %q", got, "hq-cv-test")
++	}
++}
+-- 
+2.43.0
+

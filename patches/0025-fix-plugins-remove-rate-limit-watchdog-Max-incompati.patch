@@ -1,0 +1,175 @@
+From 6113a830c47fd33231e7a7986d41646538cf3f30 Mon Sep 17 00:00:00 2001
+From: Alex <alex.a.ackerman@gmail.com>
+Date: Sun, 12 Apr 2026 13:24:14 -0700
+Subject: [PATCH 025/110] fix(plugins): remove rate-limit-watchdog
+ (Max-incompatible) (hq-quhi) (#3550)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The rate-limit-watchdog plugin's preflight requires ANTHROPIC_API_KEY and
+exits 1 on every dispatch when the var is unset. Towns running on the
+Claude Max subscription have no API key to probe with, so every cycle
+generates a P0 'plugin-run failed' bead — flooding the inbox with noise
+and obscuring real failures.
+
+This plugin is shell-only and probes the Anthropic API directly with
+curl. There is no Max-subscription equivalent of an API rate-limit probe
+(Max auth doesn't expose 429 the same way), so the simplest fix is to
+delete the plugin from gastown source. API-key-based towns that actually
+need it can re-add it locally; nothing else in the codebase references
+this plugin.
+
+Co-authored-by: navani <user.email=28374790+A3Ackerman@users.noreply.github.com>
+---
+ plugins/rate-limit-watchdog/plugin.md | 56 --------------------
+ plugins/rate-limit-watchdog/run.sh    | 74 ---------------------------
+ 2 files changed, 130 deletions(-)
+ delete mode 100644 plugins/rate-limit-watchdog/plugin.md
+ delete mode 100755 plugins/rate-limit-watchdog/run.sh
+
+diff --git a/plugins/rate-limit-watchdog/plugin.md b/plugins/rate-limit-watchdog/plugin.md
+deleted file mode 100644
+index dac283fd..00000000
+--- a/plugins/rate-limit-watchdog/plugin.md
++++ /dev/null
+@@ -1,56 +0,0 @@
+-+++
+-name = "rate-limit-watchdog"
+-description = "Auto-estop on API rate limit, auto-thaw when clear — no LLM needed"
+-version = 1
+-
+-[gate]
+-type = "cooldown"
+-duration = "3m"
+-
+-[tracking]
+-labels = ["plugin:rate-limit-watchdog", "category:safety"]
+-digest = true
+-
+-[execution]
+-timeout = "30s"
+-notify_on_failure = true
+-severity = "high"
+-+++
+-
+-# Rate Limit Watchdog
+-
+-Monitors the Anthropic API for rate limiting (HTTP 429). When detected,
+-triggers `gt estop` to freeze all agents. Periodically re-checks and
+-runs `gt thaw` when the rate limit clears.
+-
+-This is a **shell-only plugin** — no LLM calls. It runs as a daemon
+-plugin on a 3-minute cooldown gate.
+-
+-## How It Works
+-
+-1. Send a minimal API probe (1 token to haiku — cheapest possible check)
+-2. If 429 → `gt estop -r "API rate limited"` (if not already active)
+-3. If 200 and estop is active with rate-limit reason → `gt thaw`
+-4. Record result as tracking wisp
+-
+-The probe costs ~$0.0001 per check. At 3-minute intervals, ~$0.05/day.
+-
+-## Behavior
+-
+-| API Status | ESTOP Active? | Action |
+-|------------|--------------|--------|
+-| 429 | No | `gt estop -r "API rate limited"` |
+-| 429 | Yes | No-op (already frozen) |
+-| 200 | Yes (rate-limit) | `gt thaw` |
+-| 200 | Yes (other reason) | No-op (manual estop) |
+-| 200 | No | No-op (healthy) |
+-| Error | Any | Log warning, skip |
+-
+-## Configuration
+-
+-The plugin uses these environment variables:
+-- `ANTHROPIC_API_KEY` — required for the probe request
+-- `GT_ROOT` — town root for estop/thaw commands
+-
+-No additional configuration needed. The 3-minute cooldown gate prevents
+-rapid estop/thaw cycling.
+diff --git a/plugins/rate-limit-watchdog/run.sh b/plugins/rate-limit-watchdog/run.sh
+deleted file mode 100755
+index 22faa6ea..00000000
+--- a/plugins/rate-limit-watchdog/run.sh
++++ /dev/null
+@@ -1,74 +0,0 @@
+-#!/usr/bin/env bash
+-# rate-limit-watchdog/run.sh — Auto-estop on API rate limit, auto-thaw when clear.
+-#
+-# No LLM calls — just a minimal API probe and shell commands.
+-
+-set -euo pipefail
+-
+-# --- Configuration -----------------------------------------------------------
+-TOWN_ROOT="${GT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+-ESTOP_FILE="$TOWN_ROOT/ESTOP"
+-PROBE_MODEL="claude-haiku-4-5-20251001"
+-RATE_LIMIT_REASON="API rate limited (auto-watchdog)"
+-
+-# --- Preflight ---------------------------------------------------------------
+-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+-    echo "ANTHROPIC_API_KEY not set — cannot probe API"
+-    exit 1
+-fi
+-
+-# --- Probe API ---------------------------------------------------------------
+-# Minimal request: 1 max_token to cheapest model.
+-HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+-    -X POST "https://api.anthropic.com/v1/messages" \
+-    -H "x-api-key: $ANTHROPIC_API_KEY" \
+-    -H "anthropic-version: 2023-06-01" \
+-    -H "content-type: application/json" \
+-    -d "{\"model\":\"$PROBE_MODEL\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+-    --connect-timeout 10 \
+-    --max-time 15 \
+-    2>/dev/null || echo "000")
+-
+-echo "API probe: HTTP $HTTP_CODE"
+-
+-# --- Decision ----------------------------------------------------------------
+-case "$HTTP_CODE" in
+-    429)
+-        # Rate limited — freeze if not already frozen.
+-        if [ ! -f "$ESTOP_FILE" ]; then
+-            echo "Rate limit detected — triggering estop"
+-            gt estop -r "$RATE_LIMIT_REASON"
+-            echo "result:estop-triggered"
+-        else
+-            echo "Rate limit detected — estop already active"
+-            echo "result:already-frozen"
+-        fi
+-        ;;
+-    200|201)
+-        # API healthy — thaw if we were the ones who froze it.
+-        if [ -f "$ESTOP_FILE" ]; then
+-            # Only thaw auto-triggered estops with our specific reason.
+-            if grep -q "auto" "$ESTOP_FILE" 2>/dev/null || grep -q "rate limit" "$ESTOP_FILE" 2>/dev/null; then
+-                echo "API healthy — thawing (rate limit cleared)"
+-                gt thaw
+-                echo "result:thawed"
+-            else
+-                echo "API healthy — estop active but not rate-limit (skipping thaw)"
+-                echo "result:manual-estop-preserved"
+-            fi
+-        else
+-            echo "API healthy — no action needed"
+-            echo "result:healthy"
+-        fi
+-        ;;
+-    000)
+-        # Network error — can't reach API. Don't estop (might be local network).
+-        echo "Warning: API unreachable (network error)"
+-        echo "result:network-error"
+-        ;;
+-    *)
+-        # Other error (500, 503, etc.) — log but don't estop.
+-        echo "Warning: API returned $HTTP_CODE"
+-        echo "result:api-error-$HTTP_CODE"
+-        ;;
+-esac
+-- 
+2.43.0
+

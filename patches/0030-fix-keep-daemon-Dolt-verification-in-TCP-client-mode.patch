@@ -1,0 +1,284 @@
+From 640b63db5019d11d78916e496655e8fd32f18afc Mon Sep 17 00:00:00 2001
+From: Bella-Giraffety <117771104+Bella-Giraffety@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 16:24:30 -0400
+Subject: [PATCH 030/110] fix: keep daemon Dolt verification in TCP client mode
+ (#3482)
+
+Co-authored-by: mayor <thalia.geraghty@fiserv.com>
+---
+ internal/daemon/dolt.go              |  79 +++++++++-------
+ internal/daemon/dolt_backoff_test.go | 136 +++++++++++++++++++++++++--
+ 2 files changed, 175 insertions(+), 40 deletions(-)
+
+diff --git a/internal/daemon/dolt.go b/internal/daemon/dolt.go
+index 0aa012ef..0d28aaeb 100644
+--- a/internal/daemon/dolt.go
++++ b/internal/daemon/dolt.go
+@@ -144,19 +144,19 @@ type DoltServerManager struct {
+ 	onRecoveryFn func()
+ 
+ 	// Test hooks (nil = use real implementations; set only in tests)
+-	healthCheckFn      func() error
+-	writeProbeCheckFn  func() error
+-	identityCheckFn    func() error // nil = use real VerifyServerDataDir
+-	startFn            func() error
+-	runningFn          func() (int, bool)
+-	stopFn             func()
+-	sleepFn            func(time.Duration)
+-	nowFn              func() time.Time
+-	escalateFn         func(int)
+-	unhealthyAlertFn   func(error)
+-	readOnlyAlertFn    func(error)
+-	crashAlertFn       func(int)
+-	listDatabasesFn    func() ([]string, error)
++	healthCheckFn     func() error
++	writeProbeCheckFn func() error
++	identityCheckFn   func() error // nil = use real VerifyServerDataDir
++	startFn           func() error
++	runningFn         func() (int, bool)
++	stopFn            func()
++	sleepFn           func(time.Duration)
++	nowFn             func() time.Time
++	escalateFn        func(int)
++	unhealthyAlertFn  func(error)
++	readOnlyAlertFn   func(error)
++	crashAlertFn      func(int)
++	listDatabasesFn   func() ([]string, error)
+ }
+ 
+ // NewDoltServerManager creates a new Dolt server manager.
+@@ -238,29 +238,28 @@ func (m *DoltServerManager) isRemote() bool {
+ 	return true
+ }
+ 
+-// buildDoltSQLCmd constructs a dolt sql command using daemon config, mirroring
+-// the doltserver.buildDoltSQLCmd pattern for local-vs-remote command construction.
++// buildDoltSQLCmd constructs a non-interactive dolt sql command that always
++// talks to the running SQL server over TCP.
++//
++// For local servers, this avoids embedded-mode auto-discovery, which can load
++// databases relative to cmd.Dir instead of querying the live shared server.
+ func (m *DoltServerManager) buildDoltSQLCmd(ctx context.Context, args ...string) *exec.Cmd {
+-	var fullArgs []string
+-	fullArgs = append(fullArgs, "sql")
+-
+-	if m.isRemote() {
+-		host := m.config.Host
+-		if host == "" {
+-			host = "127.0.0.1"
+-		}
+-		user := m.config.User
+-		if user == "" {
+-			user = "root"
+-		}
+-		fullArgs = append(fullArgs,
+-			"--host", host,
+-			"--port", strconv.Itoa(m.config.Port),
+-			"--user", user,
+-			"--no-tls",
+-		)
++	host := m.config.Host
++	if host == "" {
++		host = "127.0.0.1"
++	}
++	user := m.config.User
++	if user == "" {
++		user = "root"
+ 	}
+ 
++	fullArgs := []string{
++		"--host", host,
++		"--port", strconv.Itoa(m.config.Port),
++		"--user", user,
++		"--no-tls",
++		"sql",
++	}
+ 	fullArgs = append(fullArgs, args...)
+ 	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
+ 	setSysProcAttr(cmd)
+@@ -271,8 +270,20 @@ func (m *DoltServerManager) buildDoltSQLCmd(ctx context.Context, args ...string)
+ 	// .doltcfg directories detected" or "Access denied" errors.
+ 	cmd.Dir = m.config.DataDir
+ 
+-	if m.isRemote() && m.config.Password != "" {
++	// Always set DOLT_CLI_PASSWORD when explicitly configured.
++	// For remote checks, preserve inherited credentials if config omits a
++	// password. For local checks, keep forcing the empty-password path so
++	// inherited shell credentials cannot make a healthy local server look broken.
++	if m.config.Password != "" {
+ 		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+m.config.Password)
++	} else if m.isRemote() {
++		if inherited, ok := os.LookupEnv("DOLT_CLI_PASSWORD"); ok {
++			cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+inherited)
++		} else {
++			cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD=")
++		}
++	} else {
++		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD=")
+ 	}
+ 
+ 	return cmd
+diff --git a/internal/daemon/dolt_backoff_test.go b/internal/daemon/dolt_backoff_test.go
+index b5e60f0e..597fef60 100644
+--- a/internal/daemon/dolt_backoff_test.go
++++ b/internal/daemon/dolt_backoff_test.go
+@@ -74,6 +74,130 @@ func TestAdvanceBackoff(t *testing.T) {
+ 	}
+ }
+ 
++func TestBuildDoltSQLCmd_LocalUsesTCPClientMode(t *testing.T) {
++	m := &DoltServerManager{
++		config: &DoltServerConfig{
++			Port:    3307,
++			User:    "root",
++			DataDir: "/tmp/dolt-data",
++		},
++		logger: func(format string, v ...interface{}) {},
++	}
++
++	cmd := m.buildDoltSQLCmd(t.Context(), "-q", "SELECT 1")
++
++	if cmd.Dir != "/tmp/dolt-data" {
++		t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, "/tmp/dolt-data")
++	}
++
++	argStr := strings.Join(cmd.Args, " ")
++	for _, want := range []string{"--host", "127.0.0.1", "--port", "3307", "--user", "root", "--no-tls", "sql", "-q", "SELECT 1"} {
++		if !strings.Contains(argStr, want) {
++			t.Errorf("args %q missing expected %q", argStr, want)
++		}
++	}
++
++	for _, env := range cmd.Env {
++		if env == "DOLT_CLI_PASSWORD=" {
++			return
++		}
++	}
++	t.Error("local cmd should set empty DOLT_CLI_PASSWORD to suppress prompts")
++}
++
++func TestBuildDoltSQLCmd_RemoteNoPasswordSuppressesPrompt(t *testing.T) {
++	m := &DoltServerManager{
++		config: &DoltServerConfig{
++			Host:    "10.0.0.5",
++			Port:    3307,
++			User:    "root",
++			DataDir: "/tmp/dolt-data",
++		},
++		logger: func(format string, v ...interface{}) {},
++	}
++
++	cmd := m.buildDoltSQLCmd(t.Context(), "-q", "SELECT 1")
++
++	argStr := strings.Join(cmd.Args, " ")
++	for _, want := range []string{"--host", "10.0.0.5", "--port", "3307", "--user", "root", "--no-tls", "sql", "-q", "SELECT 1"} {
++		if !strings.Contains(argStr, want) {
++			t.Errorf("args %q missing expected %q", argStr, want)
++		}
++	}
++
++	for _, env := range cmd.Env {
++		if env == "DOLT_CLI_PASSWORD=" {
++			return
++		}
++	}
++	t.Error("remote cmd without password should set empty DOLT_CLI_PASSWORD env var")
++}
++
++func TestBuildDoltSQLCmd_LocalIgnoresInheritedCredentials(t *testing.T) {
++	t.Setenv("DOLT_CLI_PASSWORD", "secret-from-env")
++
++	m := &DoltServerManager{
++		config: &DoltServerConfig{
++			Port:    3307,
++			User:    "root",
++			DataDir: "/tmp/dolt-data",
++		},
++		logger: func(format string, v ...interface{}) {},
++	}
++
++	cmd := m.buildDoltSQLCmd(t.Context(), "-q", "SELECT 1")
++
++	foundEmpty := false
++	foundInherited := false
++	for _, env := range cmd.Env {
++		if env == "DOLT_CLI_PASSWORD=" {
++			foundEmpty = true
++		}
++		if env == "DOLT_CLI_PASSWORD=secret-from-env" {
++			foundInherited = true
++		}
++	}
++	if !foundEmpty {
++		t.Fatal("expected local helper to force empty DOLT_CLI_PASSWORD")
++	}
++	if foundInherited {
++		t.Fatal("did not expect local helper to preserve inherited DOLT_CLI_PASSWORD")
++	}
++}
++
++func TestBuildDoltSQLCmd_RemoteNoPasswordPreservesInheritedCredentials(t *testing.T) {
++	t.Setenv("DOLT_CLI_PASSWORD", "secret-from-env")
++
++	m := &DoltServerManager{
++		config: &DoltServerConfig{
++			Host:    "10.0.0.5",
++			Port:    3307,
++			User:    "root",
++			DataDir: "/tmp/dolt-data",
++		},
++		logger: func(format string, v ...interface{}) {},
++	}
++
++	cmd := m.buildDoltSQLCmd(t.Context(), "-q", "SELECT 1")
++
++	foundInherited := false
++	foundEmpty := false
++	for _, env := range cmd.Env {
++		if env == "DOLT_CLI_PASSWORD=secret-from-env" {
++			foundInherited = true
++		}
++		if env == "DOLT_CLI_PASSWORD=" {
++			foundEmpty = true
++		}
++	}
++	if !foundInherited {
++		t.Fatal("expected inherited DOLT_CLI_PASSWORD to be preserved")
++	}
++	if foundEmpty {
++		t.Fatal("did not expect empty DOLT_CLI_PASSWORD to overwrite inherited credentials")
++	}
++}
++
+ func TestGetBackoffDelay_InitialValue(t *testing.T) {
+ 	m := &DoltServerManager{
+ 		config: &DoltServerConfig{
+@@ -328,11 +452,11 @@ func TestStartLocked_SkipsIfAlreadyRunning(t *testing.T) {
+ 	var logMessages []string
+ 	m := &DoltServerManager{
+ 		config: &DoltServerConfig{
+-			Enabled:  true,
+-			Port:     13307,
+-			Host:     "127.0.0.1",
+-			DataDir:  filepath.Join(tmpDir, "dolt"),
+-			LogFile:  filepath.Join(daemonDir, "dolt-server.log"),
++			Enabled: true,
++			Port:    13307,
++			Host:    "127.0.0.1",
++			DataDir: filepath.Join(tmpDir, "dolt"),
++			LogFile: filepath.Join(daemonDir, "dolt-server.log"),
+ 		},
+ 		townRoot: tmpDir,
+ 		logger: func(format string, v ...interface{}) {
+@@ -552,7 +676,7 @@ func newTestManager(t *testing.T) *DoltServerManager {
+ 			RestartWindow:        10 * time.Minute,
+ 			HealthyResetInterval: 50 * time.Millisecond,
+ 		},
+-		townRoot:      tmpDir,
++		townRoot:         tmpDir,
+ 		logger:           func(format string, v ...interface{}) { t.Logf(format, v...) },
+ 		runningFn:        func() (int, bool) { return 0, false },
+ 		healthCheckFn:    func() error { return nil },
+-- 
+2.43.0
+

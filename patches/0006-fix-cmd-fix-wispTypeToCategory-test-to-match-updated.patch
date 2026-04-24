@@ -1,0 +1,28 @@
+From 088173eefdf9e06aeab0d0cb653572e6b31e0a6b Mon Sep 17 00:00:00 2001
+From: "Ryan R. Fox" <ryanRfox@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 16:22:53 -0400
+Subject: [PATCH 006/110] fix(cmd): fix wispTypeToCategory test to match
+ updated signature (#3546)
+
+The function signature changed to accept (wispType, title) but the
+test was still calling with a single argument, causing go vet failure.
+---
+ internal/cmd/compact_report_test.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/internal/cmd/compact_report_test.go b/internal/cmd/compact_report_test.go
+index cdb2c572..b6bf8cdd 100644
+--- a/internal/cmd/compact_report_test.go
++++ b/internal/cmd/compact_report_test.go
+@@ -26,7 +26,7 @@ func TestWispTypeToCategory(t *testing.T) {
+ 
+ 	for _, tc := range tests {
+ 		t.Run(tc.wispType, func(t *testing.T) {
+-			got := wispTypeToCategory(tc.wispType)
++			got := wispTypeToCategory(tc.wispType, "")
+ 			if got != tc.want {
+ 				t.Errorf("wispTypeToCategory(%q) = %q, want %q", tc.wispType, got, tc.want)
+ 			}
+-- 
+2.43.0
+

@@ -1,0 +1,297 @@
+From 93ae201e2669d30093f4a527c3d1bd8718f80b26 Mon Sep 17 00:00:00 2001
+From: Christopher R Kane <tuf05531@temple.edu>
+Date: Sun, 12 Apr 2026 16:23:45 -0400
+Subject: [PATCH 016/110] Fix promptless polecat startup and nudge targeting
+ (#3574)
+
+* fix(tmux): canonicalize stored pane ids for nudge
+
+* fix(polecat): deliver full startup prompt for codex fallback
+
+* test(cmd): fix compact report helper signature
+
+---------
+
+Co-authored-by: mayor <chriskane@Chriss-MacBook-Air.local>
+---
+ internal/polecat/session_manager.go      | 37 ++++++++++--------
+ internal/polecat/session_manager_test.go | 48 +++++++++++++++++-------
+ internal/tmux/tmux.go                    | 26 ++++++++++---
+ internal/tmux/tmux_test.go               | 24 ++++++++++++
+ 4 files changed, 100 insertions(+), 35 deletions(-)
+
+diff --git a/internal/polecat/session_manager.go b/internal/polecat/session_manager.go
+index f88b8c67..04eb77c7 100644
+--- a/internal/polecat/session_manager.go
++++ b/internal/polecat/session_manager.go
+@@ -300,6 +300,8 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+ 		ExcludeWorkInstructions: fallbackInfo.SendStartupNudge,
+ 	}
+ 	beacon := session.FormatStartupBeacon(beaconConfig)
++	startupNudgeContent := runtime.StartupNudgeContent()
++	startupPromptFallback := session.BuildStartupPrompt(beaconConfig, startupNudgeContent)
+ 
+ 	command := opts.Command
+ 	if command == "" {
+@@ -460,26 +462,23 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+ 
+ 	// Handle fallback nudges for non-hook agents.
+ 	// See StartupFallbackInfo in runtime package for the fallback matrix.
+-	if fallbackInfo.SendBeaconNudge && fallbackInfo.SendStartupNudge && fallbackInfo.StartupNudgeDelayMs == 0 {
+-		// Hooks + no prompt: Single combined nudge (hook already ran gt prime synchronously)
+-		combined := beacon + "\n\n" + runtime.StartupNudgeContent()
+-		debugSession("SendCombinedNudge", m.tmux.NudgeSession(sessionID, combined))
++	if fallbackInfo.SendBeaconNudge {
++		// Promptless runtimes need the full startup prompt delivered via nudge so
++		// the agent sees both the beacon and the initial work instructions.
++		debugSession("DeliverStartupPromptFallback",
++			runtime.DeliverStartupPromptFallback(m.tmux, sessionID, startupPromptFallback, runtimeConfig, constants.ClaudeStartTimeout))
+ 	} else {
+-		if fallbackInfo.SendBeaconNudge {
+-			// Agent doesn't support CLI prompt - send beacon via nudge
+-			debugSession("SendBeaconNudge", m.tmux.NudgeSession(sessionID, beacon))
+-		}
+-
+ 		if fallbackInfo.StartupNudgeDelayMs > 0 {
+-			// Wait for agent to finish processing beacon + gt prime before sending work instructions.
+-			// Uses prompt-based detection where available; falls back to max(ReadyDelayMs, StartupNudgeDelayMs).
++			// Wait for agent to finish processing the beacon + gt prime before sending
++			// work instructions. Prompt-capable runtimes already got the beacon as the
++			// initial CLI prompt, so they only need the delayed startup nudge here.
+ 			primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
+ 			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
+ 		}
+ 
+ 		if fallbackInfo.SendStartupNudge {
+ 			// Send work instructions via nudge
+-			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, runtime.StartupNudgeContent()))
++			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+ 		}
+ 	}
+ 
+@@ -487,7 +486,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+ 	// This fixes the Mode B race where the nudge arrives before Claude Code is ready,
+ 	// causing the polecat to sit idle at an empty prompt. See GH#1379.
+ 	if fallbackInfo.SendStartupNudge {
+-		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig)
++		verifyContent := startupNudgeContent
++		if fallbackInfo.SendBeaconNudge {
++			verifyContent = startupPromptFallback
++		}
++		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent)
+ 	}
+ 
+ 	// Legacy fallback for other startup paths (non-fatal)
+@@ -816,7 +819,7 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
+ //
+ // Non-fatal: if verification fails or times out, the session is left running.
+ // The witness zombie patrol will eventually detect and handle truly idle polecats.
+-func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig) {
++func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig, retryContent string) {
+ 	// Only verify for agents with prompt detection. Without ReadyPromptPrefix,
+ 	// we can't distinguish "idle at prompt" from "busy processing".
+ 	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
+@@ -832,7 +835,9 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
+ 	verifyDelay := sessionCfg.StartupNudgeVerifyDelayD()
+ 	maxRetries := sessionCfg.StartupNudgeMaxRetriesV()
+ 
+-	nudgeContent := runtime.StartupNudgeContent()
++	if strings.TrimSpace(retryContent) == "" {
++		retryContent = runtime.StartupNudgeContent()
++	}
+ 
+ 	for attempt := 1; attempt <= maxRetries; attempt++ {
+ 		// Wait for the agent to process the nudge before checking.
+@@ -856,7 +861,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
+ 		// Agent is truly idle (no busy indicator, prompt visible) — nudge was likely lost. Retry.
+ 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
+ 			attempt, maxRetries, sessionID)
+-		if err := m.tmux.NudgeSession(sessionID, nudgeContent); err != nil {
++		if err := m.tmux.NudgeSession(sessionID, retryContent); err != nil {
+ 			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
+ 			return
+ 		}
+diff --git a/internal/polecat/session_manager_test.go b/internal/polecat/session_manager_test.go
+index 20d95535..f52bc960 100644
+--- a/internal/polecat/session_manager_test.go
++++ b/internal/polecat/session_manager_test.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	"github.com/steveyegge/gastown/internal/config"
+ 	"github.com/steveyegge/gastown/internal/rig"
++	gtruntime "github.com/steveyegge/gastown/internal/runtime"
+ 	"github.com/steveyegge/gastown/internal/session"
+ 	"github.com/steveyegge/gastown/internal/tmux"
+ )
+@@ -384,7 +385,8 @@ func TestSessionManager_resolveBeadsDir(t *testing.T) {
+ //
+ // Without the fallback, GT_AGENT is never written to the tmux session table,
+ // and the post-startup validation kills the session with:
+-//   "GT_AGENT not set in session ... witness patrol will misidentify this polecat"
++//
++//	"GT_AGENT not set in session ... witness patrol will misidentify this polecat"
+ //
+ // Regression test for the bug introduced in PR #1776 which removed the
+ // unconditional runtimeConfig.ResolvedAgent → SetEnvironment("GT_AGENT") logic
+@@ -394,23 +396,23 @@ func TestAgentEnvOmitsGTAgent_FallbackRequired(t *testing.T) {
+ 
+ 	// Simulate what session_manager.Start calls for each dispatch scenario.
+ 	cases := []struct {
+-		name       string
+-		agent      string // opts.Agent value
+-		wantGTAgent bool  // whether GT_AGENT should be in AgentEnv output
++		name        string
++		agent       string // opts.Agent value
++		wantGTAgent bool   // whether GT_AGENT should be in AgentEnv output
+ 	}{
+ 		{
+-			name:       "default dispatch (no --agent flag)",
+-			agent:      "",
++			name:        "default dispatch (no --agent flag)",
++			agent:       "",
+ 			wantGTAgent: false, // fallback needed
+ 		},
+ 		{
+-			name:       "explicit --agent codex",
+-			agent:      "codex",
++			name:        "explicit --agent codex",
++			agent:       "codex",
+ 			wantGTAgent: true,
+ 		},
+ 		{
+-			name:       "explicit --agent gemini",
+-			agent:      "gemini",
++			name:        "explicit --agent gemini",
++			agent:       "gemini",
+ 			wantGTAgent: true,
+ 		},
+ 	}
+@@ -483,7 +485,7 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
+ 	// plus overhead = ~60s. Use 90s for safety.
+ 	done := make(chan struct{})
+ 	go func() {
+-		m.verifyStartupNudgeDelivery(sessionName, rc)
++		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook")
+ 		close(done)
+ 	}()
+ 
+@@ -504,7 +506,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
+ 	m := NewSessionManager(tmux.NewTmux(), r)
+ 
+ 	// Should return immediately without error for nil config
+-	m.verifyStartupNudgeDelivery("nonexistent-session", nil)
++	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "")
+ 
+ 	// And for config without prompt prefix
+ 	rc := &config.RuntimeConfig{
+@@ -513,7 +515,27 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
+ 			ReadyDelayMs:      1000,
+ 		},
+ 	}
+-	m.verifyStartupNudgeDelivery("nonexistent-session", rc)
++	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "")
++}
++
++func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
++	beaconConfig := session.BeaconConfig{
++		Recipient:               session.BeaconRecipient("polecat", "toast", "demo"),
++		Sender:                  "witness",
++		Topic:                   "assigned",
++		MolID:                   "demo-123",
++		IncludePrimeInstruction: true,
++		ExcludeWorkInstructions: true,
++	}
++
++	prompt := session.BuildStartupPrompt(beaconConfig, gtruntime.StartupNudgeContent())
++
++	if !strings.Contains(prompt, "Run `gt prime`") {
++		t.Fatalf("prompt missing gt prime instruction: %q", prompt)
++	}
++	if !strings.Contains(prompt, gtruntime.StartupNudgeContent()) {
++		t.Fatalf("prompt missing startup nudge content: %q", prompt)
++	}
+ }
+ 
+ func TestValidateSessionName(t *testing.T) {
+diff --git a/internal/tmux/tmux.go b/internal/tmux/tmux.go
+index 6b27a174..94533984 100644
+--- a/internal/tmux/tmux.go
++++ b/internal/tmux/tmux.go
+@@ -1619,6 +1619,25 @@ type NudgeOpts struct {
+ 	TownRoot string
+ }
+ 
++// canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
++// that send-keys can resolve reliably. Bare pane IDs work for display-message,
++// but for send-keys we prefer an explicit session:window.pane target.
++func (t *Tmux) canonicalPaneTarget(session, pane string) string {
++	if pane == "" {
++		return session
++	}
++
++	out, err := t.run("display-message", "-t", pane, "-p", "#{session_name}:#{window_index}.#{pane_index}")
++	if err == nil {
++		target := strings.TrimSpace(out)
++		if target != "" {
++			return target
++		}
++	}
++
++	return pane
++}
++
+ // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
+ // See NudgeOpts for available options.
+ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {
+@@ -1646,12 +1665,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
+ 	// running the agent rather than sending to the focused pane.
+ 	target := session
+ 	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+-		// Qualify the pane ID with the session name (e.g., "hq-dog-alpha:%1")
+-		// to avoid ambiguity. On some tmux versions (e.g., 3.3 on Windows),
+-		// pane IDs are NOT globally unique — every session may have "%1".
+-		// A bare "send-keys -t %1" targets the attached session's pane,
+-		// not necessarily this session's.
+-		target = session + ":" + agentPane
++		target = t.canonicalPaneTarget(session, agentPane)
+ 	}
+ 
+ 	// 0. Pre-delivery: dismiss Rewind menu if the session is stuck in it.
+diff --git a/internal/tmux/tmux_test.go b/internal/tmux/tmux_test.go
+index cb14926c..7d7bec69 100644
+--- a/internal/tmux/tmux_test.go
++++ b/internal/tmux/tmux_test.go
+@@ -1703,6 +1703,30 @@ func TestNudgeSession_WithRetry(t *testing.T) {
+ 	}
+ }
+ 
++func TestNudgeSession_WithStoredPaneID(t *testing.T) {
++	tm := newTestTmux(t)
++	sessionName := "gt-test-nudge-paneid-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
++
++	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
++		t.Fatalf("NewSession: %v", err)
++	}
++	defer func() { _ = tm.KillSession(sessionName) }()
++
++	time.Sleep(200 * time.Millisecond)
++
++	paneID, err := tm.GetPaneID(sessionName)
++	if err != nil {
++		t.Fatalf("GetPaneID: %v", err)
++	}
++	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", paneID); err != nil {
++		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
++	}
++
++	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
++		t.Fatalf("NudgeSession() with GT_PANE_ID = %v, want nil", err)
++	}
++}
++
+ // TestAdaptiveTextDelay verifies the delay scaling logic for post-text delivery.
+ func TestAdaptiveTextDelay(t *testing.T) {
+ 	t.Parallel()
+-- 
+2.43.0
+

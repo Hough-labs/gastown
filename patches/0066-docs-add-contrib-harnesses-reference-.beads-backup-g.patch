@@ -1,0 +1,282 @@
+From 677877bf7b2ec5597e783f5b8784436895cf7ebd Mon Sep 17 00:00:00 2001
+From: nux <steve.yegge@gmail.com>
+Date: Sun, 12 Apr 2026 17:00:28 -0700
+Subject: [PATCH 066/110] docs: add contrib-harnesses reference + .beads/backup
+ gitignore (hq-j6hur.3.1)
+
+- Create docs/contrib-harnesses/ with a copy-and-adapt harness for
+  contributors who want the polecat -> GitHub PR -> human review flow
+  instead of the canonical Refinery merge-queue flow. Includes:
+  - README.md explaining the pattern and how to contribute harnesses
+  - polecat-pr-flow/polecat.md: example role directive
+  - polecat-pr-flow/mol-polecat-work.toml: example formula overlay
+    (append mode on the submit-and-exit step)
+  - polecat-pr-flow/README.md: install/verify instructions
+
+- Add a pointer from docs/design/directives-and-overlays.md to the new
+  harness directory so operators can find reference examples.
+
+- Add .beads/backup/ to root .gitignore as a defensive explicit entry
+  (gh#3397) so polecats cannot commit backup files into PRs.
+
+No Go or formula-source changes. Phase 0 of hq-j6hur.3.
+---
+ .gitignore                                    |  1 +
+ docs/contrib-harnesses/README.md              | 42 +++++++++++
+ .../polecat-pr-flow/README.md                 | 74 +++++++++++++++++++
+ .../polecat-pr-flow/mol-polecat-work.toml     | 32 ++++++++
+ .../polecat-pr-flow/polecat.md                | 44 +++++++++++
+ docs/design/directives-and-overlays.md        |  5 ++
+ 6 files changed, 198 insertions(+)
+ create mode 100644 docs/contrib-harnesses/README.md
+ create mode 100644 docs/contrib-harnesses/polecat-pr-flow/README.md
+ create mode 100644 docs/contrib-harnesses/polecat-pr-flow/mol-polecat-work.toml
+ create mode 100644 docs/contrib-harnesses/polecat-pr-flow/polecat.md
+
+diff --git a/.gitignore b/.gitignore
+index a57043c4..5c322f0a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -50,6 +50,7 @@ state.json
+ .beads/daemon-*.log.gz
+ .beads/.sync.lock
+ .beads/sync_base.jsonl
++.beads/backup/
+ .beads-wisp/
+ 
+ # Clone-specific CLAUDE.md (regenerated locally per clone)
+diff --git a/docs/contrib-harnesses/README.md b/docs/contrib-harnesses/README.md
+new file mode 100644
+index 00000000..7f1ac3e7
+--- /dev/null
++++ b/docs/contrib-harnesses/README.md
+@@ -0,0 +1,42 @@
++# Contributor Harnesses
++
++Reference examples of **role directives** and **formula overlays** that
++contributors and operators can drop into their own Gas Town setup to customize
++agent behavior — without patching the framework.
++
++These examples are not active by default. They are starting points you copy
++into your own `~/gt/<rig>/directives/` or `~/gt/<rig>/formula-overlays/`
++directory and adapt to your rig's needs.
++
++See [`docs/design/directives-and-overlays.md`](../design/directives-and-overlays.md)
++for the design of the extension surface (how directives and overlays are
++loaded, injection points, precedence, validation). The canonical prime-time
++reference is `~/gt/docs/PRIMING.md` § "Role Directives and Formula Overlays".
++
++## Available harnesses
++
++| Harness | What it does |
++|---------|--------------|
++| [`polecat-pr-flow/`](polecat-pr-flow/) | Makes polecats open a GitHub PR for their branch before running `gt done`. For rigs that use a PR-review workflow instead of the canonical Refinery merge-queue flow. |
++
++## Scope
++
++Each harness is intentionally small and focused — enough to show the shape of
++a directive or overlay without covering every edge case. You are expected to
++read it, copy it, and adapt it.
++
++Harnesses do **not**:
++
++- Modify Go source or formula source-of-truth files
++- Change default agent behavior for anyone who hasn't opted in
++- Replace `gt doctor` validation — run `gt doctor` after installing to confirm
++  overlays are healthy
++
++## Contributing a new harness
++
++If you've built a directive or overlay that other operators might want, open a
++PR adding a new directory here with:
++
++- `README.md` — what it does, how to install, how to verify it's active
++- The directive (`<role>.md`) and/or overlay (`<formula>.toml`) files
++- Keep it short. A harness is a worked example, not a complete product.
+diff --git a/docs/contrib-harnesses/polecat-pr-flow/README.md b/docs/contrib-harnesses/polecat-pr-flow/README.md
+new file mode 100644
+index 00000000..ae789efe
+--- /dev/null
++++ b/docs/contrib-harnesses/polecat-pr-flow/README.md
+@@ -0,0 +1,74 @@
++# polecat-pr-flow
++
++A reference harness for rigs that gate polecat work on a **GitHub PR** rather
++than the canonical Refinery **merge-queue** flow.
++
++It instructs polecats, after their final build/pre-verify passes, to push
++their branch and open (or confirm) a GitHub PR before running `gt done`.
++
++## What's in here
++
++| File | Purpose |
++|------|---------|
++| `polecat.md` | Role directive for polecats in a PR-flow rig. Broad guardrail — applies to any formula a polecat runs. |
++| `mol-polecat-work.toml` | Formula overlay that appends a PR-creation step to `mol-polecat-work`'s `submit-and-exit` step. Surgical — only affects this formula. |
++
++Both layers are intentional: the directive sets the rig-level expectation
++("open PRs, don't merge them yourself"), and the overlay wires the concrete
++commands into the workflow a polecat actually sees at `gt prime` time.
++
++## Install
++
++```bash
++# Role directive (rig-scoped)
++mkdir -p ~/gt/<rig>/directives
++cp polecat.md ~/gt/<rig>/directives/polecat.md
++
++# Formula overlay (rig-scoped)
++mkdir -p ~/gt/<rig>/formula-overlays
++cp mol-polecat-work.toml ~/gt/<rig>/formula-overlays/mol-polecat-work.toml
++```
++
++Replace `<rig>` with your rig's name (e.g. `gastown`, `longeye`). For
++town-wide installation, drop the `<rig>/` segment — but this is almost
++never what you want, since different rigs legitimately use different flows.
++
++## Verify it's active
++
++```bash
++# Validate overlay step IDs against the current formula
++gt doctor
++# Expect: overlay-health: N overlay(s) healthy
++
++# Inspect the rendered formula with the overlay applied
++gt formula overlay show mol-polecat-work --rig <rig>
++
++# See the directive text that will be injected at prime time
++gt directive show polecat --rig <rig>
++
++# End-to-end: see what a polecat would see
++gt prime --explain
++# Expect: "Formula overlay: applying 1 override(s) for mol-polecat-work (rig=<rig>)"
++```
++
++## What this does / does not do
++
++**Does:**
++
++- Tells the polecat to push and open a PR before `gt done`
++- Sets a rig-level policy that a PR is the review artifact
++- Surfaces `gh pr create` failure as an escalation to Witness, not a silent skip
++
++**Does not:**
++
++- Modify `gt done` behavior (no Go changes)
++- Force PR creation via framework-level validation (agents can still misbehave)
++- Merge the PR (that's a maintainer / merge-queue concern)
++- Replace the directive or overlay if your rig also uses other customizations
++  — merge this content with your existing files rather than overwriting them
++
++## When to fork this
++
++If your rig needs additional PR-flow constraints (required reviewers, specific
++labels, CODEOWNERS enforcement, CI checks before `gt done`), copy this harness
++and adapt it. The point is a starting template, not a drop-in product.
+diff --git a/docs/contrib-harnesses/polecat-pr-flow/mol-polecat-work.toml b/docs/contrib-harnesses/polecat-pr-flow/mol-polecat-work.toml
+new file mode 100644
+index 00000000..551bc7dd
+--- /dev/null
++++ b/docs/contrib-harnesses/polecat-pr-flow/mol-polecat-work.toml
+@@ -0,0 +1,32 @@
++# Formula overlay: polecat-PR-flow
++#
++# Appends a PR-creation requirement to the final submit step of
++# mol-polecat-work. Use this in rigs that gate work on a GitHub PR review
++# rather than the canonical Refinery merge queue.
++#
++# Install to: ~/gt/<rig>/formula-overlays/mol-polecat-work.toml
++# Verify with: gt doctor  (checks overlay-health)
++# See also:    directives/polecat.md in this harness
++
++[[step-overrides]]
++step_id = "submit-and-exit"
++mode = "append"
++description = """
++**PR-flow addendum (rig override):**
++
++Before you run `gt done`, push your branch and ensure a GitHub PR exists
++for it. In this rig, a PR is the review artifact — `gt done` alone is not
++sufficient.
++
++```bash
++git push -u origin HEAD
++
++BRANCH=$(git branch --show-current)
++if ! gh pr view "$BRANCH" >/dev/null 2>&1; then
++  gh pr create --fill --base {{base_branch}} --head "$BRANCH"
++fi
++```
++
++Only then run `gt done`. If `gh pr create` fails (auth, rate-limit, missing
++template, unknown base), escalate to Witness — do NOT skip PR creation.
++"""
+diff --git a/docs/contrib-harnesses/polecat-pr-flow/polecat.md b/docs/contrib-harnesses/polecat-pr-flow/polecat.md
+new file mode 100644
+index 00000000..3a641c9d
+--- /dev/null
++++ b/docs/contrib-harnesses/polecat-pr-flow/polecat.md
+@@ -0,0 +1,44 @@
++## PR-Flow Polecat Policy
++
++> **Rig Policy — overrides formula instructions where they conflict.**
++
++This rig uses a **polecat → GitHub PR → human review** flow. After pushing
++your branch, you MUST ensure a GitHub PR is open for it before running
++`gt done`.
++
++This overrides the canonical Refinery merge-queue assumption embedded in
++`mol-polecat-work`. `gt done` is still the completion signal — but in this
++rig, a visible PR is the gating artifact for review.
++
++### Required steps after implementation
++
++1. Push the branch explicitly (do not rely on `gt done` to push):
++   ```bash
++   git push -u origin HEAD
++   ```
++2. Check whether a PR already exists for the branch:
++   ```bash
++   gh pr view "$(git branch --show-current)" >/dev/null 2>&1
++   ```
++3. If no PR exists, create one against the base branch:
++   ```bash
++   gh pr create --fill --base main
++   ```
++4. Only then run `gt done`.
++
++### Do NOT
++
++- Run `gt done` without a PR open — the review loop breaks.
++- Merge your own PR. A maintainer or the merge queue handles merging.
++- Push directly to `main`.
++
++### If `gh` commands fail
++
++Auth, rate-limit, missing PR template, or unknown base branch — do NOT skip
++PR creation to unblock yourself. Escalate to your Witness:
++
++```bash
++gt mail send <rig>/witness -s "HELP: gh pr create failed" -m "Branch: $(git branch --show-current)
++Error: <paste>
++Tried: <what you attempted>"
++```
+diff --git a/docs/design/directives-and-overlays.md b/docs/design/directives-and-overlays.md
+index a1afb0ca..de25788d 100644
+--- a/docs/design/directives-and-overlays.md
++++ b/docs/design/directives-and-overlays.md
+@@ -2,6 +2,11 @@
+ 
+ > Operator-customizable agent behavior without modifying the Go binary.
+ 
++> **Reference examples:** [`docs/contrib-harnesses/`](../contrib-harnesses/)
++> contains copy-and-adapt directives and overlays that contributors can drop
++> into their own rig. See for example `polecat-pr-flow/` for a rig that gates
++> work on GitHub PR review rather than the canonical Refinery merge queue.
++
+ ## Problem
+ 
+ The MEOW stack embeds formulas and role templates in the binary — intentionally
+-- 
+2.43.0
+

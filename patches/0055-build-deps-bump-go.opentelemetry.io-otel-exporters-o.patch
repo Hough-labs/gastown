@@ -1,0 +1,60 @@
+From 59111af9d1a8300f97fcdbc58a0f2bf861a98a47 Mon Sep 17 00:00:00 2001
+From: "dependabot[bot]" <49699333+dependabot[bot]@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 14:08:25 -0700
+Subject: [PATCH 055/110] build(deps): bump
+ go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp (#3610)
+
+Bumps the go_modules group with 1 update in the / directory: [go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp](https://github.com/open-telemetry/opentelemetry-go).
+
+
+Updates `go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp` from 1.42.0 to 1.43.0
+- [Release notes](https://github.com/open-telemetry/opentelemetry-go/releases)
+- [Changelog](https://github.com/open-telemetry/opentelemetry-go/blob/main/CHANGELOG.md)
+- [Commits](https://github.com/open-telemetry/opentelemetry-go/compare/v1.42.0...v1.43.0)
+
+---
+updated-dependencies:
+- dependency-name: go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp
+  dependency-version: 1.43.0
+  dependency-type: direct:production
+  dependency-group: go_modules
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+---
+ go.mod | 2 +-
+ go.sum | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/go.mod b/go.mod
+index 6891e6ec..52ba3cd6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -21,7 +21,7 @@ require (
+ 	github.com/testcontainers/testcontainers-go/modules/dolt v0.41.0
+ 	go.opentelemetry.io/otel v1.43.0
+ 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0
+-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.42.0
++	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0
+ 	go.opentelemetry.io/otel/log v0.19.0
+ 	go.opentelemetry.io/otel/metric v1.43.0
+ 	go.opentelemetry.io/otel/sdk v1.43.0
+diff --git a/go.sum b/go.sum
+index 451d7a44..5a54a638 100644
+--- a/go.sum
++++ b/go.sum
+@@ -253,8 +253,8 @@ go.opentelemetry.io/otel v1.43.0 h1:mYIM03dnh5zfN7HautFE4ieIig9amkNANT+xcVxAj9I=
+ go.opentelemetry.io/otel v1.43.0/go.mod h1:JuG+u74mvjvcm8vj8pI5XiHy1zDeoCS2LB1spIq7Ay0=
+ go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0 h1:HIBTQ3VO5aupLKjC90JgMqpezVXwFuq6Ryjn0/izoag=
+ go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0/go.mod h1:ji9vId85hMxqfvICA0Jt8JqEdrXaAkcpkI9HPXya0ro=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.42.0 h1:H7O6RlGOMTizyl3R08Kn5pdM06bnH8oscSj7o11tmLA=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.42.0/go.mod h1:mBFWu/WOVDkWWsR7Tx7h6EpQB8wsv7P0Yrh0Pb7othc=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0 h1:w1K+pCJoPpQifuVpsKamUdn9U0zM3xUziVOqsGksUrY=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0/go.mod h1:HBy4BjzgVE8139ieRI75oXm3EcDN+6GhD88JT1Kjvxg=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.19.0 h1:Mne5On7VWdx7omSrSSZvM4Kw7cS7NQkOOmLcgscI51U=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.19.0/go.mod h1:IPtUMKL4O3tH5y+iXVyAXqpAwMuzC1IrxVS81rummfE=
+ go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.41.0 h1:inYW9ZhgqiDqh6BioM7DVHHzEGVq76Db5897WLGZ5Go=
+-- 
+2.43.0
+

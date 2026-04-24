@@ -1,0 +1,406 @@
+From db74d7567d58c2f83f562ea66c2377c693448e2b Mon Sep 17 00:00:00 2001
+From: Bella-Giraffety <117771104+Bella-Giraffety@users.noreply.github.com>
+Date: Sun, 19 Apr 2026 21:01:48 -0400
+Subject: [PATCH 083/110] fix: base fresh polecat branches on canonical refs
+ (#3629)
+
+Co-authored-by: fury <thalia.geraghty@fiserv.com>
+---
+ internal/polecat/manager_test.go         | 153 +++++++++++++++++++++++
+ internal/polecat/session_manager.go      |  78 +++++++++---
+ internal/polecat/session_manager_test.go |  98 +++++++++++++++
+ 3 files changed, 312 insertions(+), 17 deletions(-)
+
+diff --git a/internal/polecat/manager_test.go b/internal/polecat/manager_test.go
+index 5c27802e..a928efca 100644
+--- a/internal/polecat/manager_test.go
++++ b/internal/polecat/manager_test.go
+@@ -106,6 +106,87 @@ esac
+ 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+ }
+ 
++func setupCanonicalBranchManagerTest(t *testing.T) (*Manager, string) {
++	t.Helper()
++	installMockBd(t)
++
++	root := t.TempDir()
++	mayorRig := filepath.Join(root, "mayor", "rig")
++	if err := os.MkdirAll(mayorRig, 0755); err != nil {
++		t.Fatalf("mkdir mayor/rig: %v", err)
++	}
++
++	rigBeads := filepath.Join(root, ".beads")
++	if err := os.MkdirAll(rigBeads, 0755); err != nil {
++		t.Fatalf("mkdir rig .beads: %v", err)
++	}
++	mayorBeads := filepath.Join(mayorRig, ".beads")
++	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
++		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
++		t.Fatalf("write rig redirect: %v", err)
++	}
++
++	cmd := exec.Command("git", "init", "-b", "main")
++	cmd.Dir = mayorRig
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git init: %v\n%s", err, out)
++	}
++
++	readmePath := filepath.Join(mayorRig, "README.md")
++	if err := os.WriteFile(readmePath, []byte("# Test\n"), 0644); err != nil {
++		t.Fatalf("write README.md: %v", err)
++	}
++	mayorGit := git.NewGit(mayorRig)
++	if err := mayorGit.Add("README.md"); err != nil {
++		t.Fatalf("git add: %v", err)
++	}
++	if err := mayorGit.Commit("Initial commit"); err != nil {
++		t.Fatalf("git commit: %v", err)
++	}
++
++	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
++	cmd.Dir = mayorRig
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git remote add: %v\n%s", err, out)
++	}
++	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
++	cmd.Dir = mayorRig
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git update-ref: %v\n%s", err, out)
++	}
++
++	r := &rig.Rig{Name: "rig", Path: root}
++	return NewManager(r, git.NewGit(root), nil), mayorRig
++}
++
++func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {
++	t.Helper()
++
++	repoGit := git.NewGit(repoPath)
++	if err := repoGit.CheckoutNewBranch(branchName, startPoint); err != nil {
++		t.Fatalf("checkout stale branch %s from %s: %v", branchName, startPoint, err)
++	}
++
++	fileName := strings.NewReplacer("/", "-", "@", "-").Replace(branchName) + ".txt"
++	if err := os.WriteFile(filepath.Join(repoPath, fileName), []byte(branchName+"\n"), 0644); err != nil {
++		t.Fatalf("write stale branch marker: %v", err)
++	}
++	if err := repoGit.Add(fileName); err != nil {
++		t.Fatalf("git add stale branch marker: %v", err)
++	}
++	if err := repoGit.Commit("Create stale polecat branch"); err != nil {
++		t.Fatalf("git commit stale branch marker: %v", err)
++	}
++
++	sha, err := repoGit.Rev("HEAD")
++	if err != nil {
++		t.Fatalf("resolve stale branch commit: %v", err)
++	}
++	return sha
++}
++
+ func TestStateIsWorking(t *testing.T) {
+ 	tests := []struct {
+ 		state   State
+@@ -1071,6 +1152,78 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
+ 	}
+ }
+ 
++func TestAddWithOptions_UsesCanonicalOriginDefaultBranch(t *testing.T) {
++	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
++
++	mayorGit := git.NewGit(mayorRig)
++	baseSHA, err := mayorGit.Rev("origin/main")
++	if err != nil {
++		t.Fatalf("resolve origin/main: %v", err)
++	}
++	staleSHA := createStalePolecatCommit(t, mayorRig, "main", "polecat/stale-source")
++
++	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
++	if err != nil {
++		t.Fatalf("AddWithOptions: %v", err)
++	}
++
++	worktreeGit := git.NewGit(polecat.ClonePath)
++	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, polecat.Branch)
++	if err != nil {
++		t.Fatalf("check stale ancestry: %v", err)
++	}
++	if staleAncestor {
++		t.Fatalf("new polecat branch %q unexpectedly includes stale local commit %s", polecat.Branch, staleSHA)
++	}
++
++	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, polecat.Branch)
++	if err != nil {
++		t.Fatalf("check canonical ancestry: %v", err)
++	}
++	if !baseAncestor {
++		t.Fatalf("new polecat branch %q should descend from origin/main commit %s", polecat.Branch, baseSHA)
++	}
++}
++
++func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
++	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
++
++	mayorGit := git.NewGit(mayorRig)
++	baseSHA, err := mayorGit.Rev("origin/main")
++	if err != nil {
++		t.Fatalf("resolve origin/main: %v", err)
++	}
++
++	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
++	if err != nil {
++		t.Fatalf("AddWithOptions: %v", err)
++	}
++
++	staleSHA := createStalePolecatCommit(t, polecat.ClonePath, "HEAD", "polecat/toast-stale")
++
++	reused, err := mgr.ReuseIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
++	if err != nil {
++		t.Fatalf("ReuseIdlePolecat: %v", err)
++	}
++
++	worktreeGit := git.NewGit(reused.ClonePath)
++	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, reused.Branch)
++	if err != nil {
++		t.Fatalf("check stale ancestry: %v", err)
++	}
++	if staleAncestor {
++		t.Fatalf("reused polecat branch %q unexpectedly includes stale local commit %s", reused.Branch, staleSHA)
++	}
++
++	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, reused.Branch)
++	if err != nil {
++		t.Fatalf("check canonical ancestry: %v", err)
++	}
++	if !baseAncestor {
++		t.Fatalf("reused polecat branch %q should descend from origin/main commit %s", reused.Branch, baseSHA)
++	}
++}
++
+ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
+ 	// This test verifies the invariant that polecat creation does NOT add any
+ 	// TRACKED files to the repo's directory structure. The user's code should stay pure.
+diff --git a/internal/polecat/session_manager.go b/internal/polecat/session_manager.go
+index 1e011a84..18367800 100644
+--- a/internal/polecat/session_manager.go
++++ b/internal/polecat/session_manager.go
+@@ -186,6 +186,66 @@ func (m *SessionManager) freshBranchName(polecatName, issue string) string {
+ 	return fmt.Sprintf("polecat/%s-%s", polecatName, ts)
+ }
+ 
++func (m *SessionManager) canonicalSessionStartPoint(g *git.Git) string {
++	defaultBranch := ""
++	if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
++		defaultBranch = rigCfg.DefaultBranch
++	}
++	if defaultBranch == "" {
++		defaultBranch = g.RemoteDefaultBranch()
++	}
++	return fmt.Sprintf("origin/%s", defaultBranch)
++}
++
++func shouldCreateFreshSessionBranch(currentBranch, issue, canonicalBranch string) bool {
++	if issue != "" && strings.Contains(currentBranch, "/"+issue+"@") {
++		return false
++	}
++
++	if currentBranch == canonicalBranch || currentBranch == "main" || currentBranch == "master" {
++		return true
++	}
++
++	return issue != "" && strings.HasPrefix(currentBranch, "polecat/")
++}
++
++func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string, opts SessionStartOptions) string {
++	currentBranch, err := g.CurrentBranch()
++	if err != nil {
++		return ""
++	}
++
++	startPoint := m.canonicalSessionStartPoint(g)
++	canonicalBranch := strings.TrimPrefix(startPoint, "origin/")
++	if !shouldCreateFreshSessionBranch(currentBranch, opts.Issue, canonicalBranch) {
++		return currentBranch
++	}
++
++	// Refresh origin refs before branching so recovered sessions start from the
++	// canonical remote base instead of any preserved local polecat branch.
++	if err := g.Fetch("origin"); err != nil {
++		debugSession("fetch origin for canonical session branch", err)
++	}
++
++	exists, err := g.RefExists(startPoint)
++	if err != nil {
++		debugSession("check canonical session start point", err)
++		return currentBranch
++	}
++	if !exists {
++		debugSession("missing canonical session start point", fmt.Errorf("%s", startPoint))
++		return currentBranch
++	}
++
++	newBranch := m.freshBranchName(polecat, opts.Issue)
++	if err := g.CheckoutNewBranch(newBranch, startPoint); err != nil {
++		debugSession("auto-checkout fresh branch on canonical base", err)
++		return currentBranch
++	}
++
++	return newBranch
++}
++
+ // hasPolecat checks if the polecat exists in this rig.
+ func (m *SessionManager) hasPolecat(polecat string) bool {
+ 	polecatPath := m.polecatDir(polecat)
+@@ -338,23 +398,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+ 	// branch detection and path resolution without a working directory.
+ 	polecatGitBranch := ""
+ 	if g := git.NewGit(workDir); g != nil {
+-		if b, err := g.CurrentBranch(); err == nil {
+-			polecatGitBranch = b
+-			// Auto-checkout a fresh branch if the worktree is on the default branch.
+-			// After gt done merges a polecat's work, the worktree reverts to main/master.
+-			// Starting a new session on main triggers the PRIME.md branch guard, which
+-			// nukes the polecat — causing the zombie loop seen in production (hq-h01n8).
+-			defaultBranch := g.DefaultBranch()
+-			if polecatGitBranch == defaultBranch || polecatGitBranch == "master" || polecatGitBranch == "main" {
+-				newBranch := m.freshBranchName(polecat, opts.Issue)
+-				if err := g.CheckoutNewBranch(newBranch, defaultBranch); err != nil {
+-					// Non-fatal: PRIME.md guard remains as a fallback; log for debugging.
+-					debugSession("auto-checkout fresh branch on default", err)
+-				} else {
+-					polecatGitBranch = newBranch
+-				}
+-			}
+-		}
++		polecatGitBranch = m.ensureCanonicalSessionBranch(g, polecat, opts)
+ 	}
+ 	// Generate the GASTA run ID — the root identifier for all telemetry emitted
+ 	// by this polecat session and its subprocesses (bd, mail, …).
+diff --git a/internal/polecat/session_manager_test.go b/internal/polecat/session_manager_test.go
+index f52bc960..5b95237d 100644
+--- a/internal/polecat/session_manager_test.go
++++ b/internal/polecat/session_manager_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/steveyegge/gastown/internal/config"
++	"github.com/steveyegge/gastown/internal/git"
+ 	"github.com/steveyegge/gastown/internal/rig"
+ 	gtruntime "github.com/steveyegge/gastown/internal/runtime"
+ 	"github.com/steveyegge/gastown/internal/session"
+@@ -43,6 +44,41 @@ func requireTmux(t *testing.T) {
+ 	}
+ }
+ 
++func setupSessionBranchTestRepo(t *testing.T) (string, *git.Git) {
++	t.Helper()
++
++	workDir := t.TempDir()
++	cmd := exec.Command("git", "init", "-b", "main")
++	cmd.Dir = workDir
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git init: %v\n%s", err, out)
++	}
++
++	repoGit := git.NewGit(workDir)
++	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
++		t.Fatalf("write README.md: %v", err)
++	}
++	if err := repoGit.Add("README.md"); err != nil {
++		t.Fatalf("git add: %v", err)
++	}
++	if err := repoGit.Commit("Initial commit"); err != nil {
++		t.Fatalf("git commit: %v", err)
++	}
++
++	cmd = exec.Command("git", "remote", "add", "origin", workDir)
++	cmd.Dir = workDir
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git remote add: %v\n%s", err, out)
++	}
++	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
++	cmd.Dir = workDir
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git update-ref: %v\n%s", err, out)
++	}
++
++	return workDir, repoGit
++}
++
+ func TestSessionName(t *testing.T) {
+ 	setupTestRegistryForSession(t)
+ 
+@@ -300,6 +336,68 @@ func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnsureCanonicalSessionBranch_UsesOriginDefaultBranch(t *testing.T) {
++	workDir, repoGit := setupSessionBranchTestRepo(t)
++
++	baseSHA, err := repoGit.Rev("origin/main")
++	if err != nil {
++		t.Fatalf("resolve origin/main: %v", err)
++	}
++	if err := repoGit.CheckoutNewBranch("polecat/toast-old", "main"); err != nil {
++		t.Fatalf("checkout stale polecat branch: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(workDir, "stale.txt"), []byte("stale\n"), 0644); err != nil {
++		t.Fatalf("write stale.txt: %v", err)
++	}
++	if err := repoGit.Add("stale.txt"); err != nil {
++		t.Fatalf("git add stale.txt: %v", err)
++	}
++	if err := repoGit.Commit("stale local polecat commit"); err != nil {
++		t.Fatalf("git commit stale.txt: %v", err)
++	}
++	staleSHA, err := repoGit.Rev("HEAD")
++	if err != nil {
++		t.Fatalf("resolve stale HEAD: %v", err)
++	}
++
++	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
++	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
++	if !strings.Contains(branch, "/gt-9qb@") {
++		t.Fatalf("fresh session branch = %q, want issue-scoped branch", branch)
++	}
++
++	staleAncestor, err := repoGit.IsAncestor(staleSHA, branch)
++	if err != nil {
++		t.Fatalf("check stale ancestry: %v", err)
++	}
++	if staleAncestor {
++		t.Fatalf("fresh session branch %q unexpectedly includes stale local commit %s", branch, staleSHA)
++	}
++
++	baseAncestor, err := repoGit.IsAncestor(baseSHA, branch)
++	if err != nil {
++		t.Fatalf("check canonical ancestry: %v", err)
++	}
++	if !baseAncestor {
++		t.Fatalf("fresh session branch %q should descend from origin/main commit %s", branch, baseSHA)
++	}
++}
++
++func TestEnsureCanonicalSessionBranch_KeepsCurrentIssueBranch(t *testing.T) {
++	workDir, repoGit := setupSessionBranchTestRepo(t)
++
++	currentBranch := "polecat/toast/gt-9qb@seed"
++	if err := repoGit.CheckoutNewBranch(currentBranch, "main"); err != nil {
++		t.Fatalf("checkout current issue branch: %v", err)
++	}
++
++	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
++	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
++	if branch != currentBranch {
++		t.Fatalf("ensureCanonicalSessionBranch changed active issue branch: got %q want %q", branch, currentBranch)
++	}
++}
++
+ // TestSessionManager_resolveBeadsDir verifies that SessionManager correctly
+ // resolves the beads directory for cross-rig issues via routes.jsonl.
+ // This is a regression test for GitHub issue #1056.
+-- 
+2.43.0
+

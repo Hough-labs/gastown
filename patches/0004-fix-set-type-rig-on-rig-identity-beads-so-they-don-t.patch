@@ -1,0 +1,32 @@
+From 241148f3a24dcecf71978e551e7ac552962046cf Mon Sep 17 00:00:00 2001
+From: Cherub Kumar <ckumar1@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 13:22:48 -0700
+Subject: [PATCH 004/110] fix: set type=rig on rig identity beads so they don't
+ appear in bd ready (#3579)
+
+CreateRigBead omitted --type=rig, defaulting to task. This caused rig
+identity beads to surface as available work in bd ready. Re-applied after
+rebase dropped the original fix.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+Executed-By: gastown/crew/woodhouse
+---
+ internal/beads/beads_rig.go | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/internal/beads/beads_rig.go b/internal/beads/beads_rig.go
+index 953e8632..296ca4f3 100644
+--- a/internal/beads/beads_rig.go
++++ b/internal/beads/beads_rig.go
+@@ -149,6 +149,7 @@ func (b *Beads) CreateRigBead(name string, fields *RigFields) (*Issue, error) {
+ 		"--title=" + name,
+ 		"--description=" + description,
+ 		"--labels=gt:rig",
++		"--type=rig",
+ 	}
+ 	if NeedsForceForID(id) {
+ 		args = append(args, "--force")
+-- 
+2.43.0
+

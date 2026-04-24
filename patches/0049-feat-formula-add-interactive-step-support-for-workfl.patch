@@ -1,0 +1,143 @@
+From da22a592bf06d659a94d2dc09f5ef31fe235f3b2 Mon Sep 17 00:00:00 2001
+From: Pierre-Alexandre Entraygues <paentraygues@gmail.com>
+Date: Sun, 12 Apr 2026 22:49:36 +0200
+Subject: [PATCH 049/110] feat(formula): add interactive step support for
+ workflow formulas (#3529)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(formula): add interactive step support for workflow formulas
+
+Steps marked with `interactive = true` in formula TOML are hooked to the
+current session instead of being dispatched to a polecat. When any step
+in a workflow is interactive, all ready steps stay local.
+
+This enables crew workers to run spec-workflow and other dialogue-heavy
+formulas interactively without spawning polecats that block on user input.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* fix(formula): correct misspelling dialogue → dialog
+
+Fixes CI lint failure (misspell linter).
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* chore: gitignore Gas Town internal files
+
+---------
+
+Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ .gitignore                |  4 ++++
+ internal/cmd/formula.go   | 45 +++++++++++++++++++++++++++++++++++----
+ internal/formula/types.go |  5 +++--
+ 3 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 0a47cd20..dceb6e8e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -88,3 +88,7 @@ __pycache__/
+ 
+ # Beads / Dolt files (added by bd init)
+ .beads-credential-key
++
++# Gas Town (added by gt)
++.runtime/
++CLAUDE.local.md
+diff --git a/internal/cmd/formula.go b/internal/cmd/formula.go
+index d8c9cb09..013f8b78 100644
+--- a/internal/cmd/formula.go
++++ b/internal/cmd/formula.go
+@@ -827,10 +827,22 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
+ 		fmt.Printf("  %s %s: %s%s\n", style.Dim.Render("○"), step.ID, stepBeadID, needsStr)
+ 	}
+ 
+-	// Step 3: Identify and sling ready steps (those with no dependencies)
++	// Step 3: Identify and dispatch ready steps (those with no dependencies)
++	// Interactive steps are hooked to the current session; others are slung to polecats.
+ 	fmt.Printf("\n%s Dispatching ready steps...\n\n", style.Bold.Render("→"))
+ 
++	// Check if any step in the workflow is interactive — if so, we'll need
++	// to handle the molecule lifecycle in the current session.
++	hasInteractive := false
++	for _, step := range f.Steps {
++		if step.Interactive {
++			hasInteractive = true
++			break
++		}
++	}
++
+ 	slingCount := 0
++	interactiveCount := 0
+ 	for _, step := range f.Steps {
+ 		if len(step.Needs) > 0 {
+ 			continue // has unmet dependencies — will be auto-dispatched
+@@ -841,6 +853,23 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
+ 			continue
+ 		}
+ 
++		if step.Interactive || hasInteractive {
++			// Interactive step: hook to current session instead of slinging to a polecat.
++			// The user will execute this step in their current crew session.
++			_ = BdCmd("update", stepBeadID, "--status=hooked").
++				WithAutoCommit().
++				Dir(rigBeadsDir).
++				Run()
++
++			fmt.Printf("  %s %s: %s (interactive — hooked to current session)\n",
++				style.Bold.Render("⇨"), step.ID, stepBeadID)
++			fmt.Printf("    %s\n", step.Title)
++			fmt.Printf("    When done: bd close %s\n\n", stepBeadID)
++			interactiveCount++
++			continue
++		}
++
++		// Non-interactive step: sling to a polecat
+ 		// Agent precedence: CLI --agent > formula-level
+ 		stepAgent := formulaRunAgent
+ 		if stepAgent == "" {
+@@ -873,11 +902,19 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
+ 	}
+ 
+ 	// Summary
+-	blockedCount := len(f.Steps) - slingCount
++	blockedCount := len(f.Steps) - slingCount - interactiveCount
+ 	fmt.Printf("\n%s Workflow dispatched!\n", style.Bold.Render("✓"))
+ 	fmt.Printf("  Workflow: %s\n", workflowID)
+-	fmt.Printf("  Steps:    %d total, %d dispatched, %d awaiting dependencies\n",
+-		len(f.Steps), slingCount, blockedCount)
++	if interactiveCount > 0 {
++		fmt.Printf("  Steps:    %d total, %d interactive (current session), %d dispatched, %d awaiting dependencies\n",
++			len(f.Steps), interactiveCount, slingCount, blockedCount)
++		fmt.Printf("\n  This workflow has interactive steps. Work through them sequentially:\n")
++		fmt.Printf("    bd mol current <molecule-id>   — find current step\n")
++		fmt.Printf("    bd close <step-id>             — advance to next step\n")
++	} else {
++		fmt.Printf("  Steps:    %d total, %d dispatched, %d awaiting dependencies\n",
++			len(f.Steps), slingCount, blockedCount)
++	}
+ 	fmt.Printf("\n  Track progress: gt convoy status %s\n", workflowID)
+ 
+ 	return nil
+diff --git a/internal/formula/types.go b/internal/formula/types.go
+index e66b0fb7..cdd83b8f 100644
+--- a/internal/formula/types.go
++++ b/internal/formula/types.go
+@@ -123,8 +123,9 @@ type Step struct {
+ 	Title       string   `toml:"title"`
+ 	Description string   `toml:"description"`
+ 	Needs       []string `toml:"needs"`
+-	Parallel    bool     `toml:"parallel"`   // If true, this step can run concurrently with other parallel steps that share the same needs
+-	Acceptance  string   `toml:"acceptance"` // Exit criteria for this step (used by Ralph loop mode)
++	Parallel    bool     `toml:"parallel"`    // If true, this step can run concurrently with other parallel steps that share the same needs
++	Interactive bool     `toml:"interactive"` // If true, this step requires user dialog and runs in the current session instead of being dispatched to a polecat
++	Acceptance  string   `toml:"acceptance"`  // Exit criteria for this step (used by Ralph loop mode)
+ }
+ 
+ // Template represents a template step in an expansion formula.
+-- 
+2.43.0
+

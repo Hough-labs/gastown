@@ -1,0 +1,115 @@
+From 6b4f5de51c226be414c257a9f9730a0d61c1208a Mon Sep 17 00:00:00 2001
+From: m4dc4p <jgbailey@gmail.com>
+Date: Sun, 12 Apr 2026 13:23:54 -0700
+Subject: [PATCH 019/110] Update nix flake for v1.0.0 (#3542)
+
+Updated flake so gastown builds & installs under
+nix.
+---
+ flake.lock | 16 ++++++++--------
+ flake.nix  | 23 +++++------------------
+ 2 files changed, 13 insertions(+), 26 deletions(-)
+
+diff --git a/flake.lock b/flake.lock
+index 2209962b..ece74609 100644
+--- a/flake.lock
++++ b/flake.lock
+@@ -5,15 +5,15 @@
+         "nixpkgs": "nixpkgs"
+       },
+       "locked": {
+-        "lastModified": 1773453770,
+-        "narHash": "sha256-cMxZQJ3NdoqvQPlXt+6EuDruGPTVz/56m4e5apAHeFI=",
+-        "owner": "steveyegge",
++        "lastModified": 1775495284,
++        "narHash": "sha256-/dV4HKOW8S1PtlU5ewcacUxbGhRclzxeNBXVfZbdj2Q=",
++        "owner": "gastownhall",
+         "repo": "beads",
+-        "rev": "1ce765eef881a2a7efcc005c789729242da19f8b",
++        "rev": "97fea942f6588dc5772ed92b5434281ad458727c",
+         "type": "github"
+       },
+       "original": {
+-        "owner": "steveyegge",
++        "owner": "gastownhall",
+         "repo": "beads",
+         "type": "github"
+       }
+@@ -54,11 +54,11 @@
+     },
+     "nixpkgs_2": {
+       "locked": {
+-        "lastModified": 1771848320,
+-        "narHash": "sha256-0MAd+0mun3K/Ns8JATeHT1sX28faLII5hVLq0L3BdZU=",
++        "lastModified": 1775036866,
++        "narHash": "sha256-ZojAnPuCdy657PbTq5V0Y+AHKhZAIwSIT2cb8UgAz/U=",
+         "owner": "NixOS",
+         "repo": "nixpkgs",
+-        "rev": "2fc6539b481e1d2569f25f8799236694180c0993",
++        "rev": "6201e203d09599479a3b3450ed24fa81537ebc4e",
+         "type": "github"
+       },
+       "original": {
+diff --git a/flake.nix b/flake.nix
+index a18702c8..46a8da7c 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -4,7 +4,7 @@
+   inputs = {
+     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+     flake-utils.url = "github:numtide/flake-utils";
+-    beads.url = "github:steveyegge/beads";
++    beads.url = "github:gastownhall/beads";
+   };
+ 
+   outputs =
+@@ -17,21 +17,8 @@
+     flake-utils.lib.eachDefaultSystem (
+       system:
+       let
+-        # Go 1.25.8: beads v0.60.0 deps (charm.land/huh/v2) require it, nixpkgs has 1.25.7
+-        # Remove when nixpkgs ships Go >= 1.25.8
+-        goOverlay = final: prev: {
+-          go_1_25 = prev.go_1_25.overrideAttrs {
+-            version = "1.25.8";
+-            src = prev.fetchurl {
+-              url = "https://go.dev/dl/go1.25.8.src.tar.gz";
+-              hash = "sha256-6YjUokRqx/4/baoImljpk2pSo4E1Wt7ByJgyMKjWxZ4=";
+-            };
+-          };
+-        };
+-
+         pkgs = import nixpkgs {
+           inherit system;
+-          overlays = [ goOverlay ];
+         };
+         beadsPkg = beads.packages.${system}.default;
+       in
+@@ -39,12 +26,12 @@
+         packages = {
+           gt = pkgs.buildGoModule {
+             pname = "gt";
+-            version = "0.8.0";
++            version = "1.0.0";
+             src = ./.;
+-            vendorHash = "sha256-XWv/slFm796AO928eqzVHms0uUX4ZMJk0I4mZz+kp54=";
++            vendorHash = "sha256-mJzpsl4XnIm3ZSg7fFn0MOdQQW1bdOkAJ+TikiLMXJM=";
+ 
+             ldflags = [
+-              "-X github.com/steveyegge/gastown/internal/cmd.Build=nix"
++              "-X github.com/gastownhall/gastown/internal/cmd.Build=nix"
+               "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1"
+             ];
+ 
+@@ -52,7 +39,7 @@
+ 
+             meta = with pkgs.lib; {
+               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
+-              homepage = "https://github.com/steveyegge/gastown";
++              homepage = "https://github.com/gastownhall/gastown";
+               license = licenses.mit;
+               mainProgram = "gt";
+             };
+-- 
+2.43.0
+

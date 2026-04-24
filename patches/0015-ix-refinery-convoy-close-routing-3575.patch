@@ -1,0 +1,178 @@
+From b6ac5a0960adc1834a8ab863c2cd31efc94be5f1 Mon Sep 17 00:00:00 2001
+From: James Johnson <jaj@fastmail.com>
+Date: Sun, 12 Apr 2026 21:23:43 +0100
+Subject: [PATCH 015/110] ix refinery convoy close routing (#3575)
+
+---
+ internal/refinery/engineer.go      | 29 +++++++++--
+ internal/refinery/engineer_test.go | 77 ++++++++++++++++++++++++++++++
+ 2 files changed, 102 insertions(+), 4 deletions(-)
+
+diff --git a/internal/refinery/engineer.go b/internal/refinery/engineer.go
+index b8373c57..c4f2029c 100644
+--- a/internal/refinery/engineer.go
++++ b/internal/refinery/engineer.go
+@@ -26,6 +26,17 @@ import (
+ 	"github.com/steveyegge/gastown/internal/util"
+ )
+ 
++func stripEnvKey(env []string, key string) []string {
++	prefix := key + "="
++	filtered := env[:0]
++	for _, entry := range env {
++		if !strings.HasPrefix(entry, prefix) {
++			filtered = append(filtered, entry)
++		}
++	}
++	return filtered
++}
++
+ // shortSHA returns at most 8 characters of a SHA for display.
+ func shortSHA(sha string) string {
+ 	if len(sha) > 8 {
+@@ -1871,10 +1882,14 @@ type convoyInfo struct {
+ // checkAndCloseCompletedConvoys finds and closes convoys where all tracked issues
+ // are complete. Returns the list of convoys that were closed.
+ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
++	bdEnv := stripEnvKey(os.Environ(), "BEADS_DIR")
++
+ 	// List all open convoys
+-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
++	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--type=convoy", "--status=open", "--json"})
++	listCmd := exec.Command("bd", listArgs...)
+ 	util.SetDetachedProcessGroup(listCmd)
+ 	listCmd.Dir = townBeads
++	listCmd.Env = bdEnv
+ 	var stdout bytes.Buffer
+ 	listCmd.Stdout = &stdout
+ 
+@@ -1898,9 +1913,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
+ 
+ 	for _, convoy := range convoys {
+ 		// Get tracked issues for this convoy via bd dep list
+-		depCmd := exec.Command("bd", "dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json")
++		depArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
++		depCmd := exec.Command("bd", depArgs...)
+ 		util.SetDetachedProcessGroup(depCmd)
+ 		depCmd.Dir = townRoot
++		depCmd.Env = bdEnv
+ 		var depOut bytes.Buffer
+ 		depCmd.Stdout = &depOut
+ 
+@@ -1929,9 +1946,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
+ 			}
+ 
+ 			// Get fresh status from home rig via bd show with routing
+-			showCmd := exec.Command("bd", "show", depID, "--json")
++			showArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"show", depID, "--json"})
++			showCmd := exec.Command("bd", showArgs...)
+ 			util.SetDetachedProcessGroup(showCmd)
+ 			showCmd.Dir = townRoot
++			showCmd.Env = bdEnv
+ 			var showOut bytes.Buffer
+ 			showCmd.Stdout = &showOut
+ 
+@@ -1965,9 +1984,11 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
+ 			reason = "Empty convoy — auto-closed as definitionally complete"
+ 		}
+ 
+-		closeCmd := exec.Command("bd", "close", convoy.ID, "-r", reason)
++		closeArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"close", convoy.ID, "-r", reason})
++		closeCmd := exec.Command("bd", closeArgs...)
+ 		util.SetDetachedProcessGroup(closeCmd)
+ 		closeCmd.Dir = townBeads
++		closeCmd.Env = bdEnv
+ 
+ 		if err := closeCmd.Run(); err != nil {
+ 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close convoy %s: %v\n", convoy.ID, err)
+diff --git a/internal/refinery/engineer_test.go b/internal/refinery/engineer_test.go
+index 7e3aaba5..cac8bd0d 100644
+--- a/internal/refinery/engineer_test.go
++++ b/internal/refinery/engineer_test.go
+@@ -760,6 +760,83 @@ func TestPostMergeConvoyCheck_NoTownBeads(t *testing.T) {
+ 	}
+ }
+ 
++func TestCheckAndCloseCompletedConvoys_StripsBeadsDir(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on windows - shell stubs")
++	}
++
++	tmpDir := t.TempDir()
++	townBeads := filepath.Join(tmpDir, ".beads")
++	if err := os.MkdirAll(townBeads, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	rigDir := filepath.Join(tmpDir, "l9")
++	if err := os.MkdirAll(rigDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	binDir := t.TempDir()
++	bdPath := filepath.Join(binDir, "bd")
++	script := `#!/bin/sh
++case "$*" in
++  "--allow-stale version")
++    exit 0
++    ;;
++  "--allow-stale list --type=convoy --status=open --json"|"list --type=convoy --status=open --json")
++    if [ -n "$BEADS_DIR" ]; then
++      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
++      exit 1
++    fi
++    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":""}]'
++    ;;
++  "--allow-stale dep list hq-cv-l9 --direction=down --type=tracks --json"|"dep list hq-cv-l9 --direction=down --type=tracks --json")
++    if [ -n "$BEADS_DIR" ]; then
++      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
++      exit 1
++    fi
++    echo '[{"id":"external:l9:l9-123","status":"closed"}]'
++    ;;
++  "--allow-stale show l9-123 --json"|"show l9-123 --json")
++    if [ -n "$BEADS_DIR" ]; then
++      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
++      exit 1
++    fi
++    echo '[{"status":"closed"}]'
++    ;;
++  "--allow-stale close hq-cv-l9 -r All tracked issues completed"|"close hq-cv-l9 -r All tracked issues completed")
++    if [ -n "$BEADS_DIR" ]; then
++      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
++      exit 1
++    fi
++    exit 0
++    ;;
++  *)
++    echo "unexpected bd args: $*" >&2
++    exit 1
++    ;;
++esac
++`
++	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	t.Setenv("BEADS_DIR", "/wrong/.beads")
++
++	e := NewEngineer(&rig.Rig{
++		Name: "l9",
++		Path: rigDir,
++	})
++
++	closed := e.checkAndCloseCompletedConvoys(tmpDir, townBeads)
++	if len(closed) != 1 {
++		t.Fatalf("expected 1 closed convoy, got %d", len(closed))
++	}
++	if closed[0].ID != "hq-cv-l9" {
++		t.Fatalf("closed convoy ID = %q, want hq-cv-l9", closed[0].ID)
++	}
++}
++
+ func TestNotifyDeaconConvoyFeeding_SkipsWhenNoConvoyID(t *testing.T) {
+ 	// notifyDeaconConvoyFeeding should skip when MR has no ConvoyID
+ 	tmpDir, err := os.MkdirTemp("", "engineer-notify-test-*")
+-- 
+2.43.0
+

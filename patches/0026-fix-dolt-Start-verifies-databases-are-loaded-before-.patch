@@ -1,0 +1,98 @@
+From 1c59b78af9df8eb53ce8e454199df99cd41c6422 Mon Sep 17 00:00:00 2001
+From: Alex <alex.a.ackerman@gmail.com>
+Date: Sun, 12 Apr 2026 13:24:16 -0700
+Subject: [PATCH 026/110] fix(dolt): Start verifies databases are loaded before
+ returning (gt-nq1) (#3549)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After a `gt down` + `gt up` cycle, the Dolt server could come up with its
+TCP listener bound but no rig databases registered — leaving SHOW DATABASES
+showing only information_schema and mysql. The user had to manually
+`gt dolt stop && gt dolt start` to recover.
+
+Root cause: doltserver.Start() returned success on the first iteration of
+its readiness loop where TCP was reachable. Dolt opens its listener before
+finishing database discovery, so callers (and any agents waiting on
+WaitForReady) raced ahead while databases were still loading or had failed
+to register entirely.
+
+Fix: extend the existing wait loop to also call VerifyDatabases() once TCP
+is reachable. Only return success when every expected on-disk database is
+present in SHOW DATABASES. Reuse the existing per-database time budget
+(5s × dbCount) rather than introducing a new one. If TCP came up but
+databases never loaded, surface a distinct error that points the user at
+the recovery steps.
+
+The Verify path is a no-op when there are no on-disk databases, so the
+fresh-install case still returns immediately on TCP-reachable.
+
+Co-authored-by: navani <user.email=28374790+A3Ackerman@users.noreply.github.com>
+---
+ internal/doltserver/doltserver.go | 38 +++++++++++++++++++++++++++----
+ 1 file changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index 6e46ff81..f53041ee 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -1664,6 +1664,7 @@ func Start(townRoot string) error {
+ 	}
+ 	maxAttempts := dbCount * 10 // 10 × 500ms = 5s per database
+ 	var lastErr error
++	tcpReachable := false
+ 	for attempt := 0; attempt < maxAttempts; attempt++ {
+ 		time.Sleep(500 * time.Millisecond)
+ 
+@@ -1672,15 +1673,42 @@ func Start(townRoot string) error {
+ 			return fmt.Errorf("Dolt server process died during startup (check logs with 'gt dolt logs')")
+ 		}
+ 
+-		if err := CheckServerReachable(townRoot); err == nil {
+-			return nil // Server is up and accepting connections
+-		} else {
+-			lastErr = err
++		if !tcpReachable {
++			if err := CheckServerReachable(townRoot); err != nil {
++				lastErr = err
++				continue
++			}
++			tcpReachable = true
++		}
++
++		// TCP listener is up. Verify that the expected on-disk databases are
++		// actually being served before declaring success. Without this check
++		// Start() can return on the first iteration where Dolt has bound its
++		// port but is still discovering/loading databases — leaving callers
++		// (and waiting agents) connected to a server that only exposes
++		// information_schema and mysql. Symptom: gt down + gt up cycle leaves
++		// SHOW DATABASES showing no rig databases until the user manually
++		// runs gt dolt stop + gt dolt start. (gt-nq1)
++		if len(databases) == 0 {
++			return nil // Nothing to verify — fresh install or empty data dir
++		}
++		_, missing, verifyErr := VerifyDatabases(townRoot)
++		if verifyErr != nil {
++			lastErr = fmt.Errorf("verifying databases: %w", verifyErr)
++			continue
+ 		}
++		if len(missing) == 0 {
++			return nil // Server is up and serving every expected database
++		}
++		lastErr = fmt.Errorf("server is reachable but %d/%d databases not yet served (missing: %v)",
++			len(missing), len(databases), missing)
+ 	}
+ 
+ 	totalTimeout := time.Duration(dbCount) * 5 * time.Second
+-	return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
++	if !tcpReachable {
++		return fmt.Errorf("Dolt server process started (PID %d) but not accepting connections after %v (%d databases × 5s): %w\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
++	}
++	return fmt.Errorf("Dolt server process started (PID %d) and is reachable, but databases failed to load after %v (%d databases × 5s): %w\nRecovery: gt dolt stop && gt dolt start\nCheck logs with: gt dolt logs", cmd.Process.Pid, totalTimeout, dbCount, lastErr)
+ }
+ 
+ // cleanupStaleDoltLock removes a stale Dolt LOCK file if no process holds it.
+-- 
+2.43.0
+

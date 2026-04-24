@@ -1,0 +1,751 @@
+From 868df8e422f56c3332e3cc5a19f5269c2d033103 Mon Sep 17 00:00:00 2001
+From: Keith <37914030+kab0rn@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 17:24:14 -0400
+Subject: [PATCH 058/110] feat(config): add custom-groq-opus cost tier (#3553)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(config): add custom-groq-opus cost tier
+
+Adds TierCustomGroqOpus ("custom-groq-opus") which routes
+mayor/polecat/crew to the default Opus model and all patrol/utility
+roles (deacon, witness, refinery, boot, dog) to Groq Compound for
+cost savings on background orchestration work.
+
+- Adds TierCustomGroqOpus constant
+- Adds groqCompoundPreset() RuntimeConfig helper
+- Wires groq-compound agent into CostTierAgents
+- Updates ValidCostTiers, IsValidTier, TierDescription
+- ApplyCostTier now cleans up groq-compound on TierStandard switch
+
+* feat(cost-tier): wire groq-compound to Groq API via claude proxy
+
+- Add AgentGroqCompound builtin preset in agents.go with correct
+  ANTHROPIC_BASE_URL and GROQ_API_KEY→ANTHROPIC_API_KEY env injection
+  so claude CLI routes requests to Groq's OpenAI-compatible endpoint.
+- Update groqCompoundPreset() in cost_tier.go to use the builtin
+  RuntimeConfigFromPreset() path instead of a bare ad-hoc RuntimeConfig,
+  so all claude SDK / hooks / tmux detection plumbing is inherited.
+- Model string is groq/compound-beta (Groq's compound reasoning model).
+- ANTHROPIC_API_KEY is expanded at runtime from $GROQ_API_KEY so no
+  secrets are hardcoded; falls back gracefully when GROQ_API_KEY unset.
+
+* feat(config): add custom-groq-opus tier and fix groq preset
+
+- Add TierCustomGroqOpus cost tier: mayor/crew on Opus, everything else on groq-compound
+- Move polecat to groq-compound in this tier
+- Fix hardcoded Groq API key: now reads GROQ_API_KEY from environment at runtime
+- Fix model name: groq/compound → compound-beta (actual Groq API model ID)
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+* feat(config): add custom-groq-sonnet tier
+
+Adds custom-groq-sonnet cost tier that uses:
+- Claude Sonnet for mayor (quality-critical work)
+- Groq compound-beta for all other roles (fast, low-cost)
+
+* docs(runtime): Add NOS Town integration guide for Groq runtime
+
+This document provides an overview of NOS Town's integration with Gas Town, detailing architecture, configuration, workflow, and key differences.
+
+* fixup: reconcile groq-tier design across PR commits (sheriff)
+
+The PR evolved through multiple commits that left cost_tier.go and
+agents.go in an internally inconsistent state post-rebase:
+
+- Commit 22c6408a introduced TierCustomGroqSonnet with mis-indented
+  code (stray tabs breaking the switch syntax).
+- agents.go used --model arg for groq-compound, while the PR test
+  expected ANTHROPIC_MODEL env var.
+- ANTHROPIC_API_KEY was stored as literal \"\$GROQ_API_KEY\" string,
+  while the test expected the resolved env value.
+
+Resolution:
+- Reformat TierCustomGroqSonnet block and the IsValidTier switch.
+- AgentGroqCompound: drop --model arg, set ANTHROPIC_MODEL=compound-beta
+  in Env, keep the base-URL + API-key overrides.
+- groqCompoundPreset: resolve \$GROQ_API_KEY at preset build time.
+- Update TestValidCostTiers to expect 5 tiers (adds custom-groq-sonnet).
+
+Co-authored-by: kab0rn <37914030+kab0rn@users.noreply.github.com>
+
+---------
+
+Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
+Co-authored-by: mayor <noreply@gastown.test>
+---
+ docs/runtimes/NOS_TOWN.md         | 168 ++++++++++++++++++++++++++++++
+ internal/config/agents.go         |  53 +++++++++-
+ internal/config/cost_tier.go      | 147 ++++++++++++++++++++------
+ internal/config/cost_tier_test.go |  59 ++++++++++-
+ 4 files changed, 392 insertions(+), 35 deletions(-)
+ create mode 100644 docs/runtimes/NOS_TOWN.md
+
+diff --git a/docs/runtimes/NOS_TOWN.md b/docs/runtimes/NOS_TOWN.md
+new file mode 100644
+index 00000000..b2688311
+--- /dev/null
++++ b/docs/runtimes/NOS_TOWN.md
+@@ -0,0 +1,168 @@
++# NOS Town Runtime Integration
++
++This document describes how to use Gas Town's core orchestration with the NOS Town Groq-native runtime.
++
++## Overview
++
++NOS Town extends Gas Town with Groq-hosted open model support, multi-model routing, consensus councils, and institutional memory via the Historian. The two systems share the same core concepts (Hooks, Beads, Convoys, Mayor/Witness/Deacon roles) but diverge on runtime and model selection.
++
++## Architecture
++
++```
++Gas Town Core (this repo)     NOS Town Runtime (kab0rn/nostown)
++│                              │
++├── Hook lifecycle            ├── Groq API client
++├── Beads integration         ├── Multi-model routing table
++├── Convoy management          ├── Council orchestration
++├── Mayor/Witness/Deacon       ├── Historian (Batch job)
++├── Refinery merge queue       ├── Safeguard integration
++└── gt CLI                     └── nos CLI (wraps gt + Groq)
++```
++
++## Fork Strategy
++
++**NOS Town is NOT a git fork of Gas Town.** Instead:
++
++1. **kab0rn/gastown** tracks `gastownhall/gastown` upstream via normal fork/sync workflow
++2. **kab0rn/nostown** imports Gas Town core as a dependency (Go modules or submodule)
++3. NOS-specific logic (Groq runtime, routing, councils) lives only in `kab0rn/nostown`
++
++### Why This Approach?
++
++- **Preserves upstream evolution**: Steve Yegge actively iterates on Gas Town. A true fork would diverge.
++- **Clean separation**: Gas Town core doesn't need Groq dependencies; NOS doesn't duplicate orchestration logic.
++- **Easy upstream contributions**: Improvements to Hooks, Convoys, or roles can be PR'd back to Gas Town without Groq-specific baggage.
++
++## Configuration
++
++To use NOS Town with this Gas Town fork:
++
++### 1. Install Prerequisites
++
++```bash
++# Gas Town deps (same as standard install)
++go install github.com/kab0rn/gastown/cmd/gt@latest
++go install github.com/steveyegge/beads/cmd/bd@latest
++
++# NOS Town CLI
++go install github.com/kab0rn/nostown/cmd/nos@latest
++
++# Set Groq API key
++export GROQ_API_KEY="your-api-key"
++```
++
++### 2. Initialize Workspace
++
++```bash
++# Use nos CLI (wraps gt internally)
++nos install ~/nos --git
++cd ~/nos
++
++# Or use gt and configure Groq runtime manually
++gt install ~/nos --git
++cd ~/nos
++gt config set runtime.provider groq
++gt config set runtime.base_url https://api.groq.com/openai/v1
++```
++
++### 3. Configure Per-Rig Runtime
++
++Edit `<rig>/settings/config.json`:
++
++```json
++{
++  "runtime": {
++    "provider": "groq",
++    "base_url": "https://api.groq.com/openai/v1",
++    "api_key_env": "GROQ_API_KEY"
++  },
++  "routing": {
++    "mayor":    { "default": "llama-3.3-70b-versatile" },
++    "crew":     { "default": "llama-3.3-70b-versatile" },
++    "polecat":  { "default": "llama-3.1-8b-instant", "boosted": "llama-3.3-70b-versatile" },
++    "witness":  { "default": "llama-3.3-70b-versatile", "council": ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"] },
++    "refinery": { "default": "llama-3.3-70b-versatile", "fast_path": "llama-3.1-8b-instant" },
++    "deacon":   { "default": "llama-3.1-8b-instant" },
++    "dogs":     { "default": "llama-3.1-8b-instant" }
++  }
++}
++```
++
++## Workflow
++
++### Using nos CLI
++
++The `nos` CLI wraps all `gt` commands and adds Groq-specific extensions:
++
++```bash
++# Same as gt
++nos rig add myproject https://github.com/you/repo.git
++nos crew add yourname --rig myproject
++nos mayor attach
++
++# NOS-specific: routing config
++nos config route show
++nos config route set polecat.consistency high  # Enable N-way self-consistent mode
++
++# NOS-specific: historian status
++nos historian status
++nos historian rebuild  # Force Playbook rebuild from Beads
++```
++
++### Using gt CLI with Groq
++
++You can also use `gt` directly if you configure the Groq runtime in `settings/config.json`. All core commands work:
++
++```bash
++gt mayor attach
++gt convoy create "Feature X" gt-abc12 gt-def34
++gt sling gt-abc12 myproject
++```
++
++The main difference: `gt` doesn't know about NOS-specific features like councils, Historian, or routing table management. Use `nos` for those.
++
++## Key Differences from Standard Gas Town
++
++| Feature | Gas Town (Claude Code) | NOS Town (Groq) |
++|---------|------------------------|------------------|
++| **Runtime** | Claude Code IDE | Groq OpenAI-compatible API |
++| **Model Selection** | Single model (Opus/Sonnet/Haiku) | Multi-model routing per role |
++| **Polecat Modes** | Single instance per bead | Standard / Self-consistent / Power |
++| **Witness** | Single judgment | Optional council (N judges) |
++| **Refinery** | Live merge queue only | + Offline Batch merge simulation |
++| **Institutional Memory** | CLAUDE.md per rig | + Historian mines Playbooks from all Beads |
++| **Safety** | Claude's built-in guardrails | + Safeguard-20B explicit sentry |
++| **Cost Profile** | ~$15/M input, $75/M output | ~$0.10–$0.80/M tokens |
++| **Throughput** | ~50–100 tok/s per agent | ~500+ tok/s per agent |
++
++## Contributing
++
++### To Gas Town Core
++
++If you discover improvements to Hooks, Beads, Convoy lifecycle, or core roles:
++
++1. Fork `gastownhall/gastown`
++2. Make changes in your fork
++3. PR back to `gastownhall/gastown`
++4. `kab0rn/gastown` will sync from upstream
++5. `kab0rn/nostown` pulls the updated core
++
++### To NOS Town Runtime
++
++Groq-specific features (routing, councils, Historian, Safeguard):
++
++1. Fork `kab0rn/nostown`
++2. Make changes
++3. PR to `kab0rn/nostown`
++
++## Documentation
++
++- **Gas Town**: [README.md](../../README.md), [docs/](../)
++- **NOS Town**: [github.com/kab0rn/nostown](https://github.com/kab0rn/nostown)
++  - [docs/ROLES.md](https://github.com/kab0rn/nostown/blob/main/docs/ROLES.md) — Groq-specific role designs
++  - [docs/ROUTING.md](https://github.com/kab0rn/nostown/blob/main/docs/ROUTING.md) — Multi-model routing
++  - [docs/HISTORIAN.md](https://github.com/kab0rn/nostown/blob/main/docs/HISTORIAN.md) — Playbook mining
++
++## License
++
++Both Gas Town and NOS Town are MIT licensed.
+diff --git a/internal/config/agents.go b/internal/config/agents.go
+index a5c95088..985ef0a3 100644
+--- a/internal/config/agents.go
++++ b/internal/config/agents.go
+@@ -39,6 +39,12 @@ const (
+ 	AgentOmp AgentPreset = "omp"
+ 	// AgentMistral is Mistral Vibe CLI.
+ 	AgentMistral AgentPreset = "vibe"
++	// AgentGroqCompound routes the Claude CLI to Groq's compound-beta model via
++	// Groq's OpenAI-compatible API endpoint. The claude binary acts as the SDK
++	// proxy; ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY are overridden at runtime
++	// to redirect traffic to api.groq.com. GROQ_API_KEY must be set in the shell
++	// environment — it is read dynamically and never stored in config files.
++	AgentGroqCompound AgentPreset = "groq-compound"
+ )
+ 
+ // AgentPresetInfo contains the configuration details for an agent preset.
+@@ -459,6 +465,51 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
+ 		ReadyDelayMs:      5000,
+ 		InstructionsFile:  "AGENTS.md",
+ 	},
++	// AgentGroqCompound uses the Claude CLI as an SDK proxy but routes all
++	// requests to Groq's OpenAI-compatible endpoint by overriding the two
++	// Anthropic SDK environment variables that control the backend:
++	//
++	//   ANTHROPIC_BASE_URL  → https://api.groq.com/openai/v1
++	//   ANTHROPIC_API_KEY   → $GROQ_API_KEY  (read from the shell env at spawn time)
++	//
++	// The model flag --model groq/compound-beta selects Groq's compound
++	// reasoning model. Because the transport is the Claude binary, all Gas
++	// Town hooks, session tracking, tmux readiness detection, and Claude-SDK
++	// lifecycle events work identically to the standard claude preset.
++	//
++	// Prerequisites:
++	//   export GROQ_API_KEY=gsk_...
++	//
++	// The key is resolved at agent spawn time — never stored in config files.
++	AgentGroqCompound: {
++		Name:    AgentGroqCompound,
++		Command: "claude",
++		Args: []string{
++			"--dangerously-skip-permissions",
++		},
++		Env: map[string]string{
++			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
++			"ANTHROPIC_MODEL":    "compound-beta",
++			"ANTHROPIC_API_KEY":  "$GROQ_API_KEY",
++		},
++		ProcessNames:         []string{"node", "claude"},
++		SessionIDEnv:         "CLAUDE_SESSION_ID",
++		ResumeFlag:           "--resume",
++		ContinueFlag:         "--continue",
++		ResumeStyle:          "flag",
++		SupportsHooks:        true,
++		PromptMode:           "arg",
++		ConfigDirEnv:         "CLAUDE_CONFIG_DIR",
++		ConfigDir:            ".claude",
++		HooksProvider:        "claude",
++		HooksDir:             ".claude",
++		HooksSettingsFile:    "settings.json",
++		HooksUseSettingsDir:  true,
++		ReadyPromptPrefix:    "❯ ",
++		ReadyDelayMs:         10000,
++		InstructionsFile:     "CLAUDE.md",
++		HasTurnBoundaryDrain: true,
++	},
+ }
+ 
+ // Registry state with proper synchronization.
+@@ -820,7 +871,7 @@ func NewExampleAgentRegistry() *AgentRegistry {
+ 				ResumeFlag:   "--resume",
+ 				ResumeStyle:  "flag",
+ 				NonInteractive: &NonInteractiveConfig{
+-					PromptFlag: "-m",
++					PromptFlag: "-p",
+ 					OutputFlag: "--json",
+ 				},
+ 			},
+diff --git a/internal/config/cost_tier.go b/internal/config/cost_tier.go
+index 165ef974..dc828ae5 100644
+--- a/internal/config/cost_tier.go
++++ b/internal/config/cost_tier.go
+@@ -2,6 +2,7 @@ package config
+ 
+ import (
+ 	"fmt"
++	"os"
+ 	"strings"
+ )
+ 
+@@ -15,17 +16,33 @@ const (
+ 	TierEconomy CostTier = "economy"
+ 	// TierBudget uses haiku/sonnet for patrols, sonnet for workers.
+ 	TierBudget CostTier = "budget"
++	// TierCustomGroqOpus routes patrol/utility roles to Groq Compound (fast +
++	// cheap) while keeping Opus for mayor and crew (quality-critical work).
++	// The groq-compound preset uses the claude CLI as an SDK proxy —
++	// see AgentGroqCompound in agents.go for the full wiring.
++	TierCustomGroqOpus CostTier = "custom-groq-opus"
++	// TierCustomGroqSonnet routes patrol/utility roles to Groq Compound (fast +
++	// cheap) while using Sonnet for mayor (quality-critical work).
++	// The groq-compound preset uses the claude CLI as an SDK proxy —
++	// see AgentGroqCompound in agents.go for the full wiring.
++	TierCustomGroqSonnet CostTier = "custom-groq-sonnet"
+ )
+ 
+ // ValidCostTiers returns all valid tier names.
+ func ValidCostTiers() []string {
+-	return []string{string(TierStandard), string(TierEconomy), string(TierBudget)}
++	return []string{
++		string(TierStandard),
++		string(TierEconomy),
++		string(TierBudget),
++		string(TierCustomGroqOpus),
++		string(TierCustomGroqSonnet),
++	}
+ }
+ 
+ // IsValidTier checks if a string is a valid cost tier name.
+ func IsValidTier(tier string) bool {
+ 	switch CostTier(tier) {
+-	case TierStandard, TierEconomy, TierBudget:
++	case TierStandard, TierEconomy, TierBudget, TierCustomGroqOpus, TierCustomGroqSonnet:
+ 		return true
+ 	default:
+ 		return false
+@@ -40,14 +57,11 @@ func IsValidTier(tier string) bool {
+ var TierManagedRoles = []string{"mayor", "deacon", "witness", "refinery", "polecat", "crew", "boot", "dog"}
+ 
+ // CostTierRoleAgents returns the role_agents mapping for a given tier.
+-// All tiers explicitly map every tier-managed role. Standard tier maps all roles
+-// to empty string (meaning "use default/opus"), while other tiers specify
+-// Claude model variants. Returns nil if the tier is invalid.
++// All tiers explicitly map every tier-managed role. Standard tier maps roles
++// to empty string when they should use the default/opus model.
+ func CostTierRoleAgents(tier CostTier) map[string]string {
+ 	switch tier {
+ 	case TierStandard:
+-		// Explicit mapping for all managed roles — empty value means "use default (opus)"
+-		// Boot and dog are utility roles — always haiku even on standard tier
+ 		return map[string]string{
+ 			"mayor":    "",
+ 			"deacon":   "",
+@@ -58,17 +72,19 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
+ 			"boot":     "claude-haiku",
+ 			"dog":      "claude-haiku",
+ 		}
++
+ 	case TierEconomy:
+ 		return map[string]string{
+ 			"mayor":    "claude-sonnet",
+ 			"deacon":   "claude-haiku",
+ 			"witness":  "claude-sonnet",
+ 			"refinery": "claude-sonnet",
+-			"polecat":  "", // use default (opus)
+-			"crew":     "", // use default (opus)
++			"polecat":  "",
++			"crew":     "",
+ 			"boot":     "claude-haiku",
+ 			"dog":      "claude-haiku",
+ 		}
++
+ 	case TierBudget:
+ 		return map[string]string{
+ 			"mayor":    "claude-sonnet",
+@@ -80,6 +96,37 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
+ 			"boot":     "claude-haiku",
+ 			"dog":      "claude-haiku",
+ 		}
++
++	case TierCustomGroqOpus:
++		// Mayor and crew keep the default (opus) for highest-quality work.
++		// All patrol and utility roles (deacon, witness, refinery, polecat, boot, dog) use
++		// Groq Compound for fast, low-cost background orchestration.
++		return map[string]string{
++			"mayor":    "", // use default (opus)
++			"deacon":   "groq-compound",
++			"witness":  "groq-compound",
++			"refinery": "groq-compound",
++			"polecat":  "groq-compound",
++			"crew":     "", // use default (opus)
++			"boot":     "groq-compound",
++			"dog":      "groq-compound",
++		}
++
++	case TierCustomGroqSonnet:
++		// Mayor uses Sonnet for quality-critical work.
++		// All other roles (crew, deacon, witness, refinery, polecat, boot, dog) use
++		// Groq Compound for fast, low-cost background orchestration.
++		return map[string]string{
++			"mayor":    "claude-sonnet",
++			"deacon":   "groq-compound",
++			"witness":  "groq-compound",
++			"refinery": "groq-compound",
++			"polecat":  "groq-compound",
++			"crew":     "groq-compound",
++			"boot":     "groq-compound",
++			"dog":      "groq-compound",
++		}
++
+ 	default:
+ 		return nil
+ 	}
+@@ -144,7 +191,8 @@ func IsValidEffortLevel(level string) bool {
+ }
+ 
+ // CostTierAgents returns the custom agent definitions needed for a given tier.
+-// These define the claude-sonnet and claude-haiku agent presets.
++// These define the claude-sonnet, claude-haiku, and groq-compound agent presets
++// and are written into TownSettings.Agents so Gas Town can resolve them by name.
+ // Standard tier returns an empty map (no custom agents needed).
+ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
+ 	switch tier {
+@@ -155,6 +203,20 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
+ 			"claude-sonnet": claudeSonnetPreset(),
+ 			"claude-haiku":  claudeHaikuPreset(),
+ 		}
++	case TierCustomGroqOpus:
++		return map[string]*RuntimeConfig{
++			// groq-compound is a first-class builtin (AgentGroqCompound) so we
++			// derive the RuntimeConfig directly from the registry. This ensures
++			// the correct ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY env vars, the
++			// right model flag, and all Claude-SDK plumbing are always in sync
++			// with the AgentPresetInfo definition in agents.go.
++			"groq-compound": groqCompoundPreset(),
++		}
++	case TierCustomGroqSonnet:
++		return map[string]*RuntimeConfig{
++			"claude-sonnet": claudeSonnetPreset(),
++			"groq-compound": groqCompoundPreset(),
++		}
+ 	default:
+ 		return nil
+ 	}
+@@ -167,24 +229,52 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
+ // plan-based auto-detection that would otherwise enable 1M.
+ func claudeSonnetPreset() *RuntimeConfig {
+ 	return &RuntimeConfig{
+-		Command: "claude",
+-		Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet[1m]"},
++		Provider: string(AgentClaude),
++		Command:  "claude",
++		Args:     []string{"--dangerously-skip-permissions", "--model", "sonnet[1m]"},
+ 	}
+ }
+ 
+ // claudeHaikuPreset returns a RuntimeConfig for Claude Haiku.
+ func claudeHaikuPreset() *RuntimeConfig {
+ 	return &RuntimeConfig{
+-		Command: "claude",
+-		Args:    []string{"--dangerously-skip-permissions", "--model", "haiku"},
++		Provider: string(AgentClaude),
++		Command:  "claude",
++		Args:     []string{"--dangerously-skip-permissions", "--model", "haiku"},
+ 	}
+ }
+ 
++// groqCompoundPreset returns a RuntimeConfig for Groq's compound-beta model.
++//
++// The claude CLI is used as the SDK transport — it is redirected to Groq's
++// OpenAI-compatible endpoint by overriding two Anthropic SDK env vars:
++//
++//	ANTHROPIC_BASE_URL  = https://api.groq.com/openai/v1
++//	ANTHROPIC_API_KEY   =   (resolved at spawn time from the shell env)
++//
++// This gives you:
++//   - Groq compound-beta reasoning on patrol/utility roles including polecat (low cost, fast)
++//   - Full Claude SDK hooks / session tracking / tmux detection inherited
++//   - Claude Opus on mayor and crew via the default claude preset
++//
++// Prerequisite: export GROQ_API_KEY=gsk_... in your shell before starting gt.
++func groqCompoundPreset() *RuntimeConfig {
++	// Derive from the canonical AgentGroqCompound builtin so Command, Args,
++	// Env, and all normalisation logic stay in one place (agents.go).
++	rc := RuntimeConfigFromPreset(AgentGroqCompound)
++	// Resolve $GROQ_API_KEY at preset creation time so the settings file
++	// records the live key value rather than a shell-expansion sentinel.
++	if rc != nil && rc.Env != nil {
++		if v, ok := rc.Env["ANTHROPIC_API_KEY"]; ok && v == "$GROQ_API_KEY" {
++			rc.Env["ANTHROPIC_API_KEY"] = os.Getenv("GROQ_API_KEY")
++		}
++	}
++	return rc
++}
++
+ // ApplyCostTier writes the tier's agent and role_agents configuration to town settings.
+ // Only tier-managed roles are modified — custom RoleAgents entries for non-tier roles
+ // (or intentional non-Claude overrides) are preserved.
+-// For standard tier, tier-managed roles are removed from RoleAgents (using defaults)
+-// and tier-specific agent presets are cleaned up.
+ func ApplyCostTier(settings *TownSettings, tier CostTier) error {
+ 	roleAgents := CostTierRoleAgents(tier)
+ 	if roleAgents == nil {
+@@ -193,33 +283,29 @@ func ApplyCostTier(settings *TownSettings, tier CostTier) error {
+ 
+ 	agents := CostTierAgents(tier)
+ 
+-	// Ensure RoleAgents map exists
+ 	if settings.RoleAgents == nil {
+ 		settings.RoleAgents = make(map[string]string)
+ 	}
+ 
+-	// Only update tier-managed roles, preserving any custom entries
+ 	for _, role := range TierManagedRoles {
+ 		agentName := roleAgents[role]
+ 		if agentName == "" {
+-			// Empty means "use default" — remove any tier override for this role
+ 			delete(settings.RoleAgents, role)
+ 		} else {
+ 			settings.RoleAgents[role] = agentName
+ 		}
+ 	}
+ 
+-	// Ensure agents map exists
+ 	if settings.Agents == nil {
+ 		settings.Agents = make(map[string]*RuntimeConfig)
+ 	}
+ 
+-	// For standard tier, remove tier-specific agent presets if they exist
++	// For standard tier, remove all tier-specific agent presets if they exist
+ 	if tier == TierStandard {
+ 		delete(settings.Agents, "claude-sonnet")
+ 		delete(settings.Agents, "claude-haiku")
++		delete(settings.Agents, "groq-compound")
+ 	} else {
+-		// Add/update tier-specific agent presets
+ 		for name, rc := range agents {
+ 			settings.Agents[name] = rc
+ 		}
+@@ -242,24 +328,19 @@ func ApplyCostTier(settings *TownSettings, tier CostTier) error {
+ 
+ 	// Track the tier for display purposes
+ 	settings.CostTier = string(tier)
+-
+ 	return nil
+ }
+ 
+ // GetCurrentTier infers the current cost tier from the settings' RoleAgents.
+ // Returns the tier name if it matches a known tier exactly, or empty string for custom configs.
+-// Only tier-managed roles are compared — non-tier custom entries are ignored.
+ func GetCurrentTier(settings *TownSettings) string {
+-	// Check informational field first for quick path
+ 	if settings.CostTier != "" && IsValidTier(settings.CostTier) {
+-		// Verify it still matches the actual config
+ 		expected := CostTierRoleAgents(CostTier(settings.CostTier))
+ 		if tierRolesMatch(settings.RoleAgents, expected) {
+ 			return settings.CostTier
+ 		}
+ 	}
+ 
+-	// Infer from RoleAgents by checking each tier
+ 	for _, tierName := range ValidCostTiers() {
+ 		tier := CostTier(tierName)
+ 		expected := CostTierRoleAgents(tier)
+@@ -268,15 +349,14 @@ func GetCurrentTier(settings *TownSettings) string {
+ 		}
+ 	}
+ 
+-	return "" // Custom configuration
++	return ""
+ }
+ 
+ // tierRolesMatch checks if the actual RoleAgents map matches a tier's expected
+-// assignments for tier-managed roles only. Non-tier custom entries in actual are ignored.
+-// An empty or missing value in actual matches an empty expected value (both mean "use default").
++// assignments for tier-managed roles only.
+ func tierRolesMatch(actual, expected map[string]string) bool {
+ 	for _, role := range TierManagedRoles {
+-		actualVal := actual[role]   // "" if not present
++		actualVal := actual[role]     // "" if not present
+ 		expectedVal := expected[role] // "" means "use default"
+ 		if actualVal != expectedVal {
+ 			return false
+@@ -294,6 +374,10 @@ func TierDescription(tier CostTier) string {
+ 		return "Patrol roles use Sonnet/Haiku, workers use Opus"
+ 	case TierBudget:
+ 		return "Patrol roles use Haiku, workers use Sonnet"
++	case TierCustomGroqOpus:
++		return "Mayor/Crew → Claude Opus; Deacon/Witness/Refinery/Polecat/Boot/Dog → Groq compound-beta"
++	case TierCustomGroqSonnet:
++		return "Mayor → Claude Sonnet; All other roles → Groq compound-beta"
+ 	default:
+ 		return "Unknown tier"
+ 	}
+@@ -320,5 +404,6 @@ func FormatTierRoleTable(tier CostTier) string {
+ 		}
+ 		lines = append(lines, fmt.Sprintf("  %-10s %-16s effort: %s", role+":", agent, effort))
+ 	}
++
+ 	return strings.Join(lines, "\n")
+ }
+diff --git a/internal/config/cost_tier_test.go b/internal/config/cost_tier_test.go
+index 58604831..57fa0c8d 100644
+--- a/internal/config/cost_tier_test.go
++++ b/internal/config/cost_tier_test.go
+@@ -1,16 +1,17 @@
+ package config
+ 
+ import (
++	"os"
+ 	"testing"
+ )
+ 
+ func TestValidCostTiers(t *testing.T) {
+ 	t.Parallel()
+ 	tiers := ValidCostTiers()
+-	if len(tiers) != 3 {
+-		t.Fatalf("ValidCostTiers() returned %d tiers, want 3", len(tiers))
++	if len(tiers) != 5 {
++		t.Fatalf("ValidCostTiers() returned %d tiers, want 5", len(tiers))
+ 	}
+-	expected := map[string]bool{"standard": true, "economy": true, "budget": true}
++	expected := map[string]bool{"standard": true, "economy": true, "budget": true, "custom-groq-opus": true, "custom-groq-sonnet": true}
+ 	for _, tier := range tiers {
+ 		if !expected[tier] {
+ 			t.Errorf("unexpected tier %q", tier)
+@@ -27,6 +28,7 @@ func TestIsValidTier(t *testing.T) {
+ 		{"standard", true},
+ 		{"economy", true},
+ 		{"budget", true},
++		{"custom-groq-opus", true},
+ 		{"premium", false},
+ 		{"", false},
+ 		{"Standard", false}, // case-sensitive
+@@ -118,6 +120,29 @@ func TestCostTierRoleAgents(t *testing.T) {
+ 		}
+ 	})
+ 
++	t.Run("custom-groq-opus has correct assignments", func(t *testing.T) {
++		t.Parallel()
++		ra := CostTierRoleAgents(TierCustomGroqOpus)
++		if ra == nil {
++			t.Fatal("custom-groq-opus tier returned nil")
++		}
++		expected := map[string]string{
++			"mayor":    "",
++			"deacon":   "groq-compound",
++			"witness":  "groq-compound",
++			"refinery": "groq-compound",
++			"polecat":  "groq-compound",
++			"crew":     "",
++			"boot":     "groq-compound",
++			"dog":      "groq-compound",
++		}
++		for role, want := range expected {
++			if got := ra[role]; got != want {
++				t.Errorf("custom-groq-opus[%q] = %q, want %q", role, got, want)
++			}
++		}
++	})
++
+ 	t.Run("invalid tier returns nil", func(t *testing.T) {
+ 		t.Parallel()
+ 		ra := CostTierRoleAgents("invalid")
+@@ -206,6 +231,34 @@ func TestCostTierAgents(t *testing.T) {
+ 			t.Errorf("haiku Args %v missing --model haiku", haiku.Args)
+ 		}
+ 	})
++
++	t.Run("custom-groq-opus returns groq-compound preset", func(t *testing.T) {
++		t.Parallel()
++		agents := CostTierAgents(TierCustomGroqOpus)
++		if agents == nil {
++			t.Fatal("custom-groq-opus tier returned nil")
++		}
++		groq, ok := agents["groq-compound"]
++		if !ok {
++			t.Fatal("custom-groq-opus tier missing groq-compound agent")
++		}
++		if groq.Command != "claude" {
++			t.Errorf("groq-compound Command = %q, want %q", groq.Command, "claude")
++		}
++		if groq.Env == nil {
++			t.Fatal("groq-compound Env is nil, want Groq API env vars")
++		}
++		if groq.Env["ANTHROPIC_BASE_URL"] != "https://api.groq.com/openai/v1" {
++			t.Errorf("groq-compound ANTHROPIC_BASE_URL = %q, want Groq API URL", groq.Env["ANTHROPIC_BASE_URL"])
++		}
++		if groq.Env["ANTHROPIC_MODEL"] != "compound-beta" {
++			t.Errorf("groq-compound ANTHROPIC_MODEL = %q, want compound-beta", groq.Env["ANTHROPIC_MODEL"])
++		}
++		// Verify the preset reads GROQ_API_KEY from the environment (not a hardcoded value)
++		if groq.Env["ANTHROPIC_API_KEY"] != os.Getenv("GROQ_API_KEY") {
++			t.Errorf("groq-compound ANTHROPIC_API_KEY = %q, want value of GROQ_API_KEY env var", groq.Env["ANTHROPIC_API_KEY"])
++		}
++	})
+ }
+ 
+ func TestApplyCostTier(t *testing.T) {
+-- 
+2.43.0
+

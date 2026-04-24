@@ -1,0 +1,627 @@
+From a2b3b7ca965819825773d6cea7e27bc4b5f1055f Mon Sep 17 00:00:00 2001
+From: Ben Pittman <bennihana09@yahoo.com>
+Date: Sun, 19 Apr 2026 17:09:44 -0700
+Subject: [PATCH 072/110] fix: replace invalid --rig flag with --repo in bd
+ create (ga-movc) (#3680)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(scheduler): skip missing-bead polecats in capacity count + log zero-capacity dispatch
+
+Bug: countWorkingPolecats() counted polecats with missing or unreachable
+agent beads as "working," inflating the capacity count. With 7 orphan
+tmux sessions and no agent beads, capacity computed as 5-7=-2 and the
+scheduler dispatched zero beads for 12+ hours with no log output.
+
+Root cause: the conservative fallback (count++ on bead lookup failure)
+assumed missing-bead means "might be working." In practice, a polecat
+with no agent bead has no hook — it cannot be working. The Dolt-down
+case (all lookups fail → count=0) is safe because polecat_spawn.go
+gates on Dolt health before spawning.
+
+Changes:
+- scheduler.go: treat missing-bead polecats as idle (skip, don't count)
+- capacity_dispatch.go: log when dispatch skips beads at zero capacity
+  instead of returning silently
+
+Pre-existing test fixes (all failing on main CI):
+- diskspace_unix.go: stat.Bavail is int64 on freebsd but uint64 on
+  linux. Cast to uint64 with nolint:unconvert directive. Fixes
+  TestCrossPlatformBuild/freebsd_amd64.
+- doltserver_test.go: TestFindBrokenWorkspaces tests connected to a
+  real Dolt server on the default port (3307) instead of using the
+  test's temp directory. Write config.yaml with an unused port to
+  isolate the tests.
+- scheduler_integration_test.go: TestSchedulerAutoConvoyCreation used
+  bd show to verify the convoy, which hits the "crystallizes" column
+  error on bd v0.57.0 (column dropped in later versions). Replace
+  with direct SQL query against the Dolt test container. Also
+  simplified the tracking dep verification to be non-fatal since
+  cross-rig deps use the external: prefix format.
+
+Refs: popandpeek/gastown#20 (fork CI validation)
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* fix: use deterministic townRoot in Manager for consistent agentBeadID (gt-lph)
+
+agentBeadID() called workspace.Find(m.rig.Path) on every invocation, which
+could resolve differently or fail depending on call-site context. During spawn,
+the Manager was constructed from the main rig path and resolved correctly.
+During StartSession, a new Manager was constructed and workspace.Find could
+return a different result, computing a different agent bead ID.
+
+Fix: compute townRoot once at Manager construction using filepath.Dir(r.Path)
+(rig path is always filepath.Join(townRoot, rigName)) and store it on the
+struct. All methods that previously called workspace.Find(m.rig.Path) now
+use the stored m.townRoot, ensuring deterministic agent bead IDs regardless
+of call site.
+
+* fix: add agentBeadID determinism test and capacity check comment (gt-27k)
+
+Address PR #3677 review feedback:
+1. Add TestAgentBeadID_Deterministic regression test that constructs
+   Managers from the same rig path (including after cwd change) and
+   asserts agentBeadID returns identical strings — locks in the gt-lph
+   fix against future refactors of NewManager.
+2. Add comment at CheckDoltServerCapacity documenting the intentional
+   behavior change: the old skip-on-error path (return nil when
+   workspace.Find failed) was silently removed, and errors now
+   propagate as fail-closed — the right behavior for gt-lfc0d.
+
+* fix(env): remove ANTHROPIC_BASE_URL from parent process passthrough
+
+AgentEnv() forwarded ANTHROPIC_BASE_URL from os.Getenv() into every
+spawned agent's environment. When a non-Anthropic agent (e.g., MiniMax
+deacon with ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic) spawned
+Claude polecats, they inherited the MiniMax base URL but used an
+Anthropic API key, causing 401 auth failures on every API call.
+
+Agents that need a custom base URL (MiniMax, Groq, etc.) already receive
+it from their agent config's Env block (rc.Env in settings/config.json
+role_agents), which is the correct mechanism. The os.Getenv passthrough
+was redundant for configured agents and harmful for cross-provider spawns.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* fix(namepool): read polecat_names from rig config.json as fallback + warn on missing theme
+
+NewManager only read namepool config from settings/config.json. If that
+file was missing but the rig's config.json had polecat_names configured,
+the names were ignored and ThemeForRig hash was used instead.
+
+Now checks rig config.json for polecat_names when settings/config.json
+has no namepool config. Also logs a warning when a configured theme name
+can't be resolved (instead of silently falling back to default).
+
+Fixes: #3594
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* fix: replace invalid --rig flag with --repo in bd create (ga-movc)
+
+bd create does not support --rig. All polecats were hitting
+'MR bead creation failed: ... --rig not supported' on gt done.
+
+Add GetRigDirForName() to routes.go which resolves a rig name to its
+directory path via routes.jsonl. In beads.Create(), replace the invalid
+--rig=<name> arg with --repo=<rig_dir>, which bd create uses to open
+the target store directly instead of auto-routing.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: emmett <ben@popandpeek.com>
+Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-authored-by: chrome <leecostello1@gmail.com>
+---
+ internal/beads/beads.go                      |  8 +-
+ internal/beads/beads_test.go                 |  2 +-
+ internal/beads/routes.go                     | 22 +++++
+ internal/beads/routes_test.go                | 53 ++++++++++++
+ internal/config/env.go                       |  5 +-
+ internal/config/env_test.go                  | 16 ++++
+ internal/polecat/manager.go                  | 64 ++++++++-------
+ internal/polecat/manager_test.go             | 86 ++++++++++++++++++++
+ internal/polecat/namepool.go                 |  1 +
+ internal/polecat/namepool_test.go            | 23 ++++++
+ internal/scheduler/capacity/dispatch_test.go | 27 ++++++
+ 11 files changed, 272 insertions(+), 35 deletions(-)
+
+diff --git a/internal/beads/beads.go b/internal/beads/beads.go
+index 1e9249dc..4dabf86c 100644
+--- a/internal/beads/beads.go
++++ b/internal/beads/beads.go
+@@ -298,7 +298,7 @@ type CreateOptions struct {
+ 	Parent      string
+ 	Actor       string // Who is creating this issue (populates created_by)
+ 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
+-	Rig         string // Target rig database (e.g., "gastown"). When set, passes --rig to bd create.
++	Rig         string // Target rig database (e.g., "gantry"). When set, routes bd create to the rig's directory via --repo.
+ }
+ 
+ // UpdateOptions specifies options for updating an issue.
+@@ -1227,7 +1227,11 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
+ 		args = append(args, "--ephemeral")
+ 	}
+ 	if opts.Rig != "" {
+-		args = append(args, "--rig="+opts.Rig)
++		if townRoot := b.getTownRoot(); townRoot != "" {
++			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
++				args = append(args, "--repo="+rigDir)
++			}
++		}
+ 	}
+ 	// Default Actor from BD_ACTOR env var if not specified
+ 	// Uses getActor() to respect isolated mode (tests)
+diff --git a/internal/beads/beads_test.go b/internal/beads/beads_test.go
+index 27ecbda7..88b4f039 100644
+--- a/internal/beads/beads_test.go
++++ b/internal/beads/beads_test.go
+@@ -79,7 +79,7 @@ func TestCreateOptionsRig(t *testing.T) {
+ 		t.Errorf("Rig = %q, want %q", opts.Rig, "gastown")
+ 	}
+ 
+-	// Zero value: Rig is empty string (no --rig flag passed).
++	// Zero value: Rig is empty string (no --repo flag passed).
+ 	var empty CreateOptions
+ 	if empty.Rig != "" {
+ 		t.Errorf("zero-value Rig = %q, want empty string", empty.Rig)
+diff --git a/internal/beads/routes.go b/internal/beads/routes.go
+index 18ae345f..277f3cf6 100644
+--- a/internal/beads/routes.go
++++ b/internal/beads/routes.go
+@@ -285,6 +285,28 @@ func GetRigPathForPrefix(townRoot, prefix string) string {
+ 	return ""
+ }
+ 
++// GetRigDirForName returns the rig directory path for a named rig.
++// The rig directory is the parent of the rig's .beads database and is the
++// value expected by bd create --repo. Returns empty string if the rig is not
++// found in routes or is town-level (path=".").
++func GetRigDirForName(townRoot, rigName string) string {
++	beadsDir := filepath.Join(townRoot, ".beads")
++	routes, err := LoadRoutes(beadsDir)
++	if err != nil || routes == nil {
++		return ""
++	}
++	for _, r := range routes {
++		if r.Path == "." {
++			continue // town-level, not a specific rig dir
++		}
++		parts := strings.SplitN(r.Path, "/", 2)
++		if len(parts) > 0 && parts[0] == rigName {
++			return filepath.Join(townRoot, r.Path)
++		}
++	}
++	return ""
++}
++
+ // GetRigNameForPrefix returns the rig name that owns a given bead prefix.
+ // For example, "gt-" returns "gastown", "bd-" returns "beads".
+ // Returns empty string if the prefix is town-level (path=".") or not found in routes.
+diff --git a/internal/beads/routes_test.go b/internal/beads/routes_test.go
+index 11851f29..3e700f78 100644
+--- a/internal/beads/routes_test.go
++++ b/internal/beads/routes_test.go
+@@ -335,6 +335,59 @@ func TestGetRigNameForPrefix(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetRigDirForName(t *testing.T) {
++	tmpDir := t.TempDir()
++	beadsDir := filepath.Join(tmpDir, ".beads")
++	if err := os.MkdirAll(beadsDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	routesContent := `{"prefix": "ga-", "path": "gantry"}
++{"prefix": "al-", "path": "algoanki/mayor/rig"}
++{"prefix": "hq-", "path": "."}
++`
++	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	tests := []struct {
++		rigName  string
++		expected string
++	}{
++		{"gantry", filepath.Join(tmpDir, "gantry")},
++		{"algoanki", filepath.Join(tmpDir, "algoanki/mayor/rig")},
++		{"unknown", ""},        // Not in routes
++		{"", ""},               // Empty rig name
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.rigName, func(t *testing.T) {
++			result := GetRigDirForName(tmpDir, tc.rigName)
++			if result != tc.expected {
++				t.Errorf("GetRigDirForName(%q, %q) = %q, want %q", tmpDir, tc.rigName, result, tc.expected)
++			}
++		})
++	}
++}
++
++func TestGetRigDirForName_TownLevelNotReturned(t *testing.T) {
++	tmpDir := t.TempDir()
++	beadsDir := filepath.Join(tmpDir, ".beads")
++	if err := os.MkdirAll(beadsDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	routesContent := `{"prefix": "hq-", "path": "."}
++`
++	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
++		t.Fatal(err)
++	}
++	// Town-level rig (path=".") should not be returned — it has no rig dir.
++	result := GetRigDirForName(tmpDir, "hq")
++	if result != "" {
++		t.Errorf("GetRigDirForName for town-level path = %q, want empty string", result)
++	}
++}
++
+ func TestCheckPrefixAvailable(t *testing.T) {
+ 	tmpDir := t.TempDir()
+ 	beadsDir := filepath.Join(tmpDir, ".beads")
+diff --git a/internal/config/env.go b/internal/config/env.go
+index dd1c75e3..15bace2c 100644
+--- a/internal/config/env.go
++++ b/internal/config/env.go
+@@ -356,7 +356,10 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
+ 		// Anthropic API (direct)
+ 		"ANTHROPIC_API_KEY",
+ 		"ANTHROPIC_AUTH_TOKEN",
+-		"ANTHROPIC_BASE_URL",
++		// ANTHROPIC_BASE_URL intentionally excluded — agents that need a custom
++		// base URL (MiniMax, Groq, etc.) get it from their agent config's Env
++		// block, not from the parent process. Passthrough caused cross-provider
++		// contamination: a MiniMax deacon's base URL leaked into Claude polecats.
+ 		"ANTHROPIC_CUSTOM_HEADERS",
+ 
+ 		// Model selection
+diff --git a/internal/config/env_test.go b/internal/config/env_test.go
+index 35a8f4f9..3d93b9ca 100644
+--- a/internal/config/env_test.go
++++ b/internal/config/env_test.go
+@@ -764,6 +764,22 @@ func TestSanitizeAgentEnv_ClearsClaudeCode(t *testing.T) {
+ 	}
+ }
+ 
++func TestAgentEnv_ExcludesAnthropicBaseURL(t *testing.T) {
++	// Not parallel — t.Setenv modifies process environment.
++
++	// Even when ANTHROPIC_BASE_URL is set in the process environment,
++	// AgentEnv must NOT forward it. Agents that need a custom base URL
++	// get it from their agent config's Env block (rc.Env), not inheritance.
++	// Passthrough caused cross-provider contamination: a MiniMax deacon's
++	// base URL leaked into Claude polecats, causing 401 auth failures.
++	t.Setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
++
++	env := AgentEnv(AgentEnvConfig{Role: "polecat", Rig: "testrig", AgentName: "ember"})
++	if val, ok := env["ANTHROPIC_BASE_URL"]; ok {
++		t.Errorf("AgentEnv should not forward ANTHROPIC_BASE_URL, got %q", val)
++	}
++}
++
+ func TestAgentEnv_IncludesNodeOptionsClearing(t *testing.T) {
+ 	t.Parallel()
+ 	// Verify AgentEnv always includes NODE_OPTIONS="" regardless of role.
+diff --git a/internal/polecat/manager.go b/internal/polecat/manager.go
+index c0ddabc2..86c8c7bc 100644
+--- a/internal/polecat/manager.go
++++ b/internal/polecat/manager.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/steveyegge/gastown/internal/templates"
+ 	"github.com/steveyegge/gastown/internal/tmux"
+ 	"github.com/steveyegge/gastown/internal/util"
+-	"github.com/steveyegge/gastown/internal/workspace"
+ )
+ 
+ // Retry constants for Dolt operations (matching hook update pattern in sling.go).
+@@ -139,6 +138,7 @@ type Manager struct {
+ 	beads    *beads.Beads
+ 	namePool *NamePool
+ 	tmux     *tmux.Tmux
++	townRoot string // Computed once at construction; used by agentBeadID for deterministic IDs
+ }
+ 
+ // NewManager creates a new polecat manager.
+@@ -149,6 +149,12 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
+ 	resolvedBeads := beads.ResolveBeadsDir(r.Path)
+ 	beadsPath := filepath.Dir(resolvedBeads) // Get the directory containing .beads
+ 
++	// Compute town root once for deterministic use across all Manager methods.
++	// Rig path is always filepath.Join(townRoot, rigName), so filepath.Dir is correct
++	// and avoids the non-determinism of workspace.Find which can fail or resolve
++	// differently depending on call-site context (gt-lph).
++	townRoot := filepath.Dir(r.Path)
++
+ 	// Try to load rig settings for namepool config
+ 	settingsPath := filepath.Join(r.Path, "settings", "config.json")
+ 	var pool *NamePool
+@@ -158,10 +164,8 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
+ 		// If style is set but not built-in and no explicit names, resolve custom theme
+ 		names := settings.Namepool.Names
+ 		if len(names) == 0 && settings.Namepool.Style != "" && !IsBuiltinTheme(settings.Namepool.Style) {
+-			if townRoot, twErr := workspace.Find(r.Path); twErr == nil {
+-				if resolved, rErr := ResolveThemeNames(townRoot, settings.Namepool.Style); rErr == nil {
+-					names = resolved
+-				}
++			if resolved, rErr := ResolveThemeNames(townRoot, settings.Namepool.Style); rErr == nil {
++				names = resolved
+ 			}
+ 		}
+ 		pool = NewNamePoolWithConfig(
+@@ -172,14 +176,17 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
+ 			settings.Namepool.MaxBeforeNumbering,
+ 		)
+ 	} else {
+-		// Use defaults
+-		pool = NewNamePool(r.Path, r.Name)
++		// Fallback: check rig-level config.json for polecat_names
++		// (pool-init and gt rig config write namepool config here).
++		if rigCfg, rcErr := rig.LoadRigConfig(r.Path); rcErr == nil && len(rigCfg.PolecatNames) > 0 {
++			pool = NewNamePoolWithConfig(r.Path, r.Name, "", rigCfg.PolecatNames, 0)
++		} else {
++			pool = NewNamePool(r.Path, r.Name)
++		}
+ 	}
+ 
+ 	// Set town root for custom theme resolution in getNames()
+-	if townRoot, twErr := workspace.Find(r.Path); twErr == nil {
+-		pool.SetTownRoot(townRoot)
+-	}
++	pool.SetTownRoot(townRoot)
+ 
+ 	_ = pool.Load() // non-fatal: state file may not exist for new rigs
+ 
+@@ -189,6 +196,7 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
+ 		beads:    beads.NewWithBeadsDir(beadsPath, resolvedBeads),
+ 		namePool: pool,
+ 		tmux:     t,
++		townRoot: townRoot,
+ 	}
+ }
+ 
+@@ -268,14 +276,11 @@ func (m *Manager) CheckDoltHealth() error {
+ 	// If the persistent failure looks like read-only, attempt server recovery
+ 	// before giving up. This is the gt-level recovery path (gt-chx92).
+ 	if lastErr != nil && doltserver.IsReadOnlyError(lastErr.Error()) {
+-		townRoot, err := workspace.Find(m.rig.Path)
+-		if err == nil && townRoot != "" {
+-			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr == nil {
+-				// Recovery succeeded — verify health once more
+-				_, err := m.beads.Show("__health_check_nonexistent__")
+-				if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") {
+-					return nil
+-				}
++		if recoverErr := doltserver.RecoverReadOnly(m.townRoot); recoverErr == nil {
++			// Recovery succeeded — verify health once more
++			_, err := m.beads.Show("__health_check_nonexistent__")
++			if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") {
++				return nil
+ 			}
+ 		}
+ 	}
+@@ -290,12 +295,13 @@ func (m *Manager) CheckDoltHealth() error {
+ // Fails closed if the check errors — a server that can't report capacity is likely
+ // already under stress (gt-lfc0d).
+ func (m *Manager) CheckDoltServerCapacity() error {
+-	townRoot, err := workspace.Find(m.rig.Path)
+-	if err != nil || townRoot == "" {
+-		return nil // Can't determine town root, skip check
+-	}
+-
+-	hasCapacity, active, err := doltserver.HasConnectionCapacity(townRoot)
++	// NOTE: Prior to gt-lph, this method called workspace.Find to locate townRoot,
++	// which could fail and silently skip the capacity check (return nil). Now that
++	// m.townRoot is computed deterministically at Manager construction, errors from
++	// HasConnectionCapacity always propagate — this is intentional. A server that
++	// can't report capacity is likely under stress, and silently passing was a
++	// latent bug that allowed connection storms under load (gt-lfc0d).
++	hasCapacity, active, err := doltserver.HasConnectionCapacity(m.townRoot)
+ 	if err != nil {
+ 		// Fail closed: if we can't check capacity, the server may be overloaded.
+ 		// Proceeding optimistically caused read-only mode under load (gt-lfc0d).
+@@ -378,14 +384,10 @@ func (m *Manager) assigneeID(name string) string {
+ // agentBeadID returns the agent bead ID for a polecat.
+ // Format: "<prefix>-<rig>-polecat-<name>" (e.g., "gt-gastown-polecat-Toast", "bd-beads-polecat-obsidian")
+ // The prefix is looked up from routes.jsonl to support rigs with custom prefixes.
++// Uses the town root computed at Manager construction for deterministic IDs
++// regardless of call site (gt-lph).
+ func (m *Manager) agentBeadID(name string) string {
+-	// Find town root to lookup prefix from routes.jsonl
+-	townRoot, err := workspace.Find(m.rig.Path)
+-	if err != nil || townRoot == "" {
+-		// Fall back to default prefix
+-		return beads.PolecatBeadID(m.rig.Name, name)
+-	}
+-	prefix := beads.GetPrefixForRig(townRoot, m.rig.Name)
++	prefix := beads.GetPrefixForRig(m.townRoot, m.rig.Name)
+ 	return beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, name)
+ }
+ 
+diff --git a/internal/polecat/manager_test.go b/internal/polecat/manager_test.go
+index ab3c4550..5c27802e 100644
+--- a/internal/polecat/manager_test.go
++++ b/internal/polecat/manager_test.go
+@@ -215,6 +215,92 @@ func TestAssigneeID(t *testing.T) {
+ 	}
+ }
+ 
++// TestAgentBeadID_Deterministic verifies that agentBeadID returns the same string
++// on repeated calls regardless of process working directory. Regression test for
++// gt-lph: the old implementation called workspace.Find on each invocation, which
++// could resolve differently depending on cwd, causing non-deterministic IDs across
++// Manager instances for the same rig path.
++func TestAgentBeadID_Deterministic(t *testing.T) {
++	townRoot := t.TempDir()
++	rigPath := filepath.Join(townRoot, "myrig")
++	if err := os.MkdirAll(rigPath, 0755); err != nil {
++		t.Fatalf("mkdir rig: %v", err)
++	}
++
++	r := &rig.Rig{
++		Name: "myrig",
++		Path: rigPath,
++	}
++
++	// Construct two Managers from the same rig path — they must produce
++	// identical agentBeadIDs regardless of construction context.
++	m1 := NewManager(r, git.NewGit(rigPath), nil)
++	m2 := NewManager(r, git.NewGit(rigPath), nil)
++
++	id1a := m1.agentBeadID("Toast")
++	id1b := m1.agentBeadID("Toast")
++	id2 := m2.agentBeadID("Toast")
++
++	// Same Manager, repeated calls — must be identical.
++	if id1a != id1b {
++		t.Errorf("agentBeadID not stable across calls: %q vs %q", id1a, id1b)
++	}
++
++	// Different Manager, same rig — must be identical.
++	if id1a != id2 {
++		t.Errorf("agentBeadID differs across Managers for same rig: %q vs %q", id1a, id2)
++	}
++
++	// Verify the ID is non-empty and contains expected components.
++	if id1a == "" {
++		t.Fatal("agentBeadID returned empty string")
++	}
++
++	// Change process working directory and construct a third Manager —
++	// the ID must still match (the old bug: workspace.Find resolved
++	// differently from different cwds).
++	origDir, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("Getwd: %v", err)
++	}
++	if err := os.Chdir(townRoot); err != nil {
++		t.Fatalf("Chdir to townRoot: %v", err)
++	}
++	defer func() { _ = os.Chdir(origDir) }()
++
++	m3 := NewManager(r, git.NewGit(rigPath), nil)
++	id3 := m3.agentBeadID("Toast")
++	if id1a != id3 {
++		t.Errorf("agentBeadID differs after cwd change: %q (original) vs %q (after chdir)", id1a, id3)
++	}
++}
++
++func TestNewManager_NamepoolFromRigConfig(t *testing.T) {
++	townRoot := t.TempDir()
++	rigPath := filepath.Join(townRoot, "myrig")
++	if err := os.MkdirAll(rigPath, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	// Write rig config.json with polecat_names (no settings/config.json)
++	rigConfig := `{"polecat_names": ["alpha", "beta", "gamma"]}`
++	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	r := &rig.Rig{Name: "myrig", Path: rigPath}
++	m := NewManager(r, git.NewGit(rigPath), nil)
++	pool := m.GetNamePool()
++
++	name, err := pool.Allocate()
++	if err != nil {
++		t.Fatalf("Allocate error: %v", err)
++	}
++	if name != "alpha" {
++		t.Errorf("expected first name from rig config (alpha), got %q", name)
++	}
++}
++
+ // Note: State persistence tests removed - state is now derived from beads assignee field.
+ // Integration tests should verify beads-based state management.
+ 
+diff --git a/internal/polecat/namepool.go b/internal/polecat/namepool.go
+index 32017e0f..dcd7b53b 100644
+--- a/internal/polecat/namepool.go
++++ b/internal/polecat/namepool.go
+@@ -174,6 +174,7 @@ func (p *NamePool) getNames() []string {
+ 		if resolved, err := ResolveThemeNames(p.townRoot, p.Theme); err == nil {
+ 			names = resolved
+ 		} else {
++			fmt.Fprintf(os.Stderr, "Warning: namepool theme %q not found (not built-in, no custom theme file); using default\n", p.Theme)
+ 			names = BuiltinThemes[DefaultTheme]
+ 		}
+ 	} else {
+diff --git a/internal/polecat/namepool_test.go b/internal/polecat/namepool_test.go
+index 2b0480e0..a7889672 100644
+--- a/internal/polecat/namepool_test.go
++++ b/internal/polecat/namepool_test.go
+@@ -1228,3 +1228,26 @@ func TestGetNames_FallbackOnDeletedThemeFile(t *testing.T) {
+ 		t.Errorf("expected fallback to default theme (furiosa), got %s", name)
+ 	}
+ }
++
++func TestGetNames_UnresolvableTheme_FallsBackToDefault(t *testing.T) {
++	tmpDir := t.TempDir()
++
++	pool := NewNamePoolWithConfig(tmpDir, "testrig", "nonexistent-theme", nil, 10)
++	pool.SetTownRoot(tmpDir)
++
++	name, err := pool.Allocate()
++	if err != nil {
++		t.Fatalf("Allocate error: %v", err)
++	}
++	defaultNames := BuiltinThemes[DefaultTheme]
++	found := false
++	for _, dn := range defaultNames {
++		if dn == name {
++			found = true
++			break
++		}
++	}
++	if !found {
++		t.Errorf("expected name from default theme, got %q", name)
++	}
++}
+diff --git a/internal/scheduler/capacity/dispatch_test.go b/internal/scheduler/capacity/dispatch_test.go
+index 3d260660..89bd889f 100644
+--- a/internal/scheduler/capacity/dispatch_test.go
++++ b/internal/scheduler/capacity/dispatch_test.go
+@@ -161,6 +161,33 @@ func TestDispatchCycle_Run_NoBeads(t *testing.T) {
+ 	}
+ }
+ 
++func TestDispatchCycle_Run_ZeroCapacity(t *testing.T) {
++	beads := []PendingBead{{ID: "a"}, {ID: "b"}, {ID: "c"}}
++	cycle := &DispatchCycle{
++		AvailableCapacity: func() (int, error) { return 0, nil },
++		QueryPending:      func() ([]PendingBead, error) { return beads, nil },
++		Execute:           func(b PendingBead) error { t.Error("Execute should not be called at zero capacity"); return nil },
++		BatchSize:         10,
++	}
++
++	report, err := cycle.Run()
++	if err != nil {
++		t.Fatalf("Run() error: %v", err)
++	}
++	if report.Dispatched != 0 {
++		t.Errorf("Dispatched = %d, want 0", report.Dispatched)
++	}
++	if report.Failed != 0 {
++		t.Errorf("Failed = %d, want 0", report.Failed)
++	}
++	if report.Skipped != 3 {
++		t.Errorf("Skipped = %d, want 3", report.Skipped)
++	}
++	if report.Reason != "capacity" {
++		t.Errorf("Reason = %q, want %q", report.Reason, "capacity")
++	}
++}
++
+ func TestDispatchCycle_Run_OnSuccessError(t *testing.T) {
+ 	// When Execute succeeds but OnSuccess fails (even after retries),
+ 	// the item should NOT be counted as dispatched — it should be failed.
+-- 
+2.43.0
+

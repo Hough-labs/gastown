@@ -1,0 +1,54 @@
+From 3fcc0e124710956cc5a99752874791f37f44eb39 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 22 Apr 2026 22:16:06 -0400
+Subject: [PATCH 106/110] fix(config): match compound GT_ROLE when gating
+ exec_wrapper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0022 gated resolveExecWrapper on role but compared against
+the raw role name (constants.RolePolecat = "polecat"). GT_ROLE is
+written by AgentEnv in compound format — "devbox/polecats/obsidian"
+for polecats, "devbox/crew/mel" for crew, "devbox/witness" for
+witness — so nothing ever matched and the wrapper was dropped for
+every role, including polecats.
+
+Witness/refinery stayed unwrapped (correct outcome, wrong reason);
+polecats spawned on anvil metal instead of inside the sandbox pod.
+
+Match on the "/polecats/" and "/crew/" path segments, which are the
+only compound shapes that mean "this session lives in the sandbox."
+---
+ internal/config/loader.go | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/internal/config/loader.go b/internal/config/loader.go
+index 23199385..4c0c76df 100644
+--- a/internal/config/loader.go
++++ b/internal/config/loader.go
+@@ -2730,13 +2730,16 @@ func resolveExecWrapper(rigPath string) []string {
+ // belong inside a sandbox pod. Witness, refinery, mayor, and deacon run on
+ // metal (one per rig on the host) and must never be wrapped; only polecat and
+ // crew sessions are per-bead/per-session and live in the sandbox.
+-func resolveExecWrapperForRole(rigPath, role string) []string {
+-	switch role {
+-	case constants.RolePolecat, constants.RoleCrew:
++//
++// compoundRole is the GT_ROLE env value, which AgentEnv writes in compound
++// form (e.g. "devbox/polecats/obsidian", "devbox/crew/mel", "devbox/witness").
++// We match on the "/polecats/" and "/crew/" segments rather than the raw role
++// name because that's the format that actually reaches this call site.
++func resolveExecWrapperForRole(rigPath, compoundRole string) []string {
++	if strings.Contains(compoundRole, "/polecats/") || strings.Contains(compoundRole, "/crew/") {
+ 		return resolveExecWrapper(rigPath)
+-	default:
+-		return nil
+ 	}
++	return nil
+ }
+ 
+ // ResolveExecWrapper is the exported form of resolveExecWrapper, for callers
+-- 
+2.43.0
+

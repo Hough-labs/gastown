@@ -1,0 +1,315 @@
+From 242bb1153d9754697bfb7bdbe061a0d91bdd5f1a Mon Sep 17 00:00:00 2001
+From: Mike Akers <mike.akers@onepeloton.com>
+Date: Tue, 14 Apr 2026 01:26:20 -0400
+Subject: [PATCH 068/110] fix(ci): resolve pre-existing lint + several CI test
+ failures (#3628)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Clears the lint job and several Test/Integration failures that had been
+accumulating on main:
+
+- internal/cmd/sling_formula.go: fix 'ect' → 'etc' misspelling (misspell)
+- internal/git/git.go: silence unparam on runWithTimeout (string kept
+  for consistency with Run())
+- internal/beads/beads_rig.go: call EnsureCustomTypes() before bd create
+  --type=rig, matching CreateAgentBead (fixes TestIsRigParked_WhenOnlyBeadLabelPresent)
+- internal/beads/beads_agent_test.go: drop stale bd slot assertion
+  (slot removed in bd v0.62; hook_bead authority is now work-bead
+  status=hooked + assignee)
+- internal/util/diskspace.go: split into unix/windows variants with
+  build constraints (fixes Windows Smoke Test)
+- internal/web/fetcher.go: strip "[1m]" context-window suffix from
+  model display labels
+
+Remaining integration failures (4 scheduler tests) are tracked
+separately — they fail at sling-context creation, a different root
+cause than the rig-type validation this PR addresses.
+
+Co-authored-by: Mike Akers <mikeakers@users.noreply.github.com>
+---
+ internal/beads/beads_agent_test.go |  5 ++--
+ internal/beads/beads_rig.go        |  5 ++++
+ internal/cmd/sling_formula.go      |  2 +-
+ internal/git/git.go                | 20 +++++++-------
+ internal/util/diskspace.go         | 25 -----------------
+ internal/util/diskspace_unix.go    | 32 ++++++++++++++++++++++
+ internal/util/diskspace_windows.go | 44 ++++++++++++++++++++++++++++++
+ internal/web/fetcher.go            | 16 +++++++++--
+ 8 files changed, 107 insertions(+), 42 deletions(-)
+ create mode 100644 internal/util/diskspace_unix.go
+ create mode 100644 internal/util/diskspace_windows.go
+
+diff --git a/internal/beads/beads_agent_test.go b/internal/beads/beads_agent_test.go
+index 54edc4be..13fa9f2e 100644
+--- a/internal/beads/beads_agent_test.go
++++ b/internal/beads/beads_agent_test.go
+@@ -448,9 +448,8 @@ func TestCreateAgentBead_UsesTownRootForCrossRigRoutes(t *testing.T) {
+ 	if !strings.Contains(logOutput, "create --json --id=pt-imported-polecat-shiny") {
+ 		t.Fatalf("mock bd log missing create call:\n%s", logOutput)
+ 	}
+-	if !strings.Contains(logOutput, "slot set pt-imported-polecat-shiny hook pt-task-1") {
+-		t.Fatalf("mock bd log missing slot set call:\n%s", logOutput)
+-	}
++	// Note: hook_bead slot is no longer set — bd slot removed in v0.62 (hq-l6mm5).
++	// Work bead status=hooked and assignee=<agent> is now the authoritative source.
+ }
+ 
+ func TestCreateAgentBead_ParsesMockCreateOutput(t *testing.T) {
+diff --git a/internal/beads/beads_rig.go b/internal/beads/beads_rig.go
+index 296ca4f3..3ead42ae 100644
+--- a/internal/beads/beads_rig.go
++++ b/internal/beads/beads_rig.go
+@@ -144,6 +144,11 @@ func (b *Beads) CreateRigBead(name string, fields *RigFields) (*Issue, error) {
+ 	id := RigBeadIDWithPrefix(prefix, name)
+ 	description := FormatRigDescription(name, fields)
+ 
++	// Ensure target database has custom types configured (including "rig").
++	// This matches what CreateAgentBead does — without it, bd rejects
++	// --type=rig on databases that haven't registered custom types yet.
++	_ = EnsureCustomTypes(b.getResolvedBeadsDir())
++
+ 	args := []string{"create", "--json",
+ 		"--id=" + id,
+ 		"--title=" + name,
+diff --git a/internal/cmd/sling_formula.go b/internal/cmd/sling_formula.go
+index 3f73cdfa..60cf25c1 100644
+--- a/internal/cmd/sling_formula.go
++++ b/internal/cmd/sling_formula.go
+@@ -268,7 +268,7 @@ func runSlingFormula(ctx context.Context, args []string) error {
+ 	// Dog sessions need a nudge sent to their session (not to the bare pane ID
+ 	// from StartDelayedSession, which is ambiguous on platforms where tmux pane
+ 	// IDs are not globally unique). Use NudgeSession which qualifies the target
+-	// with the session name. (gt-ect)
++	// with the session name. (gt-etc)
+ 	if delayedDogInfo != nil {
+ 		dogSession := fmt.Sprintf("hq-dog-%s", delayedDogInfo.DogName)
+ 		if err := t.NudgeSession(dogSession, prompt); err != nil {
+diff --git a/internal/git/git.go b/internal/git/git.go
+index c6f06d45..f9beb4e5 100644
+--- a/internal/git/git.go
++++ b/internal/git/git.go
+@@ -120,7 +120,7 @@ const pushTimeout = 60 * time.Second
+ 
+ // runWithTimeout executes a git command with a deadline. If the command does
+ // not finish within the timeout, the process is killed and an error is returned.
+-func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (string, error) {
++func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
+ 	if g.gitDir != "" {
+ 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
+ 	}
+@@ -449,9 +449,9 @@ func configureRefspec(repoPath string, singleBranch bool) error {
+ 			}
+ 			return nil
+ 		}
+-		headRef := strings.TrimSpace(headOut.String())        // e.g. "refs/heads/main"
+-		branch := strings.TrimPrefix(headRef, "refs/heads/")  // e.g. "main"
+-		refspec := branch + ":refs/remotes/origin/" + branch   // e.g. "main:refs/remotes/origin/main"
++		headRef := strings.TrimSpace(headOut.String())       // e.g. "refs/heads/main"
++		branch := strings.TrimPrefix(headRef, "refs/heads/") // e.g. "main"
++		refspec := branch + ":refs/remotes/origin/" + branch // e.g. "main:refs/remotes/origin/main"
+ 
+ 		fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin", refspec)
+ 		util.SetDetachedProcessGroup(fetchCmd)
+@@ -661,10 +661,10 @@ func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
+ 
+ // GitStatus represents the status of the working directory.
+ type GitStatus struct {
+-	Clean    bool
+-	Modified []string
+-	Added    []string
+-	Deleted  []string
++	Clean     bool
++	Modified  []string
++	Added     []string
++	Deleted   []string
+ 	Untracked []string
+ }
+ 
+@@ -1853,8 +1853,8 @@ type UncommittedWorkStatus struct {
+ 	StashCount            int
+ 	UnpushedCommits       int
+ 	// Details for error messages
+-	ModifiedFiles   []string
+-	UntrackedFiles  []string
++	ModifiedFiles  []string
++	UntrackedFiles []string
+ }
+ 
+ // Clean returns true if there is no uncommitted work.
+diff --git a/internal/util/diskspace.go b/internal/util/diskspace.go
+index c055a07d..5648e888 100644
+--- a/internal/util/diskspace.go
++++ b/internal/util/diskspace.go
+@@ -2,7 +2,6 @@ package util
+ 
+ import (
+ 	"fmt"
+-	"syscall"
+ )
+ 
+ // DiskSpaceInfo contains filesystem space information.
+@@ -57,30 +56,6 @@ func FormatBytesHuman(bytes uint64) string {
+ 	}
+ }
+ 
+-// GetDiskSpace returns filesystem space information for the given path.
+-func GetDiskSpace(path string) (*DiskSpaceInfo, error) {
+-	var stat syscall.Statfs_t
+-	if err := syscall.Statfs(path, &stat); err != nil {
+-		return nil, fmt.Errorf("statfs %s: %w", path, err)
+-	}
+-
+-	total := stat.Blocks * uint64(stat.Bsize)
+-	free := stat.Bavail * uint64(stat.Bsize) // Bavail = available to non-root
+-	used := total - (stat.Bfree * uint64(stat.Bsize))
+-
+-	var usedPct float64
+-	if total > 0 {
+-		usedPct = float64(used) / float64(total) * 100
+-	}
+-
+-	return &DiskSpaceInfo{
+-		AvailableBytes: free,
+-		TotalBytes:     total,
+-		UsedBytes:      used,
+-		UsedPercent:    usedPct,
+-	}, nil
+-}
+-
+ // Default thresholds for disk space checks.
+ const (
+ 	// DiskSpaceMinimumMB is the absolute minimum free space (in MB) below which
+diff --git a/internal/util/diskspace_unix.go b/internal/util/diskspace_unix.go
+new file mode 100644
+index 00000000..4a982e1a
+--- /dev/null
++++ b/internal/util/diskspace_unix.go
+@@ -0,0 +1,32 @@
++//go:build !windows
++
++package util
++
++import (
++	"fmt"
++	"syscall"
++)
++
++// GetDiskSpace returns filesystem space information for the given path.
++func GetDiskSpace(path string) (*DiskSpaceInfo, error) {
++	var stat syscall.Statfs_t
++	if err := syscall.Statfs(path, &stat); err != nil {
++		return nil, fmt.Errorf("statfs %s: %w", path, err)
++	}
++
++	total := stat.Blocks * uint64(stat.Bsize)
++	free := stat.Bavail * uint64(stat.Bsize) // Bavail = available to non-root
++	used := total - (stat.Bfree * uint64(stat.Bsize))
++
++	var usedPct float64
++	if total > 0 {
++		usedPct = float64(used) / float64(total) * 100
++	}
++
++	return &DiskSpaceInfo{
++		AvailableBytes: free,
++		TotalBytes:     total,
++		UsedBytes:      used,
++		UsedPercent:    usedPct,
++	}, nil
++}
+diff --git a/internal/util/diskspace_windows.go b/internal/util/diskspace_windows.go
+new file mode 100644
+index 00000000..e2288350
+--- /dev/null
++++ b/internal/util/diskspace_windows.go
+@@ -0,0 +1,44 @@
++//go:build windows
++
++package util
++
++import (
++	"fmt"
++	"syscall"
++	"unsafe"
++)
++
++// GetDiskSpace returns filesystem space information for the given path.
++func GetDiskSpace(path string) (*DiskSpaceInfo, error) {
++	kernel32 := syscall.NewLazyDLL("kernel32.dll")
++	getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
++
++	pathPtr, err := syscall.UTF16PtrFromString(path)
++	if err != nil {
++		return nil, fmt.Errorf("invalid path %s: %w", path, err)
++	}
++
++	var freeBytesAvailable, totalBytes, totalFreeBytes uint64
++	ret, _, callErr := getDiskFreeSpaceEx.Call(
++		uintptr(unsafe.Pointer(pathPtr)),
++		uintptr(unsafe.Pointer(&freeBytesAvailable)),
++		uintptr(unsafe.Pointer(&totalBytes)),
++		uintptr(unsafe.Pointer(&totalFreeBytes)),
++	)
++	if ret == 0 {
++		return nil, fmt.Errorf("GetDiskFreeSpaceExW %s: %w", path, callErr)
++	}
++
++	used := totalBytes - totalFreeBytes
++	var usedPct float64
++	if totalBytes > 0 {
++		usedPct = float64(used) / float64(totalBytes) * 100
++	}
++
++	return &DiskSpaceInfo{
++		AvailableBytes: freeBytesAvailable,
++		TotalBytes:     totalBytes,
++		UsedBytes:      used,
++		UsedPercent:    usedPct,
++	}, nil
++}
+diff --git a/internal/web/fetcher.go b/internal/web/fetcher.go
+index fd9447e4..4b856ec7 100644
+--- a/internal/web/fetcher.go
++++ b/internal/web/fetcher.go
+@@ -1622,16 +1622,16 @@ func runtimeLabelFromConfig(command string, args []string, fallback string) stri
+ 	for i := 0; i < len(args); i++ {
+ 		arg := args[i]
+ 		if (arg == "--model" || arg == "-m") && i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
+-			return cmd + "/" + strings.TrimSpace(args[i+1])
++			return cmd + "/" + stripModelSuffix(strings.TrimSpace(args[i+1]))
+ 		}
+ 		if strings.HasPrefix(arg, "--model=") {
+ 			if v := strings.TrimSpace(strings.TrimPrefix(arg, "--model=")); v != "" {
+-				return cmd + "/" + v
++				return cmd + "/" + stripModelSuffix(v)
+ 			}
+ 		}
+ 		if strings.HasPrefix(arg, "-m=") {
+ 			if v := strings.TrimSpace(strings.TrimPrefix(arg, "-m=")); v != "" {
+-				return cmd + "/" + v
++				return cmd + "/" + stripModelSuffix(v)
+ 			}
+ 		}
+ 	}
+@@ -1639,6 +1639,16 @@ func runtimeLabelFromConfig(command string, args []string, fallback string) stri
+ 	return cmd
+ }
+ 
++// stripModelSuffix removes bracketed context-window hints (e.g. "[1m]")
++// from model names so the dashboard label stays human-readable.
++// "sonnet[1m]" → "sonnet", "opus" → "opus".
++func stripModelSuffix(model string) string {
++	if idx := strings.Index(model, "["); idx > 0 {
++		return model[:idx]
++	}
++	return model
++}
++
+ // FetchIssues returns open issues (the backlog).
+ func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
+ 	// Query both open AND hooked issues for the Work panel
+-- 
+2.43.0
+

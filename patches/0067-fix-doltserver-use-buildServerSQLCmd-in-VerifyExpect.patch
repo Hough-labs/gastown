@@ -1,0 +1,48 @@
+From 9490fb165836618d3078218fae09ccd751b3adaa Mon Sep 17 00:00:00 2001
+From: Steve Ash <stevemash@gmail.com>
+Date: Mon, 13 Apr 2026 22:25:52 -0700
+Subject: [PATCH 067/110] fix(doltserver): use buildServerSQLCmd in
+ VerifyExpectedDatabasesAtConfig (#3616)
+
+Replace inline dolt sql command construction with the existing
+buildServerSQLCmd() helper to match the pattern used by other internal
+callers. The helper ensures --password is always passed, preventing
+credential inheritance from env in non-TTY environments.
+
+Fixes TestBuildDoltSQLCmd_LocalIgnoresInheritedCredentials on main.
+
+Co-authored-by: Steve Ash <steveash@users.noreply.github.com>
+---
+ internal/doltserver/doltserver.go | 16 +---------------
+ 1 file changed, 1 insertion(+), 15 deletions(-)
+
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index da55a9a1..10b8d3f1 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -2012,21 +2012,7 @@ func VerifyExpectedDatabasesAtConfig(config *Config, expected []string) (served,
+ 	var lastErr error
+ 	for attempt := 1; attempt <= 3; attempt++ {
+ 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+-		args := []string{
+-			"sql",
+-			"--host", config.EffectiveHost(),
+-			"--port", strconv.Itoa(config.Port),
+-			"--user", config.User,
+-			"--no-tls",
+-			"-r", "json",
+-			"-q", "SHOW DATABASES",
+-		}
+-		cmd := exec.CommandContext(ctx, "dolt", args...)
+-		cmd.Dir = config.DataDir
+-		if config.Password != "" {
+-			cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)
+-		}
+-
++		cmd := buildServerSQLCmd(ctx, config, "-r", "json", "-q", "SHOW DATABASES")
+ 		var stderrBuf bytes.Buffer
+ 		cmd.Stderr = &stderrBuf
+ 		output, queryErr := cmd.Output()
+-- 
+2.43.0
+

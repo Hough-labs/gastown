@@ -1,0 +1,110 @@
+From e8b73e22adb30638ed816758965502cd5bee0a6c Mon Sep 17 00:00:00 2001
+From: Mike Akers <mike.akers@onepeloton.com>
+Date: Sun, 19 Apr 2026 20:42:57 -0400
+Subject: [PATCH 079/110] fix: clarify --max-concurrent flag as spawn-rate
+ throttle, not concurrency limit (gt-dop) (#3659)
+
+The flag description said "Limit concurrent polecat spawns" which implies
+it caps simultaneously running polecats. In reality it's a spawn-rate
+throttle: spawns N, pauses ~6s, resets counter, spawns N more. All
+polecats remain running concurrently.
+
+Updated flag description, help text, code comments, and runtime messages
+across sling.go, sling_batch.go, scheduler_convoy.go, and
+scheduler_epic.go to accurately describe the batch-throttle behavior.
+
+Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ internal/cmd/scheduler_convoy.go | 2 +-
+ internal/cmd/scheduler_epic.go   | 2 +-
+ internal/cmd/sling.go            | 6 +++---
+ internal/cmd/sling_batch.go      | 8 +++++---
+ 4 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/internal/cmd/scheduler_convoy.go b/internal/cmd/scheduler_convoy.go
+index 98ba658c..42ed5b4f 100644
+--- a/internal/cmd/scheduler_convoy.go
++++ b/internal/cmd/scheduler_convoy.go
+@@ -234,7 +234,7 @@ func runConvoySlingByID(convoyID string, opts convoyScheduleOpts) error {
+ 	successfulRigs := make(map[string]bool)
+ 	for i, c := range candidates {
+ 		if slingMaxConcurrent > 0 && i >= slingMaxConcurrent {
+-			fmt.Printf("  %s Reached --max-concurrent limit (%d)\n", style.Dim.Render("○"), slingMaxConcurrent)
++			fmt.Printf("  %s Reached --max-concurrent spawn batch size (%d), remaining will be scheduled next cycle\n", style.Dim.Render("○"), slingMaxConcurrent)
+ 			break
+ 		}
+ 
+diff --git a/internal/cmd/scheduler_epic.go b/internal/cmd/scheduler_epic.go
+index 2ce62429..da6690f4 100644
+--- a/internal/cmd/scheduler_epic.go
++++ b/internal/cmd/scheduler_epic.go
+@@ -236,7 +236,7 @@ func runEpicSlingByID(epicID string, opts epicScheduleOpts) error {
+ 	successfulRigs := make(map[string]bool)
+ 	for i, c := range candidates {
+ 		if slingMaxConcurrent > 0 && i >= slingMaxConcurrent {
+-			fmt.Printf("  %s Reached --max-concurrent limit (%d)\n", style.Dim.Render("○"), slingMaxConcurrent)
++			fmt.Printf("  %s Reached --max-concurrent spawn batch size (%d), remaining will be scheduled next cycle\n", style.Dim.Render("○"), slingMaxConcurrent)
+ 			break
+ 		}
+ 
+diff --git a/internal/cmd/sling.go b/internal/cmd/sling.go
+index 3d9f93a7..4e15908e 100644
+--- a/internal/cmd/sling.go
++++ b/internal/cmd/sling.go
+@@ -100,7 +100,7 @@ The propulsion principle: if it's on your hook, YOU RUN IT.
+ 
+ Batch Slinging:
+   gt sling gt-abc gt-def gt-ghi gastown   # Sling multiple beads to a rig
+-  gt sling gt-abc gt-def gastown --max-concurrent 3  # Limit concurrent spawns
++  gt sling gt-abc gt-def gastown --max-concurrent 3  # Spawn 3 at a time
+ 
+   When multiple beads are provided with a rig target, each bead gets its own
+   polecat. This parallelizes work dispatch without running gt sling N times.
+@@ -129,7 +129,7 @@ var (
+ 	slingNoMerge       bool   // --no-merge: skip merge queue on completion (for upstream PRs/human review)
+ 	slingMerge         string // --merge: merge strategy for convoy (direct/mr/local)
+ 	slingNoBoot        bool   // --no-boot: skip wakeRigAgents (avoid witness/refinery boot and lock contention)
+-	slingMaxConcurrent int    // --max-concurrent: limit concurrent spawns in batch mode
++	slingMaxConcurrent int    // --max-concurrent: throttle spawn rate in batch mode (spawns N, pauses, spawns N more)
+ 	slingBaseBranch    string // --base-branch: override base branch for polecat worktree
+ 	slingRalph         bool   // --ralph: enable Ralph Wiggum loop mode for multi-step workflows
+ 	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
+@@ -157,7 +157,7 @@ func init() {
+ 	slingCmd.Flags().BoolVar(&slingNoMerge, "no-merge", false, "Skip merge queue on completion (keep work on feature branch for review)")
+ 	slingCmd.Flags().StringVar(&slingMerge, "merge", "", "Merge strategy: direct (push to main), mr (merge queue, default), local (keep on branch)")
+ 	slingCmd.Flags().BoolVar(&slingNoBoot, "no-boot", false, "Skip rig boot after polecat spawn (avoids witness/refinery lock contention)")
+-	slingCmd.Flags().IntVar(&slingMaxConcurrent, "max-concurrent", 0, "Limit concurrent polecat spawns in batch mode (0 = no limit)")
++	slingCmd.Flags().IntVar(&slingMaxConcurrent, "max-concurrent", 0, "Throttle spawn rate: spawn N polecats, pause, then spawn N more (0 = no throttle). Does not limit total concurrent polecats")
+ 	slingCmd.Flags().StringVar(&slingBaseBranch, "base-branch", "", "Override base branch for polecat worktree (e.g., 'develop', 'release/v2')")
+ 	slingCmd.Flags().BoolVar(&slingRalph, "ralph", false, "Enable Ralph Wiggum loop mode (fresh context per step, for multi-step workflows)")
+ 	slingCmd.Flags().StringVar(&slingFormula, "formula", "", "Formula to apply (default: mol-polecat-work for polecat targets)")
+diff --git a/internal/cmd/sling_batch.go b/internal/cmd/sling_batch.go
+index f2e55ce4..7f609efa 100644
+--- a/internal/cmd/sling_batch.go
++++ b/internal/cmd/sling_batch.go
+@@ -88,7 +88,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error
+ 	fmt.Printf("%s Batch slinging %d beads to rig '%s'...\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
+ 
+ 	if slingMaxConcurrent > 0 {
+-		fmt.Printf("  Max concurrent spawns: %d\n", slingMaxConcurrent)
++		fmt.Printf("  Spawn batch size: %d (spawns N, pauses, spawns N more)\n", slingMaxConcurrent)
+ 	}
+ 
+ 	// Cook formula once before the loop for efficiency
+@@ -123,9 +123,11 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error
+ 
+ 	// Dispatch each bead via executeSling
+ 	for i, beadID := range beadIDs {
+-		// Admission control: throttle spawns when --max-concurrent is set
++		// Spawn-rate throttle: when --max-concurrent is set, pause between batches
++		// of N spawns. This does NOT limit total concurrent polecats — all spawned
++		// polecats remain running. It only slows down how fast they are created.
+ 		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
+-			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
++			fmt.Printf("\n%s Spawn batch of %d complete, pausing before next batch...\n",
+ 				style.Warning.Render("⏳"), slingMaxConcurrent)
+ 			// Wait for sessions to settle before spawning more
+ 			for wait := 0; wait < 30; wait++ {
+-- 
+2.43.0
+

@@ -1,0 +1,1273 @@
+From e0cbd517dc95707e4ab5444d99759696e0b78950 Mon Sep 17 00:00:00 2001
+From: Alexandre FILLATRE <alexandre.fillatre@gmail.com>
+Date: Sun, 12 Apr 2026 23:28:12 +0200
+Subject: [PATCH 061/110] feat(bitbucket): add Bitbucket Cloud integration for
+ merge queue (#3600)
+
+* feat(bitbucket): add Bitbucket Cloud integration for merge queue
+
+Add support for merge_strategy=bitbucket in the refinery, enabling
+PR-based merging via Bitbucket Cloud REST API 2.0. This brings parity
+with the existing GitHub merge_strategy=pr path.
+
+Closes #3599
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+* refactor(refinery): introduce PRProvider interface for VCS-agnostic PR merging
+
+Replace hardcoded GitHub calls in doMergePR with a PRProvider strategy
+interface. Add vcs_provider config field ("github" default, "bitbucket")
+so merge_strategy=pr remains the strategy while the provider selects
+the platform implementation.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Alexandre Fillatre <alexandre@geev.com>
+Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ internal/bitbucket/client.go               | 125 ++++++++++
+ internal/bitbucket/pr.go                   | 206 ++++++++++++++++
+ internal/bitbucket/pr_test.go              | 272 +++++++++++++++++++++
+ internal/bitbucket/remote.go               |  30 +++
+ internal/bitbucket/remote_test.go          |  79 ++++++
+ internal/config/types.go                   |   9 +-
+ internal/git/git.go                        | 109 +++++++++
+ internal/refinery/engineer.go              |  86 +++++--
+ internal/refinery/pr_provider.go           |  15 ++
+ internal/refinery/pr_provider_bitbucket.go |  53 ++++
+ internal/refinery/pr_provider_github.go    |  24 ++
+ internal/rig/manager.go                    |   9 +
+ internal/rig/manager_test.go               |  12 +-
+ 13 files changed, 1005 insertions(+), 24 deletions(-)
+ create mode 100644 internal/bitbucket/client.go
+ create mode 100644 internal/bitbucket/pr.go
+ create mode 100644 internal/bitbucket/pr_test.go
+ create mode 100644 internal/bitbucket/remote.go
+ create mode 100644 internal/bitbucket/remote_test.go
+ create mode 100644 internal/refinery/pr_provider.go
+ create mode 100644 internal/refinery/pr_provider_bitbucket.go
+ create mode 100644 internal/refinery/pr_provider_github.go
+
+diff --git a/internal/bitbucket/client.go b/internal/bitbucket/client.go
+new file mode 100644
+index 00000000..cab6c292
+--- /dev/null
++++ b/internal/bitbucket/client.go
+@@ -0,0 +1,125 @@
++// Package bitbucket provides a Bitbucket Cloud API client for PR lifecycle management.
++//
++// It wraps the Bitbucket Cloud REST API 2.0 for operations needed
++// by the Gas Town merge queue: creating draft PRs, managing approvals,
++// and merging.
++//
++// Authentication uses a BITBUCKET_TOKEN environment variable
++// (API token or Repository Access Token with Bearer auth).
++package bitbucket
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++)
++
++const defaultRESTBase = "https://api.bitbucket.org/2.0"
++
++// Client wraps HTTP interactions with Bitbucket Cloud's REST API 2.0.
++type Client struct {
++	httpClient *http.Client
++	token      string
++	restBase   string
++}
++
++// Option configures a Client.
++type Option func(*Client)
++
++// WithHTTPClient sets the underlying HTTP client (useful for testing).
++func WithHTTPClient(c *http.Client) Option {
++	return func(cl *Client) { cl.httpClient = c }
++}
++
++// WithToken overrides the token (default: BITBUCKET_TOKEN env var).
++func WithToken(t string) Option {
++	return func(cl *Client) { cl.token = t }
++}
++
++// WithRESTBase overrides the REST API base URL (for testing).
++func WithRESTBase(url string) Option {
++	return func(cl *Client) { cl.restBase = url }
++}
++
++// NewClient creates a Bitbucket Cloud API client.
++// By default it reads BITBUCKET_TOKEN from the environment.
++func NewClient(opts ...Option) (*Client, error) {
++	c := &Client{
++		httpClient: http.DefaultClient,
++		token:      os.Getenv("BITBUCKET_TOKEN"),
++		restBase:   defaultRESTBase,
++	}
++	for _, o := range opts {
++		o(c)
++	}
++	if c.token == "" {
++		return nil, fmt.Errorf("bitbucket: BITBUCKET_TOKEN is required (set env var or use WithToken)")
++	}
++	return c, nil
++}
++
++// restRequest makes an authenticated REST API request and decodes the JSON response.
++func (c *Client) restRequest(ctx context.Context, method, path string, body any, result any) error {
++	var reqBody io.Reader
++	if body != nil {
++		b, err := json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("bitbucket: marshal request: %w", err)
++		}
++		reqBody = bytes.NewReader(b)
++	}
++
++	url := c.restBase + path
++	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
++	if err != nil {
++		return fmt.Errorf("bitbucket: create request: %w", err)
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return fmt.Errorf("bitbucket: %s %s: %w", method, path, err)
++	}
++	defer func() { _ = resp.Body.Close() }()
++
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("bitbucket: read response: %w", err)
++	}
++
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return &APIError{
++			Method:     method,
++			Path:       path,
++			StatusCode: resp.StatusCode,
++			Body:       string(respBody),
++		}
++	}
++
++	if result != nil && len(respBody) > 0 {
++		if err := json.Unmarshal(respBody, result); err != nil {
++			return fmt.Errorf("bitbucket: decode response: %w", err)
++		}
++	}
++	return nil
++}
++
++// APIError represents a non-2xx response from the Bitbucket API.
++type APIError struct {
++	Method     string
++	Path       string
++	StatusCode int
++	Body       string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("bitbucket: %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
++}
+diff --git a/internal/bitbucket/pr.go b/internal/bitbucket/pr.go
+new file mode 100644
+index 00000000..10ae0901
+--- /dev/null
++++ b/internal/bitbucket/pr.go
+@@ -0,0 +1,206 @@
++package bitbucket
++
++import (
++	"context"
++	"fmt"
++)
++
++// ReviewState represents the overall review status of a PR.
++type ReviewState string
++
++const (
++	ReviewPending         ReviewState = "PENDING"
++	ReviewApproved        ReviewState = "APPROVED"
++	ReviewChangesRequired ReviewState = "CHANGES_REQUESTED"
++)
++
++// PRComment represents a single comment on a PR.
++type PRComment struct {
++	ID        int64  `json:"id"`
++	Body      string `json:"body"`
++	Path      string `json:"path"`
++	Line      int    `json:"line"`
++	User      string `json:"user"`
++	CreatedOn string `json:"created_on"`
++	HTMLURL   string `json:"html_url"`
++}
++
++// PRResult holds the result of creating a PR.
++type PRResult struct {
++	ID  int    `json:"id"`
++	URL string `json:"url"`
++}
++
++// CreateDraftPR creates a draft pull request on Bitbucket Cloud.
++func (c *Client) CreateDraftPR(ctx context.Context, workspace, repoSlug, source, destination, title, description string) (PRResult, error) {
++	reqBody := map[string]any{
++		"title":       title,
++		"description": description,
++		"source": map[string]any{
++			"branch": map[string]any{"name": source},
++		},
++		"destination": map[string]any{
++			"branch": map[string]any{"name": destination},
++		},
++		"draft": true,
++	}
++	var resp struct {
++		ID    int `json:"id"`
++		Links struct {
++			HTML struct {
++				Href string `json:"href"`
++			} `json:"html"`
++		} `json:"links"`
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests", workspace, repoSlug)
++	if err := c.restRequest(ctx, "POST", path, reqBody, &resp); err != nil {
++		return PRResult{}, fmt.Errorf("create draft PR: %w", err)
++	}
++	return PRResult{ID: resp.ID, URL: resp.Links.HTML.Href}, nil
++}
++
++// UpdatePRDescription updates the description of an existing PR.
++func (c *Client) UpdatePRDescription(ctx context.Context, workspace, repoSlug string, prID int, description string) error {
++	reqBody := map[string]any{"description": description}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d", workspace, repoSlug, prID)
++	if err := c.restRequest(ctx, "PUT", path, reqBody, nil); err != nil {
++		return fmt.Errorf("update PR description: %w", err)
++	}
++	return nil
++}
++
++// GetPRApprovalStatus returns the overall approval state of a PR based on
++// the participants list. Bitbucket uses an approved boolean per participant.
++func (c *Client) GetPRApprovalStatus(ctx context.Context, workspace, repoSlug string, prID int) (ReviewState, error) {
++	var pr struct {
++		Participants []struct {
++			Role     string `json:"role"`
++			Approved bool   `json:"approved"`
++			State    string `json:"state"`
++			User     struct {
++				DisplayName string `json:"display_name"`
++			} `json:"user"`
++		} `json:"participants"`
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d", workspace, repoSlug, prID)
++	if err := c.restRequest(ctx, "GET", path, nil, &pr); err != nil {
++		return "", fmt.Errorf("get PR approval status: %w", err)
++	}
++
++	if len(pr.Participants) == 0 {
++		return ReviewPending, nil
++	}
++
++	hasApproval := false
++	for _, p := range pr.Participants {
++		if p.Role != "REVIEWER" {
++			continue
++		}
++		if p.State == "changes_requested" {
++			return ReviewChangesRequired, nil
++		}
++		if p.Approved {
++			hasApproval = true
++		}
++	}
++	if hasApproval {
++		return ReviewApproved, nil
++	}
++	return ReviewPending, nil
++}
++
++// GetPRComments returns the comments on a PR.
++func (c *Client) GetPRComments(ctx context.Context, workspace, repoSlug string, prID int) ([]PRComment, error) {
++	var resp struct {
++		Values []struct {
++			ID      int64  `json:"id"`
++			Content struct {
++				Raw string `json:"raw"`
++			} `json:"content"`
++			Inline *struct {
++				Path string `json:"path"`
++				To   int    `json:"to"`
++			} `json:"inline"`
++			CreatedOn string `json:"created_on"`
++			User      struct {
++				DisplayName string `json:"display_name"`
++			} `json:"user"`
++			Links struct {
++				HTML struct {
++					Href string `json:"href"`
++				} `json:"html"`
++			} `json:"links"`
++		} `json:"values"`
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/comments", workspace, repoSlug, prID)
++	if err := c.restRequest(ctx, "GET", path, nil, &resp); err != nil {
++		return nil, fmt.Errorf("get PR comments: %w", err)
++	}
++
++	comments := make([]PRComment, len(resp.Values))
++	for i, v := range resp.Values {
++		c := PRComment{
++			ID:        v.ID,
++			Body:      v.Content.Raw,
++			User:      v.User.DisplayName,
++			CreatedOn: v.CreatedOn,
++			HTMLURL:   v.Links.HTML.Href,
++		}
++		if v.Inline != nil {
++			c.Path = v.Inline.Path
++			c.Line = v.Inline.To
++		}
++		comments[i] = c
++	}
++	return comments, nil
++}
++
++// ReplyToPRComment posts a reply to an existing comment on a PR.
++func (c *Client) ReplyToPRComment(ctx context.Context, workspace, repoSlug string, prID int, parentID int64, body string) error {
++	reqBody := map[string]any{
++		"content": map[string]any{"raw": body},
++		"parent":  map[string]any{"id": parentID},
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/comments", workspace, repoSlug, prID)
++	if err := c.restRequest(ctx, "POST", path, reqBody, nil); err != nil {
++		return fmt.Errorf("reply to PR comment: %w", err)
++	}
++	return nil
++}
++
++// MergePR merges a pull request using the specified strategy.
++// Valid strategies: "merge_commit", "squash", "fast_forward".
++func (c *Client) MergePR(ctx context.Context, workspace, repoSlug string, prID int, strategy string) error {
++	reqBody := map[string]any{
++		"merge_strategy":       strategy,
++		"close_source_branch": true,
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/merge", workspace, repoSlug, prID)
++	if err := c.restRequest(ctx, "POST", path, reqBody, nil); err != nil {
++		return fmt.Errorf("merge PR: %w", err)
++	}
++	return nil
++}
++
++// GetRepoMergeStrategies returns the preferred merge strategy for a repository.
++// It inspects the branching model and returns "squash", "fast_forward", or "merge_commit"
++// (preferring squash > fast_forward > merge_commit).
++func (c *Client) GetRepoMergeStrategies(ctx context.Context, workspace, repoSlug string) (string, error) {
++	var branchingModel struct {
++		Development struct {
++			MergeStrategy string `json:"merge_strategy"`
++		} `json:"development"`
++	}
++	path := fmt.Sprintf("/repositories/%s/%s/branching-model", workspace, repoSlug)
++	if err := c.restRequest(ctx, "GET", path, nil, &branchingModel); err != nil {
++		// Fallback: if branching model is not configured, default to squash.
++		return "squash", nil
++	}
++
++	switch branchingModel.Development.MergeStrategy {
++	case "squash", "fast_forward", "merge_commit":
++		return branchingModel.Development.MergeStrategy, nil
++	default:
++		return "squash", nil
++	}
++}
+diff --git a/internal/bitbucket/pr_test.go b/internal/bitbucket/pr_test.go
+new file mode 100644
+index 00000000..c56c039e
+--- /dev/null
++++ b/internal/bitbucket/pr_test.go
+@@ -0,0 +1,272 @@
++package bitbucket
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// newTestClient creates a Client pointing at a test HTTP server.
++func newTestClient(t *testing.T, handler http.Handler) (*Client, *httptest.Server) {
++	t.Helper()
++	srv := httptest.NewServer(handler)
++	t.Cleanup(srv.Close)
++	c, err := NewClient(
++		WithToken("test-token"),
++		WithHTTPClient(srv.Client()),
++		WithRESTBase(srv.URL),
++	)
++	require.NoError(t, err)
++	return c, srv
++}
++
++func TestNewClient_RequiresToken(t *testing.T) {
++	t.Setenv("BITBUCKET_TOKEN", "")
++	_, err := NewClient()
++	assert.ErrorContains(t, err, "BITBUCKET_TOKEN is required")
++}
++
++func TestNewClient_FromEnv(t *testing.T) {
++	t.Setenv("BITBUCKET_TOKEN", "env-token")
++	c, err := NewClient()
++	require.NoError(t, err)
++	assert.Equal(t, "env-token", c.token)
++}
++
++func TestCreateDraftPR(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /repositories/myws/myrepo/pullrequests", func(w http.ResponseWriter, r *http.Request) {
++		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
++
++		var body map[string]any
++		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
++		assert.Equal(t, true, body["draft"])
++		assert.Equal(t, "Add feature", body["title"])
++
++		source := body["source"].(map[string]any)
++		srcBranch := source["branch"].(map[string]any)
++		assert.Equal(t, "feat-branch", srcBranch["name"])
++
++		dest := body["destination"].(map[string]any)
++		destBranch := dest["branch"].(map[string]any)
++		assert.Equal(t, "main", destBranch["name"])
++
++		w.WriteHeader(http.StatusCreated)
++		json.NewEncoder(w).Encode(map[string]any{
++			"id": 42,
++			"links": map[string]any{
++				"html": map[string]any{
++					"href": "https://bitbucket.org/myws/myrepo/pull-requests/42",
++				},
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	result, err := c.CreateDraftPR(t.Context(), "myws", "myrepo", "feat-branch", "main", "Add feature", "Description")
++	require.NoError(t, err)
++	assert.Equal(t, 42, result.ID)
++	assert.Equal(t, "https://bitbucket.org/myws/myrepo/pull-requests/42", result.URL)
++}
++
++func TestUpdatePRDescription(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("PUT /repositories/myws/myrepo/pullrequests/42", func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
++		assert.Equal(t, "Updated body", body["description"])
++		w.WriteHeader(http.StatusOK)
++		w.Write([]byte(`{}`))
++	})
++
++	c, _ := newTestClient(t, mux)
++	err := c.UpdatePRDescription(t.Context(), "myws", "myrepo", 42, "Updated body")
++	require.NoError(t, err)
++}
++
++func TestGetPRApprovalStatus_Approved(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/42", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"participants": []map[string]any{
++				{"role": "REVIEWER", "approved": true, "state": "approved", "user": map[string]any{"display_name": "alice"}},
++				{"role": "REVIEWER", "approved": true, "state": "approved", "user": map[string]any{"display_name": "bob"}},
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	state, err := c.GetPRApprovalStatus(t.Context(), "myws", "myrepo", 42)
++	require.NoError(t, err)
++	assert.Equal(t, ReviewApproved, state)
++}
++
++func TestGetPRApprovalStatus_ChangesRequested(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/42", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"participants": []map[string]any{
++				{"role": "REVIEWER", "approved": true, "state": "approved", "user": map[string]any{"display_name": "alice"}},
++				{"role": "REVIEWER", "approved": false, "state": "changes_requested", "user": map[string]any{"display_name": "bob"}},
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	state, err := c.GetPRApprovalStatus(t.Context(), "myws", "myrepo", 42)
++	require.NoError(t, err)
++	assert.Equal(t, ReviewChangesRequired, state)
++}
++
++func TestGetPRApprovalStatus_NoParticipants(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/42", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"participants": []map[string]any{},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	state, err := c.GetPRApprovalStatus(t.Context(), "myws", "myrepo", 42)
++	require.NoError(t, err)
++	assert.Equal(t, ReviewPending, state)
++}
++
++func TestGetPRApprovalStatus_NonReviewerIgnored(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/42", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"participants": []map[string]any{
++				{"role": "AUTHOR", "approved": false, "state": "", "user": map[string]any{"display_name": "author"}},
++				{"role": "PARTICIPANT", "approved": true, "state": "approved", "user": map[string]any{"display_name": "viewer"}},
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	state, err := c.GetPRApprovalStatus(t.Context(), "myws", "myrepo", 42)
++	require.NoError(t, err)
++	assert.Equal(t, ReviewPending, state)
++}
++
++func TestGetPRComments(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/42/comments", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"values": []map[string]any{
++				{
++					"id":         101,
++					"content":    map[string]any{"raw": "Fix this"},
++					"inline":     map[string]any{"path": "main.go", "to": 10},
++					"created_on": "2026-01-01T00:00:00+00:00",
++					"user":       map[string]any{"display_name": "alice"},
++					"links":      map[string]any{"html": map[string]any{"href": "https://bitbucket.org/myws/myrepo/pull-requests/42#comment-101"}},
++				},
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	comments, err := c.GetPRComments(t.Context(), "myws", "myrepo", 42)
++	require.NoError(t, err)
++	require.Len(t, comments, 1)
++	assert.Equal(t, int64(101), comments[0].ID)
++	assert.Equal(t, "Fix this", comments[0].Body)
++	assert.Equal(t, "alice", comments[0].User)
++	assert.Equal(t, "main.go", comments[0].Path)
++	assert.Equal(t, 10, comments[0].Line)
++}
++
++func TestReplyToPRComment(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /repositories/myws/myrepo/pullrequests/42/comments", func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
++		content := body["content"].(map[string]any)
++		assert.Equal(t, "Thanks, fixed!", content["raw"])
++		parent := body["parent"].(map[string]any)
++		assert.Equal(t, float64(101), parent["id"])
++		w.WriteHeader(http.StatusCreated)
++		w.Write([]byte(`{}`))
++	})
++
++	c, _ := newTestClient(t, mux)
++	err := c.ReplyToPRComment(t.Context(), "myws", "myrepo", 42, 101, "Thanks, fixed!")
++	require.NoError(t, err)
++}
++
++func TestMergePR(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /repositories/myws/myrepo/pullrequests/42/merge", func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
++		assert.Equal(t, "squash", body["merge_strategy"])
++		assert.Equal(t, true, body["close_source_branch"])
++		json.NewEncoder(w).Encode(map[string]any{"state": "MERGED"})
++	})
++
++	c, _ := newTestClient(t, mux)
++	err := c.MergePR(t.Context(), "myws", "myrepo", 42, "squash")
++	require.NoError(t, err)
++}
++
++func TestGetRepoMergeStrategies(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/branching-model", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{
++			"development": map[string]any{
++				"merge_strategy": "fast_forward",
++			},
++		})
++	})
++
++	c, _ := newTestClient(t, mux)
++	strategy, err := c.GetRepoMergeStrategies(t.Context(), "myws", "myrepo")
++	require.NoError(t, err)
++	assert.Equal(t, "fast_forward", strategy)
++}
++
++func TestGetRepoMergeStrategies_DefaultsToSquash(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/branching-model", func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusNotFound)
++		w.Write([]byte(`{"error":{"message":"Not Found"}}`))
++	})
++
++	c, _ := newTestClient(t, mux)
++	strategy, err := c.GetRepoMergeStrategies(t.Context(), "myws", "myrepo")
++	require.NoError(t, err)
++	assert.Equal(t, "squash", strategy)
++}
++
++func TestAPIError(t *testing.T) {
++	t.Parallel()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /repositories/myws/myrepo/pullrequests/999", func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusNotFound)
++		w.Write([]byte(`{"error":{"message":"Not Found"}}`))
++	})
++
++	c, _ := newTestClient(t, mux)
++	_, err := c.GetPRApprovalStatus(t.Context(), "myws", "myrepo", 999)
++	require.Error(t, err)
++
++	var apiErr *APIError
++	assert.ErrorAs(t, err, &apiErr)
++	assert.Equal(t, 404, apiErr.StatusCode)
++}
+diff --git a/internal/bitbucket/remote.go b/internal/bitbucket/remote.go
+new file mode 100644
+index 00000000..47495ed4
+--- /dev/null
++++ b/internal/bitbucket/remote.go
+@@ -0,0 +1,30 @@
++package bitbucket
++
++import (
++	"fmt"
++	"strings"
++)
++
++// ParseBitbucketRemote extracts workspace and repo_slug from a Bitbucket git remote URL.
++// Supports HTTPS (https://bitbucket.org/workspace/repo.git) and
++// SSH (git@bitbucket.org:workspace/repo.git) formats.
++func ParseBitbucketRemote(remoteURL string) (workspace, repoSlug string, err error) {
++	var path string
++	switch {
++	case strings.HasPrefix(remoteURL, "https://bitbucket.org/"):
++		path = strings.TrimPrefix(remoteURL, "https://bitbucket.org/")
++	case strings.HasPrefix(remoteURL, "git@bitbucket.org:"):
++		path = strings.TrimPrefix(remoteURL, "git@bitbucket.org:")
++	default:
++		return "", "", fmt.Errorf("bitbucket: not a Bitbucket URL: %s", remoteURL)
++	}
++
++	path = strings.TrimSuffix(path, ".git")
++	path = strings.TrimSuffix(path, "/")
++
++	parts := strings.SplitN(path, "/", 3)
++	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
++		return "", "", fmt.Errorf("bitbucket: cannot parse workspace/repo from: %s", remoteURL)
++	}
++	return parts[0], parts[1], nil
++}
+diff --git a/internal/bitbucket/remote_test.go b/internal/bitbucket/remote_test.go
+new file mode 100644
+index 00000000..c0aa57ba
+--- /dev/null
++++ b/internal/bitbucket/remote_test.go
+@@ -0,0 +1,79 @@
++package bitbucket
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestParseBitbucketRemote(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		name      string
++		url       string
++		workspace string
++		repoSlug  string
++		wantErr   bool
++	}{
++		{
++			name:      "HTTPS with .git suffix",
++			url:       "https://bitbucket.org/myworkspace/myrepo.git",
++			workspace: "myworkspace",
++			repoSlug:  "myrepo",
++		},
++		{
++			name:      "HTTPS without .git suffix",
++			url:       "https://bitbucket.org/myworkspace/myrepo",
++			workspace: "myworkspace",
++			repoSlug:  "myrepo",
++		},
++		{
++			name:      "HTTPS with trailing slash",
++			url:       "https://bitbucket.org/myworkspace/myrepo/",
++			workspace: "myworkspace",
++			repoSlug:  "myrepo",
++		},
++		{
++			name:      "SSH format",
++			url:       "git@bitbucket.org:myworkspace/myrepo.git",
++			workspace: "myworkspace",
++			repoSlug:  "myrepo",
++		},
++		{
++			name:      "SSH without .git suffix",
++			url:       "git@bitbucket.org:myworkspace/myrepo",
++			workspace: "myworkspace",
++			repoSlug:  "myrepo",
++		},
++		{
++			name:    "GitHub URL returns error",
++			url:     "https://github.com/owner/repo",
++			wantErr: true,
++		},
++		{
++			name:    "Empty URL returns error",
++			url:     "",
++			wantErr: true,
++		},
++		{
++			name:    "Missing repo returns error",
++			url:     "https://bitbucket.org/myworkspace",
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			ws, repo, err := ParseBitbucketRemote(tt.url)
++			if tt.wantErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tt.workspace, ws)
++			assert.Equal(t, tt.repoSlug, repo)
++		})
++	}
++}
+diff --git a/internal/config/types.go b/internal/config/types.go
+index b7a94bb5..78c9660d 100644
+--- a/internal/config/types.go
++++ b/internal/config/types.go
+@@ -1277,11 +1277,16 @@ type MergeQueueConfig struct {
+ 	IntegrationBranchAutoLand *bool `json:"integration_branch_auto_land,omitempty"`
+ 
+ 	// MergeStrategy controls how the refinery lands approved work: "direct" (default)
+-	// merges directly to the base branch, "pr" creates a GitHub pull request.
++	// merges directly to the base branch, "pr" uses the VCS provider's merge API
++	// which respects branch protection/restriction rules.
+ 	MergeStrategy string `json:"merge_strategy,omitempty"`
+ 
++	// VCSProvider selects the VCS platform for PR operations when
++	// MergeStrategy="pr". Valid values: "github" (default), "bitbucket".
++	VCSProvider string `json:"vcs_provider,omitempty"`
++
+ 	// RequireReview controls whether the refinery requires at least one approving
+-	// GitHub review before merging a PR. Only meaningful when merge_strategy="pr".
++	// review before merging a PR. Only meaningful when merge_strategy="pr".
+ 	// Nil defaults to false (no review required).
+ 	RequireReview *bool `json:"require_review,omitempty"`
+ 
+diff --git a/internal/git/git.go b/internal/git/git.go
+index 0b9be6c7..c6f06d45 100644
+--- a/internal/git/git.go
++++ b/internal/git/git.go
+@@ -1025,6 +1025,115 @@ func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
+ 	return sha, nil
+ }
+ 
++// FindBitbucketPRNumber returns the Bitbucket PR ID for the given branch, or 0 if none exists.
++// It queries the Bitbucket REST API for open PRs with the branch as source.
++func (g *Git) FindBitbucketPRNumber(workspace, repoSlug, branch string) (int, error) {
++	// Use curl since there is no official Bitbucket CLI equivalent to gh.
++	// The BITBUCKET_TOKEN env var provides authentication.
++	token := os.Getenv("BITBUCKET_TOKEN")
++	if token == "" {
++		return 0, fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
++	}
++	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests?q=source.branch.name%%3D%%22%s%%22+AND+state%%3D%%22OPEN%%22&pagelen=1",
++		workspace, repoSlug, branch)
++	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
++	cmd.Dir = g.workDir
++	out, err := cmd.Output()
++	if err != nil {
++		return 0, fmt.Errorf("bitbucket API request failed: %w", err)
++	}
++	var resp struct {
++		Values []struct {
++			ID int `json:"id"`
++		} `json:"values"`
++	}
++	if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
++		return 0, fmt.Errorf("failed to parse Bitbucket response: %w", err)
++	}
++	if len(resp.Values) == 0 {
++		return 0, nil
++	}
++	return resp.Values[0].ID, nil
++}
++
++// IsBitbucketPRApproved checks whether a Bitbucket PR has at least one approving reviewer.
++func (g *Git) IsBitbucketPRApproved(workspace, repoSlug string, prID int) (bool, error) {
++	token := os.Getenv("BITBUCKET_TOKEN")
++	if token == "" {
++		return false, fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
++	}
++	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d",
++		workspace, repoSlug, prID)
++	cmd := exec.Command("curl", "-s", "-H", "Authorization: Bearer "+token, url)
++	cmd.Dir = g.workDir
++	out, err := cmd.Output()
++	if err != nil {
++		return false, fmt.Errorf("bitbucket API request failed: %w", err)
++	}
++	var pr struct {
++		Participants []struct {
++			Role     string `json:"role"`
++			Approved bool   `json:"approved"`
++		} `json:"participants"`
++	}
++	if err := json.Unmarshal(bytes.TrimSpace(out), &pr); err != nil {
++		return false, fmt.Errorf("failed to parse Bitbucket response: %w", err)
++	}
++	for _, p := range pr.Participants {
++		if p.Role == "REVIEWER" && p.Approved {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// BitbucketPRMerge merges a Bitbucket PR via the REST API.
++// The strategy parameter should be "merge_commit", "squash", or "fast_forward".
++// Returns the merge commit SHA on success (if available).
++func (g *Git) BitbucketPRMerge(workspace, repoSlug string, prID int, strategy string) (string, error) {
++	token := os.Getenv("BITBUCKET_TOKEN")
++	if token == "" {
++		return "", fmt.Errorf("BITBUCKET_TOKEN is required for Bitbucket PR operations")
++	}
++	url := fmt.Sprintf("https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d/merge",
++		workspace, repoSlug, prID)
++	body := fmt.Sprintf(`{"merge_strategy":"%s","close_source_branch":true}`, strategy)
++	cmd := exec.Command("curl", "-s", "-X", "POST",
++		"-H", "Authorization: Bearer "+token,
++		"-H", "Content-Type: application/json",
++		"-d", body, url)
++	cmd.Dir = g.workDir
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("bitbucket merge failed: %s: %w", strings.TrimSpace(string(out)), err)
++	}
++
++	var resp struct {
++		MergeCommit struct {
++			Hash string `json:"hash"`
++		} `json:"merge_commit"`
++	}
++	if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
++		// Merge may have succeeded but response parsing failed — pull to get SHA.
++		if _, pullErr := g.run("pull", "origin"); pullErr == nil {
++			if sha, revErr := g.Rev("HEAD"); revErr == nil {
++				return sha, nil
++			}
++		}
++		return "", nil
++	}
++
++	// Sync local state after remote merge.
++	if _, pullErr := g.run("pull", "origin"); pullErr != nil {
++		return resp.MergeCommit.Hash, nil
++	}
++	if resp.MergeCommit.Hash != "" {
++		return resp.MergeCommit.Hash, nil
++	}
++	sha, _ := g.Rev("HEAD")
++	return sha, nil
++}
++
+ // ListRemoteRefs returns remote ref names matching a prefix using ls-remote.
+ // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
+ // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
+diff --git a/internal/refinery/engineer.go b/internal/refinery/engineer.go
+index f0729d9e..dff0e841 100644
+--- a/internal/refinery/engineer.go
++++ b/internal/refinery/engineer.go
+@@ -172,12 +172,16 @@ type MergeQueueConfig struct {
+ 	AutoPush bool `json:"auto_push"`
+ 
+ 	// MergeStrategy controls how the refinery lands work: "direct" (default)
+-	// does local squash merge + git push; "pr" uses gh pr merge via GitHub API
+-	// which respects branch protection rules.
++	// does local squash merge + git push; "pr" uses the VCS provider's merge API
++	// which respects branch protection/restriction rules.
+ 	MergeStrategy string `json:"merge_strategy,omitempty"`
+ 
++	// VCSProvider selects the VCS platform for PR operations when
++	// MergeStrategy="pr". Valid values: "github" (default), "bitbucket".
++	VCSProvider string `json:"vcs_provider,omitempty"`
++
+ 	// RequireReview controls whether the refinery requires at least one approving
+-	// GitHub review before merging a PR. Only meaningful when MergeStrategy="pr".
++	// review before merging a PR. Only meaningful when MergeStrategy="pr".
+ 	// Nil defaults to false (no review required).
+ 	RequireReview *bool `json:"require_review,omitempty"`
+ 
+@@ -266,6 +270,7 @@ type Engineer struct {
+ 	beads                 *beads.Beads
+ 	git                   *git.Git
+ 	config                *MergeQueueConfig
++	prProvider            PRProvider   // VCS-specific PR operations (nil when MergeStrategy != "pr")
+ 	workDir               string
+ 	output                io.Writer    // Output destination for user-facing messages
+ 	router                *mail.Router // Mail router for sending protocol messages
+@@ -358,6 +363,7 @@ func (e *Engineer) LoadConfig() error {
+ 		GatesParallel        *bool                      `json:"gates_parallel"`
+ 		AutoPush             *bool                      `json:"auto_push"`
+ 		MergeStrategy        *string                    `json:"merge_strategy"`
++		VCSProvider          *string                    `json:"vcs_provider"`
+ 		RequireReview        *bool                      `json:"require_review"`
+ 	}
+ 
+@@ -440,10 +446,38 @@ func (e *Engineer) LoadConfig() error {
+ 	if mqRaw.MergeStrategy != nil {
+ 		e.config.MergeStrategy = *mqRaw.MergeStrategy
+ 	}
++	if mqRaw.VCSProvider != nil {
++		e.config.VCSProvider = *mqRaw.VCSProvider
++	}
+ 	if mqRaw.RequireReview != nil {
+ 		e.config.RequireReview = mqRaw.RequireReview
+ 	}
+ 
++	// Initialize the PR provider when merge_strategy=pr.
++	if e.config.MergeStrategy == "pr" {
++		if err := e.initPRProvider(); err != nil {
++			return fmt.Errorf("initializing PR provider: %w", err)
++		}
++	}
++
++	return nil
++}
++
++// initPRProvider creates the appropriate PRProvider based on vcs_provider config.
++// Defaults to GitHub when vcs_provider is empty or "github".
++func (e *Engineer) initPRProvider() error {
++	switch e.config.VCSProvider {
++	case "", "github":
++		e.prProvider = newGitHubPRProvider(e.git)
++	case "bitbucket":
++		p, err := newBitbucketPRProvider(e.git)
++		if err != nil {
++			return err
++		}
++		e.prProvider = p
++	default:
++		return fmt.Errorf("unknown vcs_provider %q (supported: github, bitbucket)", e.config.VCSProvider)
++	}
+ 	return nil
+ }
+ 
+@@ -595,9 +629,10 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
+ 		_, _ = fmt.Fprintln(e.output, "[Engineer] Tests passed")
+ 	}
+ 
+-	// PR merge path: when merge_strategy=pr, use GitHub's merge API instead of
+-	// local squash merge + direct push. This respects branch protection rules
+-	// and preserves the PR audit trail.
++	// PR merge path: when merge_strategy=pr, use the VCS provider's merge API
++	// instead of local squash merge + direct push. This respects branch
++	// protection/restriction rules and preserves the PR audit trail.
++	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
+ 	if e.config.MergeStrategy == "pr" {
+ 		return e.doMergePR(ctx, branch, target)
+ 	}
+@@ -715,17 +750,29 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
+ 	}
+ }
+ 
+-// doMergePR handles merging via GitHub's PR merge API (merge_strategy=pr).
+-// This respects branch protection rules including required reviews.
++// doMergePR handles merging via the VCS provider's PR merge API (merge_strategy=pr).
++// This respects branch protection/restriction rules including required reviews.
++// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
+ // Called from doMerge after quality gates have passed.
+ //
+ //nolint:unparam // ctx is reserved for future use when git methods accept context
+ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) ProcessResult {
+ 	_ = ctx
+-	_, _ = fmt.Fprintln(e.output, "[Engineer] Using PR merge strategy (merge_strategy=pr)")
++	provider := e.config.VCSProvider
++	if provider == "" {
++		provider = "github"
++	}
++	_, _ = fmt.Fprintf(e.output, "[Engineer] Using PR merge strategy (vcs_provider=%s)\n", provider)
+ 
+-	// Step PR.1: Find the GitHub PR for this branch
+-	prNumber, err := e.git.FindPRNumber(branch)
++	if e.prProvider == nil {
++		return ProcessResult{
++			Success: false,
++			Error:   fmt.Sprintf("no PR provider configured for vcs_provider=%s", provider),
++		}
++	}
++
++	// Step PR.1: Find the PR for this branch
++	prNumber, err := e.prProvider.FindPRNumber(branch)
+ 	if err != nil {
+ 		return ProcessResult{
+ 			Success: false,
+@@ -743,7 +790,7 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
+ 	// Step PR.2: Check approval status if require_review is enabled
+ 	requireReview := e.config.RequireReview != nil && *e.config.RequireReview
+ 	if requireReview {
+-		approved, err := e.git.IsPRApproved(prNumber)
++		approved, err := e.prProvider.IsPRApproved(prNumber)
+ 		if err != nil {
+ 			return ProcessResult{
+ 				Success: false,
+@@ -761,27 +808,23 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
+ 		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
+ 	}
+ 
+-	// Step PR.3: Merge via GitHub API using squash merge
+-	// gh pr merge respects branch protection rules — if protection requires
+-	// reviews and the PR doesn't have them, the merge will fail.
+-	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via gh pr merge --squash...\n", prNumber)
+-	mergeCommit, err := e.git.GhPrMerge(prNumber, "squash")
++	// Step PR.3: Merge via VCS provider API using squash merge
++	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", prNumber, provider)
++	mergeCommit, err := e.prProvider.MergePR(prNumber, "squash")
+ 	if err != nil {
+ 		return ProcessResult{
+ 			Success: false,
+-			Error:   fmt.Sprintf("gh pr merge failed for PR #%d: %v", prNumber, err),
++			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", prNumber, err),
+ 		}
+ 	}
+ 
+-	// Step PR.4: Sync local target branch after GitHub merge
+-	// Reset local target to match origin so subsequent operations see the merged state.
++	// Step PR.4: Sync local target branch after remote merge
+ 	if err := e.git.Checkout(target); err != nil {
+ 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to checkout %s after PR merge: %v\n", target, err)
+ 	} else if err := e.git.Pull("origin", target); err != nil {
+ 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to pull %s after PR merge: %v\n", target, err)
+ 	}
+ 
+-	// Get the actual merge commit SHA if GhPrMerge couldn't determine it
+ 	if mergeCommit == "" {
+ 		if sha, err := e.git.Rev("HEAD"); err == nil {
+ 			mergeCommit = sha
+@@ -795,6 +838,7 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
+ 	}
+ }
+ 
++
+ func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
+ 	slotID, err := e.mergeSlotEnsureExists()
+ 	if err != nil {
+diff --git a/internal/refinery/pr_provider.go b/internal/refinery/pr_provider.go
+new file mode 100644
+index 00000000..b94e1556
+--- /dev/null
++++ b/internal/refinery/pr_provider.go
+@@ -0,0 +1,15 @@
++package refinery
++
++// PRProvider abstracts VCS-specific PR operations for the merge queue.
++// Implementations exist for GitHub (default) and Bitbucket Cloud.
++type PRProvider interface {
++	// FindPRNumber returns the PR number/ID for the given branch, or 0 if none exists.
++	FindPRNumber(branch string) (int, error)
++
++	// IsPRApproved checks whether a PR has at least one approving review.
++	IsPRApproved(prNumber int) (bool, error)
++
++	// MergePR merges a PR using the specified method (e.g., "squash", "merge", "rebase").
++	// Returns the merge commit SHA on success (if available).
++	MergePR(prNumber int, method string) (string, error)
++}
+diff --git a/internal/refinery/pr_provider_bitbucket.go b/internal/refinery/pr_provider_bitbucket.go
+new file mode 100644
+index 00000000..6dcfde58
+--- /dev/null
++++ b/internal/refinery/pr_provider_bitbucket.go
+@@ -0,0 +1,53 @@
++package refinery
++
++import (
++	"fmt"
++
++	"github.com/steveyegge/gastown/internal/bitbucket"
++	"github.com/steveyegge/gastown/internal/git"
++)
++
++// bitbucketPRProvider implements PRProvider using the Bitbucket Cloud REST API.
++type bitbucketPRProvider struct {
++	git       *git.Git
++	workspace string
++	repoSlug  string
++}
++
++func newBitbucketPRProvider(g *git.Git) (PRProvider, error) {
++	remoteURL, err := g.RemoteURL("origin")
++	if err != nil {
++		return nil, fmt.Errorf("bitbucket provider: failed to get origin remote URL: %w", err)
++	}
++	workspace, repoSlug, err := bitbucket.ParseBitbucketRemote(remoteURL)
++	if err != nil {
++		return nil, fmt.Errorf("bitbucket provider: %w", err)
++	}
++	return &bitbucketPRProvider{
++		git:       g,
++		workspace: workspace,
++		repoSlug:  repoSlug,
++	}, nil
++}
++
++func (p *bitbucketPRProvider) FindPRNumber(branch string) (int, error) {
++	return p.git.FindBitbucketPRNumber(p.workspace, p.repoSlug, branch)
++}
++
++func (p *bitbucketPRProvider) IsPRApproved(prNumber int) (bool, error) {
++	return p.git.IsBitbucketPRApproved(p.workspace, p.repoSlug, prNumber)
++}
++
++func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {
++	// Map generic merge methods to Bitbucket strategy names.
++	bbStrategy := method
++	switch method {
++	case "squash":
++		bbStrategy = "squash"
++	case "merge":
++		bbStrategy = "merge_commit"
++	case "rebase":
++		bbStrategy = "fast_forward"
++	}
++	return p.git.BitbucketPRMerge(p.workspace, p.repoSlug, prNumber, bbStrategy)
++}
+diff --git a/internal/refinery/pr_provider_github.go b/internal/refinery/pr_provider_github.go
+new file mode 100644
+index 00000000..0b8956e6
+--- /dev/null
++++ b/internal/refinery/pr_provider_github.go
+@@ -0,0 +1,24 @@
++package refinery
++
++import "github.com/steveyegge/gastown/internal/git"
++
++// githubPRProvider implements PRProvider using the gh CLI via git.Git.
++type githubPRProvider struct {
++	git *git.Git
++}
++
++func newGitHubPRProvider(g *git.Git) PRProvider {
++	return &githubPRProvider{git: g}
++}
++
++func (p *githubPRProvider) FindPRNumber(branch string) (int, error) {
++	return p.git.FindPRNumber(branch)
++}
++
++func (p *githubPRProvider) IsPRApproved(prNumber int) (bool, error) {
++	return p.git.IsPRApproved(prNumber)
++}
++
++func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
++	return p.git.GhPrMerge(prNumber, method)
++}
+diff --git a/internal/rig/manager.go b/internal/rig/manager.go
+index e9b0238f..fe34a0f8 100644
+--- a/internal/rig/manager.go
++++ b/internal/rig/manager.go
+@@ -77,6 +77,15 @@ func convertToSSH(httpsURL string) string {
+ 		return "git@gitlab.com:" + path
+ 	}
+ 
++	// Handle Bitbucket: https://bitbucket.org/workspace/repo.git -> git@bitbucket.org:workspace/repo.git
++	if strings.HasPrefix(httpsURL, "https://bitbucket.org/") {
++		path := strings.TrimPrefix(httpsURL, "https://bitbucket.org/")
++		if !strings.HasSuffix(path, ".git") {
++			path += ".git"
++		}
++		return "git@bitbucket.org:" + path
++	}
++
+ 	return ""
+ }
+ 
+diff --git a/internal/rig/manager_test.go b/internal/rig/manager_test.go
+index a8d8d2d5..4487543a 100644
+--- a/internal/rig/manager_test.go
++++ b/internal/rig/manager_test.go
+@@ -900,8 +900,18 @@ func TestConvertToSSH(t *testing.T) {
+ 			wantSSH: "git@gitlab.com:owner/repo.git",
+ 		},
+ 		{
+-			name:    "Unknown host returns empty",
++			name:    "Bitbucket with .git suffix",
+ 			https:   "https://bitbucket.org/owner/repo.git",
++			wantSSH: "git@bitbucket.org:owner/repo.git",
++		},
++		{
++			name:    "Bitbucket without .git suffix",
++			https:   "https://bitbucket.org/owner/repo",
++			wantSSH: "git@bitbucket.org:owner/repo.git",
++		},
++		{
++			name:    "Unknown host returns empty",
++			https:   "https://gitlab.example.com/owner/repo.git",
+ 			wantSSH: "",
+ 		},
+ 		{
+-- 
+2.43.0
+

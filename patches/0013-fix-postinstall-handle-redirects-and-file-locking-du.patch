@@ -1,0 +1,63 @@
+From 58b65aec300675783ce27a29bf61f936396fd434 Mon Sep 17 00:00:00 2001
+From: pedroza <pedrozaalexandre@gmail.com>
+Date: Sun, 12 Apr 2026 17:23:38 -0300
+Subject: [PATCH 013/110] fix(postinstall): handle redirects and file locking
+ during downloads (#3576)
+
+---
+ npm-package/scripts/postinstall.js | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/npm-package/scripts/postinstall.js b/npm-package/scripts/postinstall.js
+index c3a05eb9..4069dcde 100644
+--- a/npm-package/scripts/postinstall.js
++++ b/npm-package/scripts/postinstall.js
+@@ -61,11 +61,20 @@ function downloadFile(url, dest) {
+       if (response.statusCode === 301 || response.statusCode === 302) {
+         const redirectUrl = response.headers.location;
+         console.log(`Following redirect to: ${redirectUrl}`);
+-        downloadFile(redirectUrl, dest).then(resolve).catch(reject);
++        // Consume the response so the socket can be freed
++        response.resume();
++        // Close the current write stream before recursing,
++        // otherwise the file stays locked on Windows.
++        file.close(() => {
++          fs.unlink(dest, () => {
++            downloadFile(redirectUrl, dest).then(resolve).catch(reject);
++          });
++        });
+         return;
+       }
+ 
+       if (response.statusCode !== 200) {
++        file.close(() => fs.unlink(dest, () => { }));
+         reject(new Error(`Failed to download: HTTP ${response.statusCode}`));
+         return;
+       }
+@@ -73,8 +82,6 @@ function downloadFile(url, dest) {
+       response.pipe(file);
+ 
+       file.on('finish', () => {
+-        // Wait for file.close() to complete before resolving
+-        // This is critical on Windows where the file may still be locked
+         file.close((err) => {
+           if (err) reject(err);
+           else resolve();
+@@ -83,12 +90,12 @@ function downloadFile(url, dest) {
+     });
+ 
+     request.on('error', (err) => {
+-      fs.unlink(dest, () => {});
++      file.close(() => fs.unlink(dest, () => { }));
+       reject(err);
+     });
+ 
+     file.on('error', (err) => {
+-      fs.unlink(dest, () => {});
++      fs.unlink(dest, () => { });
+       reject(err);
+     });
+   });
+-- 
+2.43.0
+

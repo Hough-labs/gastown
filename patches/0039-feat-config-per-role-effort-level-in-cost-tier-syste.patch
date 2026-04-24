@@ -1,0 +1,568 @@
+From 62b911e5603ed74b49b21cb320a2ca29f15020a6 Mon Sep 17 00:00:00 2001
+From: "Ryan R. Fox" <ryanRfox@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 16:25:22 -0400
+Subject: [PATCH 039/110] feat(config): per-role effort level in cost-tier
+ system (#3545)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(config): add per-role effort level to cost-tier system
+
+Add role_effort config to TownSettings and RigSettings, parallel to
+role_agents. Cost-tier presets now include per-role effort defaults:
+- standard: all high
+- economy: workers high, patrol low, mayor/refinery medium
+- budget: workers medium, all others low
+
+AgentEnv resolves effort internally via ResolveRoleEffort using role
+context already available in AgentEnvConfig (Role, Rig, TownRoot).
+No call-site changes required.
+
+Deprecates CLAUDE_CODE_EFFORT_LEVEL env var — effort is now configured
+per-role through config, matching the pattern used for model selection.
+A deprecation notice is emitted when the env var is detected.
+
+Resolution chain: GT_COST_TIER ephemeral → rig role_effort → town
+role_effort → "high" default.
+
+Refs: gtn-mol-dst0
+
+* fix(config): add [1m] suffix to sonnet preset for 1M context
+
+Claude Code's --model sonnet resolves to 200K context because the
+explicit --model flag bypasses the built-in plan-based auto-detection
+that enables 1M on Max/Team plans. Adding the [1m] suffix to the
+sonnet preset ensures roles using claude-sonnet get 1M context.
+---
+ internal/config/cost_tier.go      |  88 +++++++++++++++-
+ internal/config/cost_tier_test.go | 165 +++++++++++++++++++++++++++++-
+ internal/config/env.go            |  28 +++--
+ internal/config/env_test.go       |  35 +++++++
+ internal/config/loader.go         |  46 +++++++++
+ internal/config/loader_test.go    |   6 +-
+ internal/config/types.go          |  13 +++
+ 7 files changed, 364 insertions(+), 17 deletions(-)
+
+diff --git a/internal/config/cost_tier.go b/internal/config/cost_tier.go
+index edf13280..165ef974 100644
+--- a/internal/config/cost_tier.go
++++ b/internal/config/cost_tier.go
+@@ -85,6 +85,64 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
+ 	}
+ }
+ 
++// CostTierRoleEffort returns the role_effort mapping for a given tier.
++// Workers get the highest effort for the tier; patrol roles drop effort since
++// they do simpler, more repetitive work. Returns nil if the tier is invalid.
++func CostTierRoleEffort(tier CostTier) map[string]string {
++	switch tier {
++	case TierStandard:
++		return map[string]string{
++			"mayor":    "high",
++			"deacon":   "high",
++			"witness":  "high",
++			"refinery": "high",
++			"polecat":  "high",
++			"crew":     "high",
++			"boot":     "high",
++			"dog":      "high",
++		}
++	case TierEconomy:
++		return map[string]string{
++			"mayor":    "medium",
++			"deacon":   "low",
++			"witness":  "low",
++			"refinery": "medium",
++			"polecat":  "high",
++			"crew":     "high",
++			"boot":     "low",
++			"dog":      "low",
++		}
++	case TierBudget:
++		return map[string]string{
++			"mayor":    "low",
++			"deacon":   "low",
++			"witness":  "low",
++			"refinery": "low",
++			"polecat":  "medium",
++			"crew":     "medium",
++			"boot":     "low",
++			"dog":      "low",
++		}
++	default:
++		return nil
++	}
++}
++
++// ValidEffortLevels returns all valid effort level values.
++func ValidEffortLevels() []string {
++	return []string{"low", "medium", "high", "max"}
++}
++
++// IsValidEffortLevel checks if a string is a valid effort level.
++func IsValidEffortLevel(level string) bool {
++	switch level {
++	case "low", "medium", "high", "max":
++		return true
++	default:
++		return false
++	}
++}
++
+ // CostTierAgents returns the custom agent definitions needed for a given tier.
+ // These define the claude-sonnet and claude-haiku agent presets.
+ // Standard tier returns an empty map (no custom agents needed).
+@@ -103,10 +161,14 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
+ }
+ 
+ // claudeSonnetPreset returns a RuntimeConfig for Claude Sonnet.
++// Uses "sonnet[1m]" to enable 1M context window on Max/Team plans.
++// Without the [1m] suffix, --model sonnet resolves to 200K context
++// because the explicit --model flag bypasses Claude Code's built-in
++// plan-based auto-detection that would otherwise enable 1M.
+ func claudeSonnetPreset() *RuntimeConfig {
+ 	return &RuntimeConfig{
+ 		Command: "claude",
+-		Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
++		Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet[1m]"},
+ 	}
+ }
+ 
+@@ -163,6 +225,21 @@ func ApplyCostTier(settings *TownSettings, tier CostTier) error {
+ 		}
+ 	}
+ 
++	// Apply effort level defaults for the tier
++	roleEffort := CostTierRoleEffort(tier)
++	if settings.RoleEffort == nil {
++		settings.RoleEffort = make(map[string]string)
++	}
++	for _, role := range TierManagedRoles {
++		effort := roleEffort[role]
++		if effort == "" || effort == "high" {
++			// "high" is the default — don't persist it
++			delete(settings.RoleEffort, role)
++		} else {
++			settings.RoleEffort[role] = effort
++		}
++	}
++
+ 	// Track the tier for display purposes
+ 	settings.CostTier = string(tier)
+ 
+@@ -222,12 +299,13 @@ func TierDescription(tier CostTier) string {
+ 	}
+ }
+ 
+-// FormatTierRoleTable returns a formatted string showing role→model assignments for a tier.
++// FormatTierRoleTable returns a formatted string showing role→model and effort assignments for a tier.
+ func FormatTierRoleTable(tier CostTier) string {
+ 	roleAgents := CostTierRoleAgents(tier)
+ 	if roleAgents == nil {
+ 		return ""
+ 	}
++	roleEffort := CostTierRoleEffort(tier)
+ 
+ 	roles := []string{"mayor", "deacon", "witness", "refinery", "polecat", "crew", "boot", "dog"}
+ 	var lines []string
+@@ -236,7 +314,11 @@ func FormatTierRoleTable(tier CostTier) string {
+ 		if agent == "" {
+ 			agent = "(default/opus)"
+ 		}
+-		lines = append(lines, fmt.Sprintf("  %-10s %s", role+":", agent))
++		effort := roleEffort[role]
++		if effort == "" {
++			effort = "high"
++		}
++		lines = append(lines, fmt.Sprintf("  %-10s %-16s effort: %s", role+":", agent, effort))
+ 	}
+ 	return strings.Join(lines, "\n")
+ }
+diff --git a/internal/config/cost_tier_test.go b/internal/config/cost_tier_test.go
+index c8e58789..58604831 100644
+--- a/internal/config/cost_tier_test.go
++++ b/internal/config/cost_tier_test.go
+@@ -178,13 +178,13 @@ func TestCostTierAgents(t *testing.T) {
+ 		}
+ 		found := false
+ 		for i, arg := range sonnet.Args {
+-			if arg == "--model" && i+1 < len(sonnet.Args) && sonnet.Args[i+1] == "sonnet" {
++			if arg == "--model" && i+1 < len(sonnet.Args) && sonnet.Args[i+1] == "sonnet[1m]" {
+ 				found = true
+ 				break
+ 			}
+ 		}
+ 		if !found {
+-			t.Errorf("sonnet Args %v missing --model sonnet", sonnet.Args)
++			t.Errorf("sonnet Args %v missing --model sonnet[1m]", sonnet.Args)
+ 		}
+ 	})
+ 
+@@ -539,3 +539,164 @@ func containsSubstring(s, substr string) bool {
+ 	}
+ 	return false
+ }
++
++func TestCostTierRoleEffort(t *testing.T) {
++	t.Parallel()
++
++	t.Run("standard tier all high", func(t *testing.T) {
++		t.Parallel()
++		re := CostTierRoleEffort(TierStandard)
++		if re == nil {
++			t.Fatal("CostTierRoleEffort(standard) returned nil")
++		}
++		for _, role := range TierManagedRoles {
++			if re[role] != "high" {
++				t.Errorf("standard tier role_effort[%s] = %q, want %q", role, re[role], "high")
++			}
++		}
++	})
++
++	t.Run("economy tier workers high, patrol low/medium", func(t *testing.T) {
++		t.Parallel()
++		re := CostTierRoleEffort(TierEconomy)
++		if re == nil {
++			t.Fatal("CostTierRoleEffort(economy) returned nil")
++		}
++		// Workers should be high
++		for _, role := range []string{"polecat", "crew"} {
++			if re[role] != "high" {
++				t.Errorf("economy tier role_effort[%s] = %q, want %q", role, re[role], "high")
++			}
++		}
++		// Patrol roles should be low
++		for _, role := range []string{"deacon", "witness", "boot", "dog"} {
++			if re[role] != "low" {
++				t.Errorf("economy tier role_effort[%s] = %q, want %q", role, re[role], "low")
++			}
++		}
++		// Mayor and refinery should be medium
++		for _, role := range []string{"mayor", "refinery"} {
++			if re[role] != "medium" {
++				t.Errorf("economy tier role_effort[%s] = %q, want %q", role, re[role], "medium")
++			}
++		}
++	})
++
++	t.Run("budget tier workers medium, patrol low", func(t *testing.T) {
++		t.Parallel()
++		re := CostTierRoleEffort(TierBudget)
++		if re == nil {
++			t.Fatal("CostTierRoleEffort(budget) returned nil")
++		}
++		for _, role := range []string{"polecat", "crew"} {
++			if re[role] != "medium" {
++				t.Errorf("budget tier role_effort[%s] = %q, want %q", role, re[role], "medium")
++			}
++		}
++		for _, role := range []string{"mayor", "deacon", "witness", "refinery", "boot", "dog"} {
++			if re[role] != "low" {
++				t.Errorf("budget tier role_effort[%s] = %q, want %q", role, re[role], "low")
++			}
++		}
++	})
++
++	t.Run("invalid tier returns nil", func(t *testing.T) {
++		t.Parallel()
++		if re := CostTierRoleEffort("invalid"); re != nil {
++			t.Errorf("CostTierRoleEffort(invalid) = %v, want nil", re)
++		}
++	})
++}
++
++func TestIsValidEffortLevel(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		level string
++		want  bool
++	}{
++		{"low", true},
++		{"medium", true},
++		{"high", true},
++		{"max", true},
++		{"", false},
++		{"extreme", false},
++		{"High", false}, // case-sensitive
++	}
++	for _, tt := range tests {
++		t.Run(tt.level, func(t *testing.T) {
++			t.Parallel()
++			if got := IsValidEffortLevel(tt.level); got != tt.want {
++				t.Errorf("IsValidEffortLevel(%q) = %v, want %v", tt.level, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestApplyCostTier_SetsRoleEffort(t *testing.T) {
++	t.Parallel()
++
++	t.Run("economy tier sets non-high effort levels", func(t *testing.T) {
++		t.Parallel()
++		settings := NewTownSettings()
++		if err := ApplyCostTier(settings, TierEconomy); err != nil {
++			t.Fatalf("ApplyCostTier: %v", err)
++		}
++		// Workers have high effort — should NOT be in the map (high is default)
++		for _, role := range []string{"polecat", "crew"} {
++			if _, ok := settings.RoleEffort[role]; ok {
++				t.Errorf("RoleEffort[%s] should not be set (high is default)", role)
++			}
++		}
++		// Patrol roles should have low
++		for _, role := range []string{"deacon", "witness", "boot", "dog"} {
++			if settings.RoleEffort[role] != "low" {
++				t.Errorf("RoleEffort[%s] = %q, want %q", role, settings.RoleEffort[role], "low")
++			}
++		}
++		// Mayor and refinery should have medium
++		for _, role := range []string{"mayor", "refinery"} {
++			if settings.RoleEffort[role] != "medium" {
++				t.Errorf("RoleEffort[%s] = %q, want %q", role, settings.RoleEffort[role], "medium")
++			}
++		}
++	})
++
++	t.Run("standard tier clears role effort entries", func(t *testing.T) {
++		t.Parallel()
++		settings := NewTownSettings()
++		// Apply economy first
++		if err := ApplyCostTier(settings, TierEconomy); err != nil {
++			t.Fatalf("ApplyCostTier economy: %v", err)
++		}
++		// Then switch to standard
++		if err := ApplyCostTier(settings, TierStandard); err != nil {
++			t.Fatalf("ApplyCostTier standard: %v", err)
++		}
++		// All roles should be cleared (high is default, not persisted)
++		for _, role := range TierManagedRoles {
++			if val, ok := settings.RoleEffort[role]; ok {
++				t.Errorf("RoleEffort[%s] = %q, want deleted (standard tier)", role, val)
++			}
++		}
++	})
++}
++
++func TestFormatTierRoleTable_IncludesEffort(t *testing.T) {
++	t.Parallel()
++	table := FormatTierRoleTable(TierEconomy)
++	if table == "" {
++		t.Fatal("FormatTierRoleTable(economy) returned empty string")
++	}
++	// Workers should show "effort: high"
++	if !containsSubstring(table, "effort: high") {
++		t.Error("economy tier table should contain 'effort: high' for workers")
++	}
++	// Should contain effort: low for patrol roles
++	if !containsSubstring(table, "effort: low") {
++		t.Error("economy tier table should contain 'effort: low' for patrol roles")
++	}
++	// Should contain effort: medium for mayor/refinery
++	if !containsSubstring(table, "effort: medium") {
++		t.Error("economy tier table should contain 'effort: medium' for mayor/refinery")
++	}
++}
+diff --git a/internal/config/env.go b/internal/config/env.go
+index 928fa9a5..dd1c75e3 100644
+--- a/internal/config/env.go
++++ b/internal/config/env.go
+@@ -201,15 +201,25 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
+ 	// this empty value with intentional settings like --max-old-space-size.
+ 	env["NODE_OPTIONS"] = ""
+ 
+-	// Set Claude Code effort level for all agents. Opus 4.6 defaults to "medium"
+-	// which under-utilizes the model's reasoning capability. Propagate any
+-	// user-level override (from shell env); otherwise default to "high".
+-	// Users can set CLAUDE_CODE_EFFORT_LEVEL=max in their profile for maximum
+-	// reasoning depth (Opus 4.6 only, more expensive).
+-	if effortLevel := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL"); effortLevel != "" {
+-		env["CLAUDE_CODE_EFFORT_LEVEL"] = effortLevel
+-	} else {
+-		env["CLAUDE_CODE_EFFORT_LEVEL"] = "high"
++	// Resolve effort level from per-role config (role_effort in town/rig settings,
++	// or cost-tier presets). Falls back to "high" when no config exists.
++	// The CLAUDE_CODE_EFFORT_LEVEL env var is deprecated — effort is now configured
++	// per-role through config, matching the pattern used for model selection.
++	rigPath := ""
++	if cfg.Rig != "" && cfg.TownRoot != "" {
++		rigPath = filepath.Join(cfg.TownRoot, cfg.Rig)
++	}
++	effort := ResolveRoleEffort(cfg.Role, cfg.TownRoot, rigPath)
++	if effort == "" {
++		effort = "high"
++	}
++	env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
++	if shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL"); shellEffort != "" {
++		fmt.Fprintf(os.Stderr,
++			"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated and ignored; "+
++				"%s effort resolved to %q via config. "+
++				"Set per-role effort with role_effort in settings or gt config cost-tier.\n",
++			shellEffort, cfg.Role, effort)
+ 	}
+ 
+ 	// Clear CLAUDECODE to prevent nested session detection in Claude Code v2.x.
+diff --git a/internal/config/env_test.go b/internal/config/env_test.go
+index 1c8b4f39..35a8f4f9 100644
+--- a/internal/config/env_test.go
++++ b/internal/config/env_test.go
+@@ -1279,3 +1279,38 @@ func TestClaudeConfigDir_EnvVar(t *testing.T) {
+ 		t.Errorf("ClaudeConfigDir() = %q, want %q", got, customDir)
+ 	}
+ }
++
++func TestAgentEnv_EffortLevel(t *testing.T) {
++	t.Run("defaults to high when no config exists", func(t *testing.T) {
++		t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "")
++		env := AgentEnv(AgentEnvConfig{
++			Role:     "crew",
++			TownRoot: "/tmp/nonexistent-town",
++		})
++		if got := env["CLAUDE_CODE_EFFORT_LEVEL"]; got != "high" {
++			t.Errorf("CLAUDE_CODE_EFFORT_LEVEL = %q, want %q", got, "high")
++		}
++	})
++
++	t.Run("ignores shell env var", func(t *testing.T) {
++		// The env var is deprecated — config takes over, falling back to "high"
++		t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
++		env := AgentEnv(AgentEnvConfig{
++			Role:     "crew",
++			TownRoot: "/tmp/nonexistent-town",
++		})
++		if got := env["CLAUDE_CODE_EFFORT_LEVEL"]; got != "high" {
++			t.Errorf("CLAUDE_CODE_EFFORT_LEVEL = %q, want %q (env var should be ignored)", got, "high")
++		}
++	})
++
++	t.Run("always sets the key", func(t *testing.T) {
++		t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "")
++		env := AgentEnv(AgentEnvConfig{
++			Role: "witness",
++		})
++		if _, ok := env["CLAUDE_CODE_EFFORT_LEVEL"]; !ok {
++			t.Error("CLAUDE_CODE_EFFORT_LEVEL should always be set")
++		}
++	})
++}
+diff --git a/internal/config/loader.go b/internal/config/loader.go
+index 4a76ed3b..fb9d52df 100644
+--- a/internal/config/loader.go
++++ b/internal/config/loader.go
+@@ -1399,6 +1399,52 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
+ 	return withRoleSettingsFlag(rc, "crew", rigPath)
+ }
+ 
++// ResolveRoleEffort resolves the effort level for a role.
++// Resolution order:
++//  1. Rig's RoleEffort[role]
++//  2. Town's RoleEffort[role]
++//  3. Returns "" (caller falls back to env var / default "high")
++//
++// Invalid effort levels are warned about and skipped.
++func ResolveRoleEffort(role, townRoot, rigPath string) string {
++	// Tier 1: ephemeral cost tier override (mirrors agent resolution)
++	if tierName := os.Getenv("GT_COST_TIER"); tierName != "" && IsValidTier(tierName) {
++		if roleEffort := CostTierRoleEffort(CostTier(tierName)); roleEffort != nil {
++			if effort, ok := roleEffort[role]; ok {
++				return effort
++			}
++		}
++	}
++
++	// Tier 2: rig-level override
++	if rigPath != "" {
++		if rigSettings, err := LoadRigSettings(RigSettingsPath(rigPath)); err == nil && rigSettings != nil {
++			if effort, ok := rigSettings.RoleEffort[role]; ok && effort != "" {
++				if !IsValidEffortLevel(effort) {
++					fmt.Fprintf(os.Stderr, "warning: rig role_effort[%s]=%q is not a valid effort level, ignoring\n", role, effort)
++				} else {
++					return effort
++				}
++			}
++		}
++	}
++
++	// Tier 3: town-level setting
++	if townRoot != "" {
++		if townSettings, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot)); err == nil && townSettings != nil {
++			if effort, ok := townSettings.RoleEffort[role]; ok && effort != "" {
++				if !IsValidEffortLevel(effort) {
++					fmt.Fprintf(os.Stderr, "warning: town role_effort[%s]=%q is not a valid effort level, ignoring\n", role, effort)
++				} else {
++					return effort
++				}
++			}
++		}
++	}
++
++	return "" // Caller uses env var fallback, then "high" default
++}
++
+ // IsResolvedAgentClaude returns true if the RuntimeConfig represents a Claude agent.
+ // Exported for use in witness/daemon code that needs to skip hardcoded
+ // Claude start commands when a non-Claude agent is configured.
+diff --git a/internal/config/loader_test.go b/internal/config/loader_test.go
+index b03c1f32..9094dae1 100644
+--- a/internal/config/loader_test.go
++++ b/internal/config/loader_test.go
+@@ -5157,13 +5157,13 @@ func TestTryResolveFromEphemeralTier(t *testing.T) {
+ 		}
+ 		found := false
+ 		for i, arg := range rc.Args {
+-			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet" {
++			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
+ 				found = true
+ 				break
+ 			}
+ 		}
+ 		if !found {
+-			t.Errorf("Args %v missing --model sonnet", rc.Args)
++			t.Errorf("Args %v missing --model sonnet[1m]", rc.Args)
+ 		}
+ 	})
+ 
+@@ -5267,7 +5267,7 @@ func TestResolveRoleAgentConfig_EphemeralStandardSkipsPersisted(t *testing.T) {
+ 	for i, arg := range rc.Args {
+ 		if arg == "--model" && i+1 < len(rc.Args) {
+ 			model := rc.Args[i+1]
+-			if model == "sonnet" || model == "haiku" {
++			if model == "sonnet" || model == "sonnet[1m]" || model == "haiku" {
+ 				t.Errorf("ephemeral standard should not use stale budget model; got --model %s", model)
+ 			}
+ 		}
+diff --git a/internal/config/types.go b/internal/config/types.go
+index e8fe2e37..f7c39337 100644
+--- a/internal/config/types.go
++++ b/internal/config/types.go
+@@ -91,6 +91,13 @@ type TownSettings struct {
+ 	// Convoy configures convoy behavior settings.
+ 	Convoy *ConvoyConfig `json:"convoy,omitempty"`
+ 
++	// RoleEffort maps role names to effort levels for per-role effort configuration.
++	// Keys are role names: "mayor", "deacon", "witness", "refinery", "polecat", "crew", "boot", "dog".
++	// Values are effort levels: "low", "medium", "high", "max".
++	// Allows cost/speed optimization by using lower effort for simpler roles.
++	// Managed by cost-tier presets alongside RoleAgents.
++	RoleEffort map[string]string `json:"role_effort,omitempty"`
++
+ 	// CostTier tracks which cost tier preset was applied (informational).
+ 	// Actual model assignments live in RoleAgents and Agents.
+ 	// Values: "standard", "economy", "budget", or empty for custom configs.
+@@ -670,6 +677,12 @@ type RigSettings struct {
+ 	// Takes precedence over RoleAgents["crew"] but is overridden by explicit --agent flags.
+ 	// Example: {"denali": "codex", "glacier": "gemini"}
+ 	WorkerAgents map[string]string `json:"worker_agents,omitempty"`
++
++	// RoleEffort maps role names to effort levels, overriding TownSettings.RoleEffort for this rig.
++	// Keys are role names: "witness", "refinery", "polecat", "crew".
++	// Values are effort levels: "low", "medium", "high", "max".
++	// Example: {"crew": "max", "witness": "low"}
++	RoleEffort map[string]string `json:"role_effort,omitempty"`
+ }
+ 
+ // CrewConfig represents crew workspace settings for a rig.
+-- 
+2.43.0
+

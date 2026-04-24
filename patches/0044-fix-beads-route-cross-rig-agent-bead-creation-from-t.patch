@@ -1,0 +1,229 @@
+From 50584ced603cd9da716719effd759af60d46088a Mon Sep 17 00:00:00 2001
+From: Mark Kim <39310405+mk-imagine@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 20:26:31 +0000
+Subject: [PATCH 044/110] fix(beads): route cross-rig agent bead creation from
+ town root (#3520)
+
+Make FindTownRoot prefer the outermost town root so nested/imported rig
+layouts resolve correctly. Run routed CreateAgentBead calls from the
+town root to prevent double-stacking rig paths in BEADS_DIR.
+
+Adds test coverage for outermost town-root detection and a mock-bd
+regression test asserting routed CreateAgentBead executes from town root.
+
+Fixes PR #2972 (gt-u30t)
+
+Co-authored-by: cheedo <steve.yegge@gmail.com>
+Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ internal/beads/beads_agent.go      |  11 ++-
+ internal/beads/beads_agent_test.go | 117 +++++++++++++++++++++++++++++
+ internal/beads/beads_types.go      |   1 +
+ internal/beads/beads_types_test.go |  18 +++++
+ 4 files changed, 146 insertions(+), 1 deletion(-)
+
+diff --git a/internal/beads/beads_agent.go b/internal/beads/beads_agent.go
+index 3337b0be..00301246 100644
+--- a/internal/beads/beads_agent.go
++++ b/internal/beads/beads_agent.go
+@@ -218,6 +218,15 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue,
+ 	// Don't bail out — try the bd create calls anyway (GH#1769).
+ 	_ = EnsureCustomTypes(targetDir)
+ 
++	// For routed cross-rig bead IDs, run bd from the town root so bd's own
++	// prefix router resolves the target once. Running from a rig worktree with
++	// a routed BEADS_DIR can double-stack the path for imported rigs.
++	target := b
++	townRoot := b.getTownRoot()
++	if townRoot != "" && ExtractPrefix(id) != "" {
++		target = NewWithBeadsDir(townRoot, filepath.Join(townRoot, ".beads"))
++	}
++
+ 	description := FormatAgentDescription(title, fields)
+ 
+ 	buildArgs := func() []string {
+@@ -233,7 +242,7 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue,
+ 		}
+ 		// Default actor from BD_ACTOR env var for provenance tracking
+ 		// Uses getActor() to respect isolated mode (tests)
+-		if actor := b.getActor(); actor != "" {
++		if actor := target.getActor(); actor != "" {
+ 			a = append(a, "--actor="+actor)
+ 		}
+ 		return a
+diff --git a/internal/beads/beads_agent_test.go b/internal/beads/beads_agent_test.go
+index bc8159a1..54edc4be 100644
+--- a/internal/beads/beads_agent_test.go
++++ b/internal/beads/beads_agent_test.go
+@@ -1,6 +1,7 @@
+ package beads
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -346,3 +347,119 @@ func TestMergeAgentBeadSources(t *testing.T) {
+ 		}
+ 	})
+ }
++
++func installMockBDCreateRecorder(t *testing.T, logPath string) {
++	t.Helper()
++
++	binDir := t.TempDir()
++	if runtime.GOOS == "windows" {
++		t.Skip("cross-rig create recorder test not implemented on Windows")
++	}
++
++	script := `#!/bin/sh
++printf 'pwd=%s\n' "$(pwd)" >> "$MOCK_BD_LOG"
++printf 'beads_dir=%s\n' "$BEADS_DIR" >> "$MOCK_BD_LOG"
++printf 'args=%s\n' "$*" >> "$MOCK_BD_LOG"
++
++cmd=""
++for arg in "$@"; do
++  case "$arg" in
++    --*) ;;
++    *) cmd="$arg"; break ;;
++  esac
++done
++
++case "$cmd" in
++  create)
++    printf '{"id":"pt-imported-polecat-shiny","title":"shiny","status":"open"}\n'
++    exit 0
++    ;;
++  slot|config|migrate|init|show|update)
++    exit 0
++    ;;
++  *)
++    exit 0
++    ;;
++esac
++`
++	scriptPath := filepath.Join(binDir, "bd")
++	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
++		t.Fatalf("write mock bd: %v", err)
++	}
++
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	t.Setenv("MOCK_BD_LOG", logPath)
++}
++
++func TestCreateAgentBead_UsesTownRootForCrossRigRoutes(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("path assertions are Unix-oriented")
++	}
++
++	// Resolve symlinks so path assertions match shell pwd output.
++	// On macOS, t.TempDir() returns /var/... but pwd resolves to /private/var/...
++	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
++	for _, dir := range []string{
++		filepath.Join(townRoot, "mayor"),
++		filepath.Join(townRoot, ".beads"),
++		filepath.Join(townRoot, "imported", "mayor", "rig", ".beads"),
++	} {
++		if err := os.MkdirAll(dir, 0755); err != nil {
++			t.Fatalf("mkdir %s: %v", dir, err)
++		}
++	}
++	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{\"prefix\":\"pt-\",\"path\":\"imported/mayor/rig\"}\n"), 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	logPath := filepath.Join(townRoot, "bd.log")
++	installMockBDCreateRecorder(t, logPath)
++
++	workerDir := filepath.Join(townRoot, "imported", "mayor", "rig")
++	bd := NewWithBeadsDir(workerDir, filepath.Join(workerDir, ".beads"))
++
++	issue, err := bd.CreateAgentBead("pt-imported-polecat-shiny", "shiny", &AgentFields{
++		RoleType:   "polecat",
++		Rig:        "imported",
++		AgentState: "spawning",
++		HookBead:   "pt-task-1",
++	})
++	if err != nil {
++		t.Fatalf("CreateAgentBead: %v", err)
++	}
++	if issue == nil {
++		t.Fatal("CreateAgentBead returned nil issue")
++	}
++
++	logData, err := os.ReadFile(logPath)
++	if err != nil {
++		t.Fatalf("read mock bd log: %v", err)
++	}
++	logOutput := string(logData)
++	if !strings.Contains(logOutput, "pwd="+townRoot) {
++		t.Fatalf("mock bd log missing town root cwd:\n%s", logOutput)
++	}
++	if !strings.Contains(logOutput, "beads_dir="+filepath.Join(townRoot, ".beads")) {
++		t.Fatalf("mock bd log missing town-root BEADS_DIR:\n%s", logOutput)
++	}
++	if !strings.Contains(logOutput, "create --json --id=pt-imported-polecat-shiny") {
++		t.Fatalf("mock bd log missing create call:\n%s", logOutput)
++	}
++	if !strings.Contains(logOutput, "slot set pt-imported-polecat-shiny hook pt-task-1") {
++		t.Fatalf("mock bd log missing slot set call:\n%s", logOutput)
++	}
++}
++
++func TestCreateAgentBead_ParsesMockCreateOutput(t *testing.T) {
++	raw := []byte(`{"id":"pt-imported-polecat-shiny","title":"shiny","status":"open"}`)
++	var issue Issue
++	if err := json.Unmarshal(raw, &issue); err != nil {
++		t.Fatalf("json.Unmarshal: %v", err)
++	}
++	if issue.ID != "pt-imported-polecat-shiny" {
++		t.Fatalf("issue.ID = %q", issue.ID)
++	}
++}
+diff --git a/internal/beads/beads_types.go b/internal/beads/beads_types.go
+index a6cd706e..8842b48a 100644
+--- a/internal/beads/beads_types.go
++++ b/internal/beads/beads_types.go
+@@ -39,6 +39,7 @@ var (
+ // shadow the real town root above them.
+ // Returns empty string if not found (reached filesystem root).
+ func FindTownRoot(startDir string) string {
++	var found string
+ 	dir := startDir
+ 	candidate := ""
+ 	for {
+diff --git a/internal/beads/beads_types_test.go b/internal/beads/beads_types_test.go
+index 9185f055..05420ec9 100644
+--- a/internal/beads/beads_types_test.go
++++ b/internal/beads/beads_types_test.go
+@@ -177,6 +177,24 @@ func TestFindTownRoot(t *testing.T) {
+ 		{"nested rig dir prefers outermost", rigDir, tmpDir},
+ 	}
+ 
++	// Add nested town test case: inner town inside outer town
++	innerTown := filepath.Join(tmpDir, "imported", "gastown")
++	if err := os.MkdirAll(filepath.Join(innerTown, "mayor"), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(innerTown, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	innerDeepDir := filepath.Join(innerTown, "crew", "worker2")
++	if err := os.MkdirAll(innerDeepDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++	tests = append(tests, struct {
++		name     string
++		startDir string
++		expected string
++	}{"prefers outermost town root", innerDeepDir, tmpDir})
++
+ 	for _, tc := range tests {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			result := FindTownRoot(tc.startDir)
+-- 
+2.43.0
+

@@ -1,0 +1,695 @@
+From 2a173523131e17a6fc4202ede5fcae900bdf4782 Mon Sep 17 00:00:00 2001
+From: Pratham Bhatnagar <84272138+pratham-bhatnagar@users.noreply.github.com>
+Date: Mon, 13 Apr 2026 03:25:02 +0700
+Subject: [PATCH 034/110] feat(wasteland): read upstream config from
+ mayor/wasteland.json instead of hardcoding hop/wl-commons (#3501)
+
+Currently all wasteland read commands (browse, stamps, show, charsheet,
+scorekeeper) hardcode 'hop/wl-commons' as the upstream database. This
+makes it impossible to use a private wasteland with a different name.
+
+Changes:
+- wasteland.ResolveDBName() derives Dolt DB name from config ForkDB field
+- wl_browse, wl_stamps: check config local dir before clone-then-discard
+- wl_show: read upstream from config in fallback clone path
+- wl_charsheet, wl_scorekeeper: use NewWLCommonsWithDB with resolved name
+- wl_claim, wl_stamp, wl_done: use resolved DB name for existence check
+- QueryCSV/QueryJSON exported for server-side query execution
+- DB-parameterized helpers for QueryStampsForSubject, QueryBadges,
+  QueryAllSubjects, UpsertLeaderboard
+
+All changes are backward-compatible: when no wasteland config exists,
+the default hop/wl-commons behavior is preserved.
+
+Co-authored-by: Pratham's Agent <prathamonchain@gmail.com>
+---
+ internal/cmd/wl_browse.go           | 150 +++++++++++++++++++++++-----
+ internal/cmd/wl_charsheet.go        |   7 +-
+ internal/cmd/wl_claim.go            |   5 +-
+ internal/cmd/wl_done.go             |   5 +-
+ internal/cmd/wl_scorekeeper.go      |   8 +-
+ internal/cmd/wl_show.go             |  21 +++-
+ internal/cmd/wl_stamp.go            |   5 +-
+ internal/cmd/wl_stamps.go           | 100 +++++++++++++++++--
+ internal/doltserver/wl_charsheet.go |  24 ++++-
+ internal/doltserver/wl_commons.go   |  55 ++++++++--
+ internal/wasteland/wasteland.go     |  13 +++
+ 11 files changed, 337 insertions(+), 56 deletions(-)
+
+diff --git a/internal/cmd/wl_browse.go b/internal/cmd/wl_browse.go
+index ccf64a83..eb93c0ed 100644
+--- a/internal/cmd/wl_browse.go
++++ b/internal/cmd/wl_browse.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/spf13/cobra"
+ 	"github.com/steveyegge/gastown/internal/doltserver"
+ 	"github.com/steveyegge/gastown/internal/style"
++	"github.com/steveyegge/gastown/internal/wasteland"
+ 	"github.com/steveyegge/gastown/internal/workspace"
+ )
+ 
+@@ -27,10 +28,10 @@ var wlBrowseCmd = &cobra.Command{
+ 	Short: "Browse wanted items on the commons board",
+ 	Args:  cobra.NoArgs,
+ 	RunE:  runWLBrowse,
+-	Long: `Browse the Wasteland wanted board (hop/wl-commons).
++	Long: `Browse the Wasteland wanted board.
+ 
+-Uses the clone-then-discard pattern: clones the commons database to a
+-temporary directory, queries it, then deletes the clone.
++Uses the local fork if available (set by gt wl join), otherwise falls back
++to cloning the upstream commons temporarily.
+ 
+ EXAMPLES:
+   gt wl browse                          # All open wanted items
+@@ -54,39 +55,78 @@ func init() {
+ }
+ 
+ func runWLBrowse(cmd *cobra.Command, args []string) error {
+-	if _, err := workspace.FindFromCwdOrError(); err != nil {
++	townRoot, err := workspace.FindFromCwdOrError()
++	if err != nil {
+ 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+ 	}
+ 
+-	doltPath, err := exec.LookPath("dolt")
+-	if err != nil {
+-		return fmt.Errorf("dolt not found in PATH — install from https://docs.dolthub.com/introduction/installation")
+-	}
++	// Fast path: query through the Dolt server if the database is registered.
++	dbName := wasteland.ResolveDBName(townRoot)
++	if doltserver.DatabaseExists(townRoot, dbName) {
++		query := buildBrowseQuery(BrowseFilter{
++			Status:   wlBrowseStatus,
++			Project:  wlBrowseProject,
++			Type:     wlBrowseType,
++			Priority: wlBrowsePriority,
++			Limit:    wlBrowseLimit,
++		})
++		serverQuery := fmt.Sprintf("USE %s; %s", dbName, query)
++
++		if wlBrowseJSON {
++			output, err := doltserver.QueryJSON(townRoot, serverQuery)
++			if err != nil {
++				return err
++			}
++			fmt.Print(output)
++			return nil
++		}
+ 
+-	tmpDir, err := os.MkdirTemp("", "wl-browse-*")
+-	if err != nil {
+-		return fmt.Errorf("creating temp directory: %w", err)
+-	}
+-	defer os.RemoveAll(tmpDir)
++		output, err := doltserver.QueryCSV(townRoot, serverQuery)
++		if err != nil {
++			return err
++		}
++		rows := wlParseCSV(output)
++		if len(rows) <= 1 {
++			fmt.Println("No wanted items found matching your filters.")
++			return nil
++		}
+ 
+-	commonsOrg := "hop"
+-	commonsDB := "wl-commons"
+-	cloneDir := filepath.Join(tmpDir, commonsDB)
++		tbl := style.NewTable(
++			style.Column{Name: "ID", Width: 12},
++			style.Column{Name: "TITLE", Width: 40},
++			style.Column{Name: "PROJECT", Width: 12},
++			style.Column{Name: "TYPE", Width: 10},
++			style.Column{Name: "PRI", Width: 4, Align: style.AlignRight},
++			style.Column{Name: "POSTED BY", Width: 16},
++			style.Column{Name: "STATUS", Width: 10},
++			style.Column{Name: "EFFORT", Width: 8},
++		)
++
++		for _, row := range rows[1:] {
++			if len(row) < 8 {
++				continue
++			}
++			pri := wlFormatPriority(row[4])
++			tbl.AddRow(row[0], row[1], row[2], row[3], pri, row[5], row[6], row[7])
++		}
+ 
+-	remote := fmt.Sprintf("%s/%s", commonsOrg, commonsDB)
+-	if !wlBrowseJSON {
+-		fmt.Printf("Cloning %s...\n", style.Bold.Render(remote))
++		fmt.Printf("Wanted items (%d):\n\n", len(rows)-1)
++		fmt.Print(tbl.Render())
++		return nil
+ 	}
+ 
+-	cloneCmd := exec.Command(doltPath, "clone", remote, cloneDir)
+-	if !wlBrowseJSON {
+-		cloneCmd.Stderr = os.Stderr
++	// Fallback: read from local filesystem clone.
++	doltPath, err := exec.LookPath("dolt")
++	if err != nil {
++		return fmt.Errorf("dolt not found in PATH — install from https://docs.dolthub.com/introduction/installation")
+ 	}
+-	if err := cloneCmd.Run(); err != nil {
+-		return fmt.Errorf("cloning %s: %w\nEnsure the database exists on DoltHub: https://www.dolthub.com/%s", remote, err, remote)
++
++	cloneDir, tmpDir, err := resolveWLCommonsBrowse(townRoot, doltPath)
++	if err != nil {
++		return err
+ 	}
+-	if !wlBrowseJSON {
+-		fmt.Printf("%s Cloned successfully\n\n", style.Bold.Render("✓"))
++	if tmpDir != "" {
++		defer os.RemoveAll(tmpDir)
+ 	}
+ 
+ 	query := buildBrowseQuery(BrowseFilter{
+@@ -108,6 +148,64 @@ func runWLBrowse(cmd *cobra.Command, args []string) error {
+ 	return renderWLBrowseTable(doltPath, cloneDir, query)
+ }
+ 
++// resolveWLCommonsBrowse finds the local wl-commons clone directory for browsing.
++// Returns (cloneDir, tmpDir, err). If tmpDir is non-empty, caller must
++// defer os.RemoveAll(tmpDir) — a temporary clone was created.
++func resolveWLCommonsBrowse(townRoot, doltPath string) (cloneDir, tmpDir string, err error) {
++	// Try wasteland config (set by gt wl join).
++	if cfg, cfgErr := wasteland.LoadConfig(townRoot); cfgErr == nil && cfg.LocalDir != "" {
++		if _, statErr := os.Stat(filepath.Join(cfg.LocalDir, ".dolt")); statErr == nil {
++			return cfg.LocalDir, "", nil
++		}
++	}
++
++	// Try standard location: .wasteland/hop/wl-commons.
++	stdPath := wasteland.LocalCloneDir(townRoot, "hop", "wl-commons")
++	if _, statErr := os.Stat(filepath.Join(stdPath, ".dolt")); statErr == nil {
++		return stdPath, "", nil
++	}
++
++	// Try common fallback locations.
++	if forkDir := findWLCommonsFork(townRoot); forkDir != "" {
++		return forkDir, "", nil
++	}
++
++	// No local clone — do a one-time clone-then-discard.
++	// Read upstream from config, or default to hop/wl-commons.
++	commonsOrg := "hop"
++	commonsDB := "wl-commons"
++	if cfg, cfgErr := wasteland.LoadConfig(townRoot); cfgErr == nil && cfg.Upstream != "" {
++		if o, d, parseErr := wasteland.ParseUpstream(cfg.Upstream); parseErr == nil {
++			commonsOrg = o
++			commonsDB = d
++		}
++	}
++
++	tmpDir, err = os.MkdirTemp("", "wl-browse-*")
++	if err != nil {
++		return "", "", fmt.Errorf("creating temp directory: %w", err)
++	}
++
++	cloneDir = filepath.Join(tmpDir, commonsDB)
++	remote := fmt.Sprintf("%s/%s", commonsOrg, commonsDB)
++	if !wlBrowseJSON {
++		fmt.Printf("Cloning %s...\n", style.Bold.Render(remote))
++	}
++
++	cloneCmd := exec.Command(doltPath, "clone", remote, cloneDir)
++	if !wlBrowseJSON {
++		cloneCmd.Stderr = os.Stderr
++	}
++	if cloneErr := cloneCmd.Run(); cloneErr != nil {
++		os.RemoveAll(tmpDir)
++		return "", "", fmt.Errorf("cloning %s: %w\nEnsure the database exists on DoltHub: https://www.dolthub.com/%s", remote, cloneErr, remote)
++	}
++	if !wlBrowseJSON {
++		fmt.Printf("%s Cloned successfully\n\n", style.Bold.Render("✓"))
++	}
++	return cloneDir, tmpDir, nil
++}
++
+ // BrowseFilter holds filter parameters for building a browse query.
+ type BrowseFilter struct {
+ 	Status   string
+diff --git a/internal/cmd/wl_charsheet.go b/internal/cmd/wl_charsheet.go
+index eaf5a79d..991cabb9 100644
+--- a/internal/cmd/wl_charsheet.go
++++ b/internal/cmd/wl_charsheet.go
+@@ -54,11 +54,12 @@ func runWlCharsheet(cmd *cobra.Command, args []string) error {
+ 		handle = wlCfg.RigHandle
+ 	}
+ 
+-	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
+-		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
++	dbName := wasteland.ResolveDBName(townRoot)
++	if !doltserver.DatabaseExists(townRoot, dbName) {
++		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
+ 	}
+ 
+-	store := doltserver.NewWLCommons(townRoot)
++	store := doltserver.NewWLCommonsWithDB(townRoot, dbName)
+ 	sheet, err := doltserver.AssembleCharacterSheet(store, handle)
+ 	if err != nil {
+ 		return fmt.Errorf("assembling character sheet: %w", err)
+diff --git a/internal/cmd/wl_claim.go b/internal/cmd/wl_claim.go
+index ba6a3980..1c9f410f 100644
+--- a/internal/cmd/wl_claim.go
++++ b/internal/cmd/wl_claim.go
+@@ -47,11 +47,12 @@ func runWlClaim(cmd *cobra.Command, args []string) error {
+ 	}
+ 	rigHandle := wlCfg.RigHandle
+ 
++	dbName := wasteland.ResolveDBName(townRoot)
+ 	var item *doltserver.WantedItem
+-	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
++	if !doltserver.DatabaseExists(townRoot, dbName) {
+ 		// Fallback for wl-commons clone-based workspaces (join creates .wasteland clone).
+ 		if wlCfg.LocalDir == "" {
+-			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
++			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
+ 		}
+ 		if err := claimWantedInLocalClone(wlCfg.LocalDir, wantedID, rigHandle); err != nil {
+ 			return err
+diff --git a/internal/cmd/wl_done.go b/internal/cmd/wl_done.go
+index bb7eafd3..b1a7fd50 100644
+--- a/internal/cmd/wl_done.go
++++ b/internal/cmd/wl_done.go
+@@ -59,10 +59,11 @@ func runWlDone(cmd *cobra.Command, args []string) error {
+ 
+ 	completionID := generateCompletionID(wantedID, rigHandle)
+ 
+-	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
++	dbName := wasteland.ResolveDBName(townRoot)
++	if !doltserver.DatabaseExists(townRoot, dbName) {
+ 		// Fallback for wl-commons clone-based workspaces (join creates .wasteland clone).
+ 		if wlCfg.LocalDir == "" {
+-			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
++			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
+ 		}
+ 		if err := submitDoneInLocalClone(wlCfg.LocalDir, wantedID, rigHandle, wlDoneEvidence, completionID); err != nil {
+ 			return err
+diff --git a/internal/cmd/wl_scorekeeper.go b/internal/cmd/wl_scorekeeper.go
+index 79a87f36..39128480 100644
+--- a/internal/cmd/wl_scorekeeper.go
++++ b/internal/cmd/wl_scorekeeper.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/spf13/cobra"
+ 	"github.com/steveyegge/gastown/internal/doltserver"
+ 	"github.com/steveyegge/gastown/internal/style"
++	"github.com/steveyegge/gastown/internal/wasteland"
+ 	"github.com/steveyegge/gastown/internal/workspace"
+ )
+ 
+@@ -49,11 +50,12 @@ func runWlScorekeeper(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+ 	}
+ 
+-	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
+-		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
++	dbName := wasteland.ResolveDBName(townRoot)
++	if !doltserver.DatabaseExists(townRoot, dbName) {
++		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
+ 	}
+ 
+-	store := doltserver.NewWLCommons(townRoot)
++	store := doltserver.NewWLCommonsWithDB(townRoot, dbName)
+ 	return runScorekeeperWithStore(store)
+ }
+ 
+diff --git a/internal/cmd/wl_show.go b/internal/cmd/wl_show.go
+index ef59a915..922864a0 100644
+--- a/internal/cmd/wl_show.go
++++ b/internal/cmd/wl_show.go
+@@ -47,6 +47,14 @@ func runWLShow(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+ 	}
+ 
++	// Fast path: query through the Dolt server if the database is registered.
++	dbName := wasteland.ResolveDBName(townRoot)
++	if doltserver.DatabaseExists(townRoot, dbName) {
++		store := doltserver.NewWLCommonsWithDB(townRoot, dbName)
++		return showWanted(store, wantedID, wlShowJSON)
++	}
++
++	// Fallback: read from local filesystem clone.
+ 	doltPath, err := exec.LookPath("dolt")
+ 	if err != nil {
+ 		return fmt.Errorf("dolt not found in PATH — install from https://docs.dolthub.com/introduction/installation")
+@@ -103,13 +111,22 @@ func resolveWLCommonsClone(townRoot, doltPath string) (cloneDir, tmpDir string,
+ 	}
+ 
+ 	// No local clone — do a one-time clone-then-discard, like browse.
++	// Read upstream from config, or default to hop/wl-commons.
++	remote := "hop/wl-commons"
++	if cfg, cfgErr := wasteland.LoadConfig(townRoot); cfgErr == nil && cfg.Upstream != "" {
++		remote = cfg.Upstream
++	}
+ 	fmt.Fprintf(os.Stderr, "No local wl-commons clone found. Cloning temporarily.\nRun 'gt wl sync' to keep a persistent local copy.\n\n")
+ 	tmpDir, err = os.MkdirTemp("", "wl-show-*")
+ 	if err != nil {
+ 		return "", "", fmt.Errorf("creating temp directory: %w", err)
+ 	}
+-	remote := "hop/wl-commons"
+-	cloneDir = filepath.Join(tmpDir, "wl-commons")
++	parts := strings.SplitN(remote, "/", 2)
++	dbName := "wl-commons"
++	if len(parts) == 2 {
++		dbName = parts[1]
++	}
++	cloneDir = filepath.Join(tmpDir, dbName)
+ 	fmt.Printf("Cloning %s...\n", style.Bold.Render(remote))
+ 	cloneCmd := exec.Command(doltPath, "clone", remote, cloneDir)
+ 	cloneCmd.Stderr = os.Stderr
+diff --git a/internal/cmd/wl_stamp.go b/internal/cmd/wl_stamp.go
+index a7faa88f..df52aeae 100644
+--- a/internal/cmd/wl_stamp.go
++++ b/internal/cmd/wl_stamp.go
+@@ -134,9 +134,10 @@ func runWlStamp(cmd *cobra.Command, args []string) error {
+ 		StampIndex:  -1, // will be computed below
+ 	}
+ 
+-	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
++	dbName := wasteland.ResolveDBName(townRoot)
++	if !doltserver.DatabaseExists(townRoot, dbName) {
+ 		if wlCfg.LocalDir == "" {
+-			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
++			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
+ 		}
+ 		return insertStampInLocalClone(wlCfg.LocalDir, stamp)
+ 	}
+diff --git a/internal/cmd/wl_stamps.go b/internal/cmd/wl_stamps.go
+index 895089c1..0393cc68 100644
+--- a/internal/cmd/wl_stamps.go
++++ b/internal/cmd/wl_stamps.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/spf13/cobra"
+ 	"github.com/steveyegge/gastown/internal/doltserver"
+ 	"github.com/steveyegge/gastown/internal/style"
++	"github.com/steveyegge/gastown/internal/wasteland"
+ 	"github.com/steveyegge/gastown/internal/workspace"
+ )
+ 
+@@ -115,25 +116,112 @@ func runWLStamps(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+ 	}
+ 
++	// Fast path: query through the Dolt server if the database is registered.
++	dbName := wasteland.ResolveDBName(townRoot)
++	if doltserver.DatabaseExists(townRoot, dbName) {
++		query := buildStampsQuery(StampsFilter{
++			Subject:     wlStampsRig,
++			Author:      wlStampsAuthor,
++			Skill:       wlStampsSkill,
++			ContextType: wlStampsContextType,
++			StampType:   wlStampsStampType,
++			PilotCohort: wlStampsCohort,
++			Severity:    wlStampsSeverity,
++			Limit:       wlStampsLimit,
++		})
++		serverQuery := fmt.Sprintf("USE %s; %s", dbName, query)
++
++		if wlStampsJSON {
++			output, err := doltserver.QueryJSON(townRoot, serverQuery)
++			if err != nil {
++				return err
++			}
++			fmt.Print(output)
++			return nil
++		}
++
++		// Use JSON output for richer parsing (valence, skill_tags are JSON).
++		output, err := doltserver.QueryJSON(townRoot, serverQuery)
++		if err != nil {
++			return err
++		}
++
++		var result struct {
++			Rows []map[string]interface{} `json:"rows"`
++		}
++		if err := json.Unmarshal([]byte(output), &result); err != nil {
++			return fmt.Errorf("parsing response: %w", err)
++		}
++
++		if len(result.Rows) == 0 {
++			fmt.Printf("No stamps found for rig %q.\n", wlStampsRig)
++			return nil
++		}
++
++		tbl := style.NewTable(
++			style.Column{Name: "ID", Width: 16},
++			style.Column{Name: "AUTHOR", Width: 20},
++			style.Column{Name: "VALENCE", Width: 28},
++			style.Column{Name: "CONF", Width: 5, Align: style.AlignRight},
++			style.Column{Name: "SEVERITY", Width: 8},
++			style.Column{Name: "TYPE", Width: 14},
++			style.Column{Name: "SKILLS", Width: 18},
++			style.Column{Name: "DATE", Width: 10},
++		)
++
++		for _, row := range result.Rows {
++			id := getString(row, "id")
++			author := getString(row, "author")
++			valence := formatValence(row["valence"])
++			conf := getString(row, "confidence")
++			severity := getString(row, "severity")
++			ctxType := getString(row, "context_type")
++			skills := formatSkillTags(row["skill_tags"])
++			date := formatStampDate(getString(row, "created_at"))
++			tbl.AddRow(id, author, valence, conf, severity, ctxType, skills, date)
++		}
++
++		fmt.Printf("Stamps for %s (%d):\n\n", style.Bold.Render(wlStampsRig), len(result.Rows))
++		fmt.Print(tbl.Render())
++		return nil
++	}
++
++	// Fallback: read from local filesystem clone.
+ 	doltPath, err := exec.LookPath("dolt")
+ 	if err != nil {
+ 		return fmt.Errorf("dolt not found in PATH — install from https://docs.dolthub.com/introduction/installation")
+ 	}
+ 
+-	// Try local fork first (fast path)
+-	forkDir := findWLCommonsFork(townRoot)
+-	cloneDir := forkDir
++	// Try wasteland config first (set by gt wl join).
++	var cloneDir string
++	if cfg, cfgErr := wasteland.LoadConfig(townRoot); cfgErr == nil && cfg.LocalDir != "" {
++		if _, statErr := os.Stat(filepath.Join(cfg.LocalDir, ".dolt")); statErr == nil {
++			cloneDir = cfg.LocalDir
++		}
++	}
++
++	// Try local fork (fast path)
++	if cloneDir == "" {
++		cloneDir = findWLCommonsFork(townRoot)
++	}
+ 
+-	// No local fork — clone fresh
++	// No local fork — clone fresh from config upstream or default
+ 	if cloneDir == "" {
++		commonsOrg := "hop"
++		commonsDB := "wl-commons"
++		if cfg, cfgErr := wasteland.LoadConfig(townRoot); cfgErr == nil && cfg.Upstream != "" {
++			if o, d, parseErr := wasteland.ParseUpstream(cfg.Upstream); parseErr == nil {
++				commonsOrg = o
++				commonsDB = d
++			}
++		}
++
+ 		tmpDir, tmpErr := os.MkdirTemp("", "wl-stamps-*")
+ 		if tmpErr != nil {
+ 			return fmt.Errorf("creating temp directory: %w", tmpErr)
+ 		}
+ 		defer os.RemoveAll(tmpDir)
+ 
+-		commonsOrg := "hop"
+-		commonsDB := "wl-commons"
+ 		cloneDir = filepath.Join(tmpDir, commonsDB)
+ 		remote := fmt.Sprintf("%s/%s", commonsOrg, commonsDB)
+ 
+diff --git a/internal/doltserver/wl_charsheet.go b/internal/doltserver/wl_charsheet.go
+index 6e29e3e5..cf4c6893 100644
+--- a/internal/doltserver/wl_charsheet.go
++++ b/internal/doltserver/wl_charsheet.go
+@@ -356,8 +356,12 @@ func parseSkillTagsJSON(skillTags string) []string {
+ 
+ // QueryStampsForSubject fetches all stamps where the given handle is the subject.
+ func QueryStampsForSubject(townRoot, subject string) ([]StampRecord, error) {
++	return queryStampsForSubjectDB(townRoot, WLCommonsDB, subject)
++}
++
++func queryStampsForSubjectDB(townRoot, dbName, subject string) ([]StampRecord, error) {
+ 	query := fmt.Sprintf(`USE %s; SELECT id, author, subject, valence, confidence, severity, COALESCE(context_id,'') as context_id, COALESCE(context_type,'') as context_type, COALESCE(stamp_type,'') as stamp_type, COALESCE(skill_tags,'') as skill_tags, COALESCE(message,'') as message, COALESCE(prev_stamp_hash,'') as prev_stamp_hash, COALESCE(stamp_index,-1) as stamp_index, COALESCE(created_at,'') as created_at FROM stamps WHERE subject='%s' ORDER BY created_at DESC;`,
+-		WLCommonsDB, EscapeSQL(subject))
++		dbName, EscapeSQL(subject))
+ 
+ 	output, err := doltSQLQuery(townRoot, query)
+ 	if err != nil {
+@@ -398,8 +402,12 @@ func QueryStampsForSubject(townRoot, subject string) ([]StampRecord, error) {
+ 
+ // QueryBadges fetches all badges for a rig handle.
+ func QueryBadges(townRoot, handle string) ([]BadgeRecord, error) {
++	return queryBadgesDB(townRoot, WLCommonsDB, handle)
++}
++
++func queryBadgesDB(townRoot, dbName, handle string) ([]BadgeRecord, error) {
+ 	query := fmt.Sprintf(`USE %s; SELECT id, badge_type, COALESCE(awarded_at,'') as awarded_at, COALESCE(evidence,'') as evidence FROM badges WHERE rig_handle='%s' ORDER BY awarded_at ASC;`,
+-		WLCommonsDB, EscapeSQL(handle))
++		dbName, EscapeSQL(handle))
+ 
+ 	output, err := doltSQLQuery(townRoot, query)
+ 	if err != nil {
+@@ -425,7 +433,11 @@ func QueryBadges(townRoot, handle string) ([]BadgeRecord, error) {
+ 
+ // QueryAllSubjects returns all distinct subject handles from the stamps table.
+ func QueryAllSubjects(townRoot string) ([]string, error) {
+-	query := fmt.Sprintf(`USE %s; SELECT DISTINCT subject FROM stamps ORDER BY subject;`, WLCommonsDB)
++	return queryAllSubjectsDB(townRoot, WLCommonsDB)
++}
++
++func queryAllSubjectsDB(townRoot, dbName string) ([]string, error) {
++	query := fmt.Sprintf(`USE %s; SELECT DISTINCT subject FROM stamps ORDER BY subject;`, dbName)
+ 	output, err := doltSQLQuery(townRoot, query)
+ 	if err != nil {
+ 		return nil, err
+@@ -442,6 +454,10 @@ func QueryAllSubjects(townRoot string) ([]string, error) {
+ 
+ // UpsertLeaderboard inserts or updates a leaderboard entry.
+ func UpsertLeaderboard(townRoot string, entry *LeaderboardEntry) error {
++	return upsertLeaderboardDB(townRoot, WLCommonsDB, entry)
++}
++
++func upsertLeaderboardDB(townRoot, dbName string, entry *LeaderboardEntry) error {
+ 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+ 
+ 	displayName := "NULL"
+@@ -461,7 +477,7 @@ func UpsertLeaderboard(townRoot string, entry *LeaderboardEntry) error {
+ REPLACE INTO leaderboard (handle, display_name, tier, stamp_count, avg_quality, cluster_breadth, top_skills, badges, computed_at)
+ VALUES ('%s', %s, '%s', %d, %f, %d, %s, %s, '%s');
+ `,
+-		WLCommonsDB,
++		dbName,
+ 		EscapeSQL(entry.Handle), displayName, EscapeSQL(entry.Tier),
+ 		entry.StampCount, entry.AvgQuality, entry.ClusterBreadth,
+ 		topSkills, badges, now)
+diff --git a/internal/doltserver/wl_commons.go b/internal/doltserver/wl_commons.go
+index 27868025..c1effd88 100644
+--- a/internal/doltserver/wl_commons.go
++++ b/internal/doltserver/wl_commons.go
+@@ -20,6 +20,9 @@ import (
+ // WLCommonsDB is the database name for the wl-commons shared wanted board.
+ const WLCommonsDB = "wl_commons"
+ 
++// DefaultWLDBName is the fallback database name used when no wasteland config exists.
++var DefaultWLDBName = WLCommonsDB
++
+ // WLCommonsStore abstracts wl-commons database operations.
+ type WLCommonsStore interface {
+ 	EnsureDB() error
+@@ -38,10 +41,31 @@ type WLCommonsStore interface {
+ }
+ 
+ // WLCommons implements WLCommonsStore using the real Dolt server.
+-type WLCommons struct{ townRoot string }
++type WLCommons struct {
++	townRoot string
++	dbName   string // Dolt database name; defaults to WLCommonsDB if empty.
++}
+ 
+ // NewWLCommons creates a WLCommonsStore backed by the real Dolt server.
+-func NewWLCommons(townRoot string) *WLCommons { return &WLCommons{townRoot: townRoot} }
++func NewWLCommons(townRoot string) *WLCommons {
++	return &WLCommons{townRoot: townRoot, dbName: WLCommonsDB}
++}
++
++// NewWLCommonsWithDB creates a WLCommonsStore using the specified database name.
++func NewWLCommonsWithDB(townRoot, dbName string) *WLCommons {
++	if dbName == "" {
++		dbName = WLCommonsDB
++	}
++	return &WLCommons{townRoot: townRoot, dbName: dbName}
++}
++
++// DBName returns the Dolt database name for this store.
++func (w *WLCommons) DBName() string {
++	if w.dbName == "" {
++		return WLCommonsDB
++	}
++	return w.dbName
++}
+ 
+ func (w *WLCommons) EnsureDB() error           { return EnsureWLCommons(w.townRoot) }
+ func (w *WLCommons) DatabaseExists(db string) bool { return DatabaseExists(w.townRoot, db) }
+@@ -65,16 +89,16 @@ func (w *WLCommons) QueryLastStampForSubject(subject string) (*StampRecord, erro
+ 	return QueryLastStampForSubject(w.townRoot, subject)
+ }
+ func (w *WLCommons) QueryStampsForSubject(subject string) ([]StampRecord, error) {
+-	return QueryStampsForSubject(w.townRoot, subject)
++	return queryStampsForSubjectDB(w.townRoot, w.DBName(), subject)
+ }
+ func (w *WLCommons) QueryBadges(handle string) ([]BadgeRecord, error) {
+-	return QueryBadges(w.townRoot, handle)
++	return queryBadgesDB(w.townRoot, w.DBName(), handle)
+ }
+ func (w *WLCommons) QueryAllSubjects() ([]string, error) {
+-	return QueryAllSubjects(w.townRoot)
++	return queryAllSubjectsDB(w.townRoot, w.DBName())
+ }
+ func (w *WLCommons) UpsertLeaderboard(entry *LeaderboardEntry) error {
+-	return UpsertLeaderboard(w.townRoot, entry)
++	return upsertLeaderboardDB(w.townRoot, w.DBName(), entry)
+ }
+ 
+ // WantedItem represents a row in the wanted table.
+@@ -481,6 +505,25 @@ func doltSQLQuery(townRoot, query string) (string, error) {
+ 	return string(output), nil
+ }
+ 
++// QueryCSV executes a SQL query against the Dolt server and returns raw CSV output.
++// This is a convenience wrapper for commands that need server-side query execution.
++func QueryCSV(townRoot, query string) (string, error) {
++	return doltSQLQuery(townRoot, query)
++}
++
++// QueryJSON executes a SQL query against the Dolt server and returns JSON output.
++func QueryJSON(townRoot, query string) (string, error) {
++	config := DefaultConfig(townRoot)
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	cmd := buildDoltSQLCmd(ctx, config, "-r", "json", "-q", query)
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("dolt sql query failed: %w (%s)", err, strings.TrimSpace(string(output)))
++	}
++	return string(output), nil
++}
++
+ // parseSimpleCSV parses CSV output from dolt sql into a slice of maps.
+ // Handles quoted fields containing commas and escaped quotes.
+ func parseSimpleCSV(data string) []map[string]string {
+diff --git a/internal/wasteland/wasteland.go b/internal/wasteland/wasteland.go
+index e5195a4d..1e855e70 100644
+--- a/internal/wasteland/wasteland.go
++++ b/internal/wasteland/wasteland.go
+@@ -264,6 +264,19 @@ func LocalCloneDir(townRoot, upstreamOrg, upstreamDB string) string {
+ 	return filepath.Join(WastelandDir(townRoot), upstreamOrg, upstreamDB)
+ }
+ 
++// ResolveDBName returns the Dolt database name for the wasteland.
++// It derives the name from the config's ForkDB field (replacing hyphens with
++// underscores, since Dolt maps database directory names that way).
++// Falls back to "wl_commons" if no config is found.
++func ResolveDBName(townRoot string) string {
++	cfg, err := LoadConfig(townRoot)
++	if err != nil || cfg.ForkDB == "" {
++		return "wl_commons"
++	}
++	// Dolt maps directory names to database names by replacing hyphens with underscores.
++	return strings.ReplaceAll(cfg.ForkDB, "-", "_")
++}
++
+ // escapeSQLString escapes backslashes and single quotes for SQL string literals.
+ func escapeSQLString(s string) string {
+ 	s = strings.ReplaceAll(s, `\`, `\\`)
+-- 
+2.43.0
+

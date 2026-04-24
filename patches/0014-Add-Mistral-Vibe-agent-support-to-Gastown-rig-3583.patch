@@ -1,0 +1,127 @@
+From 3a45414d8cd7e1d2b74c44622de0715949b5e983 Mon Sep 17 00:00:00 2001
+From: Vesa Kaihlavirta <vegai@kapsi.fi>
+Date: Sun, 12 Apr 2026 23:23:40 +0300
+Subject: [PATCH 014/110] Add Mistral Vibe agent support to Gastown rig (#3583)
+
+* feat(agents): add Mistral Vibe agent support
+
+Executed-By: mayor
+
+* feat(vibe): add Mistral Vibe agent templates
+
+Add the vibe agent configuration template and update .gitignore to track it.
+This completes the Mistral Vibe agent support by providing the necessary
+hooks template for autonomous operation.
+
+Executed-By: mayor
+
+* Set auto-approve as agent parameter, not as config.toml setting
+---
+ .gitignore                                |  1 +
+ internal/config/agents.go                 | 26 ++++++++++++++++
+ internal/hooks/templates/vibe/config.toml | 37 +++++++++++++++++++++++
+ 3 files changed, 64 insertions(+)
+ create mode 100644 internal/hooks/templates/vibe/config.toml
+
+diff --git a/.gitignore b/.gitignore
+index 628574b6..dba2214c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,6 +32,7 @@ internal/events/*/
+ # Local config
+ config.toml
+ !config.example.toml
++!internal/hooks/templates/vibe/config.toml
+ gt
+ 
+ # Runtime state (ignore contents, but allow setup-hooks to be tracked)
+diff --git a/internal/config/agents.go b/internal/config/agents.go
+index 65443e8e..1f7e2e34 100644
+--- a/internal/config/agents.go
++++ b/internal/config/agents.go
+@@ -36,6 +36,8 @@ const (
+ 	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
+ 	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
+ 	AgentOmp AgentPreset = "omp"
++	// AgentMistral is Mistral Vibe CLI.
++	AgentMistral AgentPreset = "vibe"
+ )
+ 
+ // AgentPresetInfo contains the configuration details for an agent preset.
+@@ -427,6 +429,30 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
+ 			PromptFlag: "--prompt",
+ 		},
+ 	},
++	AgentMistral: {
++		Name:                AgentMistral,
++		Command:             "vibe",
++		Args:                []string{"--agent", "auto-approve"},
++		ProcessNames:        []string{"vibe"},
++		SessionIDEnv:        "VIBE_SESSION_ID",
++		ResumeFlag:          "--resume",
++		ContinueFlag:        "--continue",
++		ResumeStyle:         "flag",
++		SupportsHooks:       true,
++		SupportsForkSession: false,
++		NonInteractive: &NonInteractiveConfig{
++			PromptFlag: "-p",
++			OutputFlag: "json",
++		},
++		PromptMode:        "arg",
++		ConfigDir:         ".vibe",
++		HooksProvider:     "vibe",
++		HooksDir:          ".vibe",
++		HooksSettingsFile: "config.toml",
++		ReadyPromptPrefix: "❯ ",
++		ReadyDelayMs:      5000,
++		InstructionsFile:  "AGENTS.md",
++	},
+ }
+ 
+ // Registry state with proper synchronization.
+diff --git a/internal/hooks/templates/vibe/config.toml b/internal/hooks/templates/vibe/config.toml
+new file mode 100644
+index 00000000..22f9a557
+--- /dev/null
++++ b/internal/hooks/templates/vibe/config.toml
+@@ -0,0 +1,37 @@
++# Gas Town Vibe Configuration
++# Provisioned by Gas Town for agent integration
++
++# Model configuration
++active_model = "devstral-2"
++
++# Trust the current project directory
++# (Vibe will not ask about trusting this directory)
++
++# Session logging for resume capability
++enable_session_logs = true
++log_dir = ".vibe/logs"
++
++# Tools configuration - enable all tools for autonomous operation
++[tools.bash]
++permission = "always"
++
++[tools.read_file]
++permission = "always"
++
++[tools.write_file]
++permission = "always"
++
++[tools.search_replace]
++permission = "always"
++
++[tools.grep]
++permission = "always"
++
++[tools.glob]
++permission = "always"
++
++[tools.task]
++permission = "always"
++
++[tools.ask_user_question]
++permission = "always"
+-- 
+2.43.0
+

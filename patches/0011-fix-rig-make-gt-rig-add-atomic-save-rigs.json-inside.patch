@@ -1,0 +1,89 @@
+From deb1751fff7bc8aaab0f0dbb257f1b83564d9e32 Mon Sep 17 00:00:00 2001
+From: benjamindovinh <80008120+benjamindovinh@users.noreply.github.com>
+Date: Sun, 12 Apr 2026 13:23:06 -0700
+Subject: [PATCH 011/110] =?UTF-8?q?fix(rig):=20make=20gt=20rig=20add=20ato?=
+ =?UTF-8?q?mic=20=E2=80=94=20save=20rigs.json=20inside=20AddRig=20before?=
+ =?UTF-8?q?=20cleanup=20defer=20exits=20(#3543)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously, AddRig created the rig directory and all scaffolding, then returned
+to runRigAdd which called SaveRigsConfig separately. If the process was killed
+or SaveRigsConfig failed between these steps, the rig directory would exist but
+not be registered in rigs.json, leaving the workspace in a broken partial state.
+
+Fix: move SaveRigsConfig into AddRig, just before setting success=true. The
+existing cleanup defer (os.RemoveAll) only runs when success=false, so if the
+save fails the directory is cleaned up. If the save succeeds, success=true and
+the directory is kept — both actions either complete or both are rolled back.
+
+Remove the now-redundant SaveRigsConfig call from runRigAdd and update the
+TestRigAddUpdatesRigsJson test to reflect that AddRig handles persistence.
+
+Fixes hq-2l3
+
+Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ internal/cmd/rig.go                  |  6 +-----
+ internal/cmd/rig_integration_test.go |  5 +----
+ internal/rig/manager.go              | 10 ++++++++++
+ 3 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/internal/cmd/rig.go b/internal/cmd/rig.go
+index a9b46836..5ad994a9 100644
+--- a/internal/cmd/rig.go
++++ b/internal/cmd/rig.go
+@@ -573,11 +573,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
+ 	if err != nil {
+ 		return fmt.Errorf("adding rig: %w", err)
+ 	}
+-
+-	// Save updated rigs config
+-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
+-		return fmt.Errorf("saving rigs config: %w", err)
+-	}
++	// rigs.json is saved atomically inside AddRig; no separate save needed here.
+ 
+ 	// Add new rig to daemon.json patrol config (witness + refinery rigs arrays)
+ 	if err := config.AddRigToDaemonPatrols(townRoot, name); err != nil {
+diff --git a/internal/cmd/rig_integration_test.go b/internal/cmd/rig_integration_test.go
+index 739bd7aa..9269d386 100644
+--- a/internal/cmd/rig_integration_test.go
++++ b/internal/cmd/rig_integration_test.go
+@@ -720,10 +720,7 @@ func TestRigAddUpdatesRigsJson(t *testing.T) {
+ 		t.Fatalf("AddRig: %v", err)
+ 	}
+ 
+-	// Save rigs config (normally done by the command)
+-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
+-		t.Fatalf("save rigs.json: %v", err)
+-	}
++	// AddRig saves rigs.json atomically — no separate save needed.
+ 
+ 	// Reload and verify
+ 	rigsConfig2, err := config.LoadRigsConfig(rigsPath)
+diff --git a/internal/rig/manager.go b/internal/rig/manager.go
+index 802d3a4f..e9b0238f 100644
+--- a/internal/rig/manager.go
++++ b/internal/rig/manager.go
+@@ -861,6 +861,16 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
+ 		fmt.Fprintf(os.Stderr, "  Run 'gt doctor --fix' to repair if needed.\n")
+ 	}
+ 
++	// Persist rigs.json atomically before marking success.
++	// This ensures directory creation and rigs.json registration are an atomic unit:
++	// if the save fails, success remains false and the deferred cleanup removes the dir.
++	// Without this, a failure after AddRig returns (but before the caller saves) would
++	// leave a directory that is not registered in rigs.json.
++	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
++	if err := config.SaveRigsConfig(rigsPath, m.config); err != nil {
++		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
++	}
++
+ 	success = true
+ 	return m.loadRig(opts.Name, m.config.Rigs[opts.Name])
+ }
+-- 
+2.43.0
+
