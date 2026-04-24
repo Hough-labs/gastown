@@ -5,9 +5,14 @@ package deacon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // Heartbeat age thresholds — these are compiled-in defaults.
@@ -49,7 +54,7 @@ func HeartbeatFile(townRoot string) string {
 	return filepath.Join(townRoot, "deacon", "heartbeat.json")
 }
 
-// WriteHeartbeat writes a new heartbeat to disk.
+// WriteHeartbeat writes a new heartbeat to disk and updates the bead label.
 // Called by the Deacon at the start of each wake cycle.
 func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 	hbFile := HeartbeatFile(townRoot)
@@ -78,6 +83,12 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 	// These scripts predate heartbeat.json and check mtime, not file contents.
 	legacyFile := filepath.Join(filepath.Dir(hbFile), ".deacon-heartbeat")
 	_ = os.WriteFile(legacyFile, []byte(""), 0644) //nolint:gosec // G306: world-readable liveness file is intentional
+
+	// Update the heartbeat label on the hq-deacon bead
+	// This is checked by the daemon to determine if Deacon is alive
+	if err := updateHeartbeatLabel(townRoot, hb); err != nil {
+		return fmt.Errorf("updating heartbeat label on bead: %w", err)
+	}
 
 	return nil
 }
@@ -162,4 +173,67 @@ func TouchWithAction(townRoot, action string, healthy, unhealthy int) error {
 		HealthyAgents:   healthy,
 		UnhealthyAgents: unhealthy,
 	})
+}
+
+// updateHeartbeatLabel updates the heartbeat:<unix-ts> label on the hq-deacon bead.
+// This allows the daemon to check if Deacon is alive by reading the bead label,
+// rather than checking the heartbeat.json file directly.
+func updateHeartbeatLabel(townRoot string, hb *Heartbeat) error {
+	beadID := beads.DeaconBeadIDTown()
+
+	// Format the new label with unix timestamp (seconds since epoch)
+	newLabel := fmt.Sprintf("heartbeat:%d", hb.Timestamp.Unix())
+
+	// We need to remove any old heartbeat:* labels and add the new one atomically.
+	// We'll use the bd CLI to show the bead, find old heartbeat labels, and update them.
+
+	// Get current labels via bd show
+	cmd := exec.Command("bd", "show", beadID, "--json")
+	cmd.Dir = townRoot
+
+	output, err := cmd.Output()
+	if err != nil {
+		// If the bead doesn't exist yet, just try to add the label
+		// This can happen if deacon is running for the first time
+		cmd := exec.Command("bd", "update", beadID, "--add-label", newLabel)
+		cmd.Dir = townRoot
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("adding heartbeat label to new bead: %w", err)
+		}
+		return nil
+	}
+
+	// Parse the JSON output to get labels
+	var issues []struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil {
+		return fmt.Errorf("parsing bead labels: %w", err)
+	}
+
+	// Find and collect old heartbeat labels to remove
+	heartbeatLabelRegex := regexp.MustCompile(`^heartbeat:\d+$`)
+	var labelsToRemove []string
+	for _, issue := range issues {
+		for _, label := range issue.Labels {
+			if heartbeatLabelRegex.MatchString(label) && label != newLabel {
+				labelsToRemove = append(labelsToRemove, label)
+			}
+		}
+	}
+
+	// Build the bd update command to remove old labels and add the new one
+	cmdArgs := []string{"update", beadID}
+	for _, label := range labelsToRemove {
+		cmdArgs = append(cmdArgs, "--remove-label", label)
+	}
+	cmdArgs = append(cmdArgs, "--add-label", newLabel)
+
+	cmd = exec.Command("bd", cmdArgs...)
+	cmd.Dir = townRoot
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("updating heartbeat label: %w", err)
+	}
+
+	return nil
 }
