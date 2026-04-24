@@ -143,7 +143,9 @@ func upgradeDoctor(townRoot string) upgradeResult {
 	d.Register(doctor.NewDeprecatedMergeQueueKeysCheck())
 	d.Register(doctor.NewStaleTaskDispatchCheck())
 	d.Register(doctor.NewHooksSyncCheck())
-	d.Register(doctor.NewStaleDoltPortCheck())
+	// StaleDoltPortCheck unregistered on this fork — see doctor.go for the
+	// full reason. In short: its Fix() rewrites metadata.json away from our
+	// k8s Dolt server.
 	d.Register(doctor.NewStaleSQLServerInfoCheck())
 	d.Register(doctor.NewSparseCheckoutCheck())
 	d.Register(doctor.NewPrimingCheck())
@@ -209,7 +211,7 @@ func upgradeCLAUDEMD(townRoot string) upgradeResult {
 		return result
 	}
 
-	if err := os.WriteFile(claudePath, []byte(expected), 0644); err != nil {
+	if err := os.WriteFile(claudePath, []byte(expected), 0o644); err != nil {
 		result.details = append(result.details, fmt.Sprintf("error writing: %v", err))
 		fmt.Printf("     %s Could not write CLAUDE.md: %v\n", style.ErrorPrefix, err)
 		return result
