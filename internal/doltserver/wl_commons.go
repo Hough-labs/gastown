@@ -67,36 +67,51 @@ func (w *WLCommons) DBName() string {
 	return w.dbName
 }
 
-func (w *WLCommons) EnsureDB() error           { return EnsureWLCommons(w.townRoot) }
-func (w *WLCommons) DatabaseExists(db string) bool { return DatabaseExists(w.townRoot, db) }
+func (w *WLCommons) EnsureDB() error { return EnsureWLCommons(w.townRoot) }
+func (w *WLCommons) DatabaseExists(db string) bool {
+	// Port misconfiguration should surface via other codepaths; for the bool
+	// contract the WLCommons interface exposes, we report "does not exist"
+	// when resolution fails so callers don't race onto a phantom database.
+	exists, _ := DatabaseExists(w.townRoot, db)
+	return exists
+}
 func (w *WLCommons) InsertWanted(item *WantedItem) error { return InsertWanted(w.townRoot, item) }
 func (w *WLCommons) ClaimWanted(wantedID, rigHandle string) error {
 	return ClaimWanted(w.townRoot, wantedID, rigHandle)
 }
+
 func (w *WLCommons) SubmitCompletion(completionID, wantedID, rigHandle, evidence string) error {
 	return SubmitCompletion(w.townRoot, completionID, wantedID, rigHandle, evidence)
 }
+
 func (w *WLCommons) QueryWanted(wantedID string) (*WantedItem, error) {
 	return QueryWanted(w.townRoot, wantedID)
 }
+
 func (w *WLCommons) QueryWantedFull(wantedID string) (*WantedItem, error) {
 	return QueryWantedFull(w.townRoot, wantedID)
 }
+
 func (w *WLCommons) InsertStamp(stamp *StampRecord) error {
 	return InsertStamp(w.townRoot, stamp)
 }
+
 func (w *WLCommons) QueryLastStampForSubject(subject string) (*StampRecord, error) {
 	return QueryLastStampForSubject(w.townRoot, subject)
 }
+
 func (w *WLCommons) QueryStampsForSubject(subject string) ([]StampRecord, error) {
 	return queryStampsForSubjectDB(w.townRoot, w.DBName(), subject)
 }
+
 func (w *WLCommons) QueryBadges(handle string) ([]BadgeRecord, error) {
 	return queryBadgesDB(w.townRoot, w.DBName(), handle)
 }
+
 func (w *WLCommons) QueryAllSubjects() ([]string, error) {
 	return queryAllSubjectsDB(w.townRoot, w.DBName())
 }
+
 func (w *WLCommons) UpsertLeaderboard(entry *LeaderboardEntry) error {
 	return upsertLeaderboardDB(w.townRoot, w.DBName(), entry)
 }
@@ -149,7 +164,10 @@ func GenerateWantedID(title string) string {
 
 // EnsureWLCommons ensures the wl-commons database exists and has the correct schema.
 func EnsureWLCommons(townRoot string) error {
-	config := DefaultConfig(townRoot)
+	config, err := DefaultConfig(townRoot)
+	if err != nil {
+		return err
+	}
 	dbDir := filepath.Join(config.DataDir, WLCommonsDB)
 
 	if _, err := os.Stat(filepath.Join(dbDir, ".dolt")); err == nil {
@@ -493,7 +511,10 @@ func QueryWantedFull(townRoot, wantedID string) (*WantedItem, error) {
 
 // doltSQLQuery executes a SQL query and returns the raw CSV output.
 func doltSQLQuery(townRoot, query string) (string, error) {
-	config := DefaultConfig(townRoot)
+	config, err := DefaultConfig(townRoot)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -513,7 +534,10 @@ func QueryCSV(townRoot, query string) (string, error) {
 
 // QueryJSON executes a SQL query against the Dolt server and returns JSON output.
 func QueryJSON(townRoot, query string) (string, error) {
-	config := DefaultConfig(townRoot)
+	config, err := DefaultConfig(townRoot)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := buildDoltSQLCmd(ctx, config, "-r", "json", "-q", query)

@@ -122,7 +122,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 		// GH#2656: Write shutdown sentinel to prevent agents from restarting the
 		// daemon while we're tearing down. ensureDaemon checks for this file.
 		sentinelPath := filepath.Join(townRoot, ShutdownSentinel)
-		_ = os.WriteFile(sentinelPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+		_ = os.WriteFile(sentinelPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0o644)
 		defer os.Remove(sentinelPath)
 
 		// Prevent tmux server from exiting when all sessions are killed.
@@ -277,8 +277,11 @@ func runDown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Phase 4b-ii: Stop Dolt server
-	doltCfg := doltserver.DefaultConfig(townRoot)
-	if _, statErr := os.Stat(doltCfg.DataDir); statErr == nil {
+	doltCfg, doltCfgErr := doltserver.DefaultConfig(townRoot)
+	if doltCfgErr != nil {
+		printDownStatus("Dolt", false, fmt.Sprintf("resolving dolt config: %v", doltCfgErr))
+		allOK = false
+	} else if _, statErr := os.Stat(doltCfg.DataDir); statErr == nil {
 		doltRunning, doltPid, doltErr := doltserver.IsRunning(townRoot)
 		if doltErr != nil {
 			printDownStatus("Dolt", false, fmt.Sprintf("status check failed: %v", doltErr))
@@ -319,7 +322,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		conflictPID, _ := doltserver.CheckPortConflict(townRoot)
+		conflictPID, _, _ := doltserver.CheckPortConflict(townRoot)
 		if conflictPID > 0 {
 			printDownStatus("Dolt imposters", true, fmt.Sprintf("would stop imposter (PID %d)", conflictPID))
 		}
@@ -678,7 +681,7 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 func acquireShutdownLock(townRoot string) (*flock.Flock, error) {
 	lockPath := filepath.Join(townRoot, shutdownLockFile)
 
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("creating lock directory: %w", err)
 	}
 
@@ -930,7 +933,12 @@ func findIdleMonitorProcesses(townRoot string) []int {
 	if absRoot == "" {
 		return nil
 	}
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		// No port configured — nothing to scope by port. Skip the port-matching
+		// branch below by using an empty string (path-match still works).
+		return nil
+	}
 	portStr := strconv.Itoa(config.Port)
 
 	out, err := exec.Command("ps", "-eo", "pid,args").Output()

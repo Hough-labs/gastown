@@ -49,7 +49,11 @@ func runWLShow(cmd *cobra.Command, args []string) error {
 
 	// Fast path: query through the Dolt server if the database is registered.
 	dbName := wasteland.ResolveDBName(townRoot)
-	if doltserver.DatabaseExists(townRoot, dbName) {
+	dbExists, dbExistsErr := doltserver.DatabaseExists(townRoot, dbName)
+	if dbExistsErr != nil {
+		return fmt.Errorf("checking database %q: %w", dbName, dbExistsErr)
+	}
+	if dbExists {
 		store := doltserver.NewWLCommonsWithDB(townRoot, dbName)
 		return showWanted(store, wantedID, wlShowJSON)
 	}

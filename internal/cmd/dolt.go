@@ -395,7 +395,10 @@ func runDoltStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — start/stop managed externally", config.HostPort())
 	}
@@ -419,7 +422,11 @@ func runDoltStart(cmd *cobra.Command, args []string) error {
 		style.Bold.Render("✓"), state.PID, config.Port)
 	fmt.Printf("  Data dir: %s\n", state.DataDir)
 	fmt.Printf("  Databases: %s\n", style.Dim.Render(strings.Join(state.Databases, ", ")))
-	fmt.Printf("  Connection: %s\n", style.Dim.Render(doltserver.GetConnectionString(townRoot)))
+	connStr, connErr := doltserver.GetConnectionString(townRoot)
+	if connErr != nil {
+		connStr = "(not configured)"
+	}
+	fmt.Printf("  Connection: %s\n", style.Dim.Render(connStr))
 
 	// Verify all filesystem databases are actually served by the SQL server.
 	// Use retry since Start() only waits 500ms — DBs may still be loading.
@@ -447,12 +454,18 @@ func runDoltKillImposters(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote — imposter detection requires local server")
 	}
 
-	conflictPID, conflictDataDir := doltserver.CheckPortConflict(townRoot)
+	conflictPID, conflictDataDir, err := doltserver.CheckPortConflict(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking port conflict: %w", err)
+	}
 	if conflictPID == 0 {
 		fmt.Printf("%s No imposters found on port %d\n", style.Bold.Render("✓"), config.Port)
 		return nil
@@ -481,7 +494,10 @@ func runDoltStop(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — start/stop managed externally", config.HostPort())
 	}
@@ -502,7 +518,10 @@ func runDoltRestart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — start/stop managed externally", config.HostPort())
 	}
@@ -546,7 +565,11 @@ func runDoltRestart(cmd *cobra.Command, args []string) error {
 		style.Bold.Render("✓"), state.PID, config.Port)
 	fmt.Printf("  Data dir: %s\n", state.DataDir)
 	fmt.Printf("  Databases: %s\n", style.Dim.Render(strings.Join(state.Databases, ", ")))
-	fmt.Printf("  Connection: %s\n", style.Dim.Render(doltserver.GetConnectionString(townRoot)))
+	connStr, connErr := doltserver.GetConnectionString(townRoot)
+	if connErr != nil {
+		connStr = "(not configured)"
+	}
+	fmt.Printf("  Connection: %s\n", style.Dim.Render(connStr))
 
 	// Verify databases
 	served, missing, verifyErr := doltserver.VerifyDatabasesWithRetry(townRoot, 5)
@@ -576,7 +599,10 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking server status: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 
 	if config.IsRemote() {
 		if running {
@@ -590,17 +616,25 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 				"not reachable",
 				config.HostPort())
 		}
-		fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+		connStr, connErr := doltserver.GetConnectionString(townRoot)
+		if connErr != nil {
+			connStr = "(not configured)"
+		}
+		fmt.Printf("  Connection: %s\n", connStr)
 		if running {
-			metrics := doltserver.GetHealthMetrics(townRoot)
-			fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
-			fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
-			fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
-				metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
-			if metrics.ReadOnly {
-				fmt.Printf("\n  %s %s\n",
-					style.Bold.Render("!!!"),
-					style.Bold.Render("SERVER IS READ-ONLY — contact the remote server admin"))
+			metrics, metricsErr := doltserver.GetHealthMetrics(townRoot)
+			if metricsErr != nil {
+				fmt.Printf("\n  %s Could not read health metrics: %v\n", style.Dim.Render("⚠"), metricsErr)
+			} else {
+				fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
+				fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
+				fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
+					metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
+				if metrics.ReadOnly {
+					fmt.Printf("\n  %s %s\n",
+						style.Bold.Render("!!!"),
+						style.Bold.Render("SERVER IS READ-ONLY — contact the remote server admin"))
+				}
 			}
 		}
 		return nil
@@ -629,20 +663,28 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 					}
 				}
 			}
-			fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+			connStr, connErr := doltserver.GetConnectionString(townRoot)
+			if connErr != nil {
+				connStr = "(not configured)"
+			}
+			fmt.Printf("  Connection: %s\n", connStr)
 		}
 
 		// Resource metrics
-		metrics := doltserver.GetHealthMetrics(townRoot)
-		fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
-		fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
-		fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
-			metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
-		fmt.Printf("    Disk usage:    %s\n", metrics.DiskUsageHuman)
-		if metrics.ReadOnly {
-			fmt.Printf("\n  %s %s\n",
-				style.Bold.Render("!!!"),
-				style.Bold.Render("SERVER IS READ-ONLY — run 'gt dolt recover' to restart"))
+		metrics, metricsErr := doltserver.GetHealthMetrics(townRoot)
+		if metricsErr != nil {
+			fmt.Printf("\n  %s Could not read health metrics: %v\n", style.Dim.Render("⚠"), metricsErr)
+		} else {
+			fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
+			fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
+			fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
+				metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
+			fmt.Printf("    Disk usage:    %s\n", metrics.DiskUsageHuman)
+			if metrics.ReadOnly {
+				fmt.Printf("\n  %s %s\n",
+					style.Bold.Render("!!!"),
+					style.Bold.Render("SERVER IS READ-ONLY — run 'gt dolt recover' to restart"))
+			}
 		}
 
 		// Verify all filesystem databases are actually served.
@@ -669,7 +711,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Clean up with: %s\n", style.Dim.Render("gt dolt cleanup"))
 		}
 
-		if len(metrics.Warnings) > 0 {
+		if metricsErr == nil && len(metrics.Warnings) > 0 {
 			fmt.Printf("\n  %s\n", style.Bold.Render("Warnings:"))
 			for _, w := range metrics.Warnings {
 				fmt.Printf("    %s %s\n", style.Bold.Render("!"), w)
@@ -710,7 +752,10 @@ func runDoltLogs(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 
 	if _, err := os.Stat(config.LogFile); os.IsNotExist(err) {
 		return fmt.Errorf("no log file found at %s", config.LogFile)
@@ -745,7 +790,10 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Dolt server is not running — nothing to dump")
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 
 	// Send SIGQUIT to get goroutine stack dump (written to server's stderr = log file)
 	proc, err := os.FindProcess(pid)
@@ -773,7 +821,10 @@ func runDoltSQL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 
 	// Check if server is running - if so, connect via Dolt SQL client
 	running, _, _ := doltserver.IsRunning(townRoot)
@@ -839,7 +890,10 @@ func runDoltInitRig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	rigDir := doltserver.RigDatabaseDir(townRoot, rigName)
 
 	if !created {
@@ -1049,7 +1103,10 @@ func runDoltList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	databases, err := doltserver.ListDatabases(townRoot)
 	if err != nil {
 		return fmt.Errorf("listing databases: %w", err)
@@ -1081,7 +1138,10 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — migration requires local server access", config.HostPort())
 	}
@@ -1102,7 +1162,10 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find databases to migrate
-	migrations := doltserver.FindMigratableDatabases(townRoot)
+	migrations, err := doltserver.FindMigratableDatabases(townRoot)
+	if err != nil {
+		return fmt.Errorf("finding migratable databases: %w", err)
+	}
 	if len(migrations) == 0 {
 		fmt.Println("No databases found to migrate.")
 		return nil
@@ -1233,7 +1296,10 @@ func runDoltRecover(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — recovery requires local server access", config.HostPort())
 	}
@@ -1267,7 +1333,10 @@ func runDoltRollback(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — rollback requires local server access", config.HostPort())
 	}
@@ -1449,14 +1518,23 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — sync requires local server access", config.HostPort())
 	}
 
 	// Validate --db flag if set
-	if doltSyncDB != "" && !doltserver.DatabaseExists(townRoot, doltSyncDB) {
-		return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltSyncDB)
+	if doltSyncDB != "" {
+		exists, existsErr := doltserver.DatabaseExists(townRoot, doltSyncDB)
+		if existsErr != nil {
+			return fmt.Errorf("checking database %q: %w", doltSyncDB, existsErr)
+		}
+		if !exists {
+			return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltSyncDB)
+		}
 	}
 
 	// Check server state
@@ -1572,14 +1650,23 @@ func runDoltPull(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("Dolt server is remote (%s) — pull requires local server access", config.HostPort())
 	}
 
 	// Validate --db flag if set
-	if doltPullDB != "" && !doltserver.DatabaseExists(townRoot, doltPullDB) {
-		return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltPullDB)
+	if doltPullDB != "" {
+		exists, existsErr := doltserver.DatabaseExists(townRoot, doltPullDB)
+		if existsErr != nil {
+			return fmt.Errorf("checking database %q: %w", doltPullDB, existsErr)
+		}
+		if !exists {
+			return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltPullDB)
+		}
 	}
 
 	// Check server state

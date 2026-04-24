@@ -80,7 +80,10 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if config.IsRemote() {
 		return fmt.Errorf("maintain requires local Dolt server (remote: %s)", config.HostPort())
 	}

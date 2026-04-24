@@ -222,8 +222,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// connect to the Dolt SQL server. Without this sequencing, they race the
 	// server and bd auto-spawns orphan embedded servers. (gt-t2zf)
 	var doltOK bool
-	cfg := doltserver.DefaultConfig(townRoot)
-	if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+	cfg, cfgErr := doltserver.DefaultConfig(townRoot)
+	if cfgErr != nil {
+		fmt.Printf("  %s Dolt server skipped (%v)\n", style.Dim.Render("○"), cfgErr)
+	} else if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
 		// No Dolt data dir — nothing to start
 		fmt.Printf("  %s Dolt server skipped (no data dir)\n", style.Dim.Render("○"))
 	} else {
@@ -235,7 +237,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
 		} else {
 			doltOK = true
-			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
+			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), cfg.Port)
 		}
 	}
 
@@ -928,7 +930,6 @@ func cleanupPolecats(townRoot string) {
 func stopDaemonIfRunning(townRoot string) {
 	// Primary detection: PID file
 	running, pid, err := daemon.IsRunning(townRoot)
-
 	if err != nil {
 		// Detection error - report it but continue with fallback
 		fmt.Printf("  %s Daemon detection warning: %s\n", style.Bold.Render("⚠"), err.Error())

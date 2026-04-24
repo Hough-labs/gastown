@@ -31,11 +31,13 @@ import (
 	"golang.org/x/term"
 )
 
-var statusJSON bool
-var statusFast bool
-var statusWatch bool
-var statusInterval int
-var statusVerbose bool
+var (
+	statusJSON     bool
+	statusFast     bool
+	statusWatch    bool
+	statusInterval int
+	statusVerbose  bool
+)
 
 var statusCmd = &cobra.Command{
 	Use:         "status",
@@ -120,15 +122,15 @@ type DNDInfo struct {
 
 // AgentRuntime represents the runtime state of an agent.
 type AgentRuntime struct {
-	Name         string `json:"name"`                    // Display name (e.g., "mayor", "witness")
-	Address      string `json:"address"`                 // Full address (e.g., "greenplace/witness")
-	Session      string `json:"session"`                 // tmux session name
-	Role         string `json:"role"`                    // Role type
-	Running      bool   `json:"running"`                 // Is tmux session running?
-	ACP          bool   `json:"acp"`                     // Is ACP session active?
-	HasWork      bool   `json:"has_work"`                // Has pinned work?
-	WorkTitle    string `json:"work_title,omitempty"`    // Title of pinned work
-	HookBead     string `json:"hook_bead,omitempty"`     // Pinned bead ID from agent bead
+	Name              string `json:"name"`                         // Display name (e.g., "mayor", "witness")
+	Address           string `json:"address"`                      // Full address (e.g., "greenplace/witness")
+	Session           string `json:"session"`                      // tmux session name
+	Role              string `json:"role"`                         // Role type
+	Running           bool   `json:"running"`                      // Is tmux session running?
+	ACP               bool   `json:"acp"`                          // Is ACP session active?
+	HasWork           bool   `json:"has_work"`                     // Has pinned work?
+	WorkTitle         string `json:"work_title,omitempty"`         // Title of pinned work
+	HookBead          string `json:"hook_bead,omitempty"`          // Pinned bead ID from agent bead
 	State             string `json:"state,omitempty"`              // Agent state from agent bead
 	NotificationLevel string `json:"notification_level,omitempty"` // Notification level (verbose, normal, muted)
 	UnreadMail        int    `json:"unread_mail"`                  // Number of unread messages
@@ -796,34 +798,35 @@ func gatherStatus() (TownStatus, error) {
 	}
 
 	// Dolt status
-	doltCfg := doltserver.DefaultConfig(townRoot)
-	if doltCfg.IsRemote() {
-		status.Dolt = &DoltInfo{Remote: true, Port: doltCfg.Port}
-	} else {
-		doltRunning, doltPid, _ := doltserver.IsRunning(townRoot)
-		port := doltCfg.Port
-		if doltRunning {
-			// Read the actual port from state — doltCfg.Port comes from
-			// DefaultConfig which reads GT_DOLT_PORT from the shell env,
-			// but gt status is typically run without that env var set.
-			if state, err := doltserver.LoadState(townRoot); err == nil && state.Port > 0 {
-				port = state.Port
+	if doltCfg, err := doltserver.DefaultConfig(townRoot); err == nil {
+		if doltCfg.IsRemote() {
+			status.Dolt = &DoltInfo{Remote: true, Port: doltCfg.Port}
+		} else {
+			doltRunning, doltPid, _ := doltserver.IsRunning(townRoot)
+			port := doltCfg.Port
+			if doltRunning {
+				// Read the actual port from state — doltCfg.Port comes from
+				// DefaultConfig which reads GT_DOLT_PORT from the shell env,
+				// but gt status is typically run without that env var set.
+				if state, err := doltserver.LoadState(townRoot); err == nil && state.Port > 0 {
+					port = state.Port
+				}
 			}
-		}
-		doltInfo := &DoltInfo{
-			Running: doltRunning,
-			PID:     doltPid,
-			Port:    port,
-			DataDir: doltCfg.DataDir,
-		}
-		// Check if port is held by another town's Dolt
-		if !doltRunning {
-			if conflictPid, conflictDir := doltserver.CheckPortConflict(townRoot); conflictPid > 0 {
-				doltInfo.PortConflict = true
-				doltInfo.ConflictOwner = conflictDir
+			doltInfo := &DoltInfo{
+				Running: doltRunning,
+				PID:     doltPid,
+				Port:    port,
+				DataDir: doltCfg.DataDir,
 			}
+			// Check if port is held by another town's Dolt
+			if !doltRunning {
+				if conflictPid, conflictDir, _ := doltserver.CheckPortConflict(townRoot); conflictPid > 0 {
+					doltInfo.PortConflict = true
+					doltInfo.ConflictOwner = conflictDir
+				}
+			}
+			status.Dolt = doltInfo
 		}
-		status.Dolt = doltInfo
 	}
 
 	// Tmux status
@@ -1623,7 +1626,8 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 			session string
 			role    string
 			beadID  string
-		}) {
+		},
+		) {
 			defer wg.Done()
 
 			agent := AgentRuntime{

@@ -3,11 +3,11 @@
 // The wisps table is a dolt_ignored copy of the issues table schema, used for
 // ephemeral operational data (agent beads, patrol wisps, etc.) that should not
 // be version-controlled. This migration:
-//   1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
-//      wisp_events, wisp_dependencies) if they don't exist
-//   2. Copies existing agent beads (issue_type='agent') from issues to wisps
-//   3. Copies associated labels, comments, events, and dependencies
-//   4. Closes the originals in the issues table
+//  1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
+//     wisp_events, wisp_dependencies) if they don't exist
+//  2. Copies existing agent beads (issue_type='agent') from issues to wisps
+//  3. Copies associated labels, comments, events, and dependencies
+//  4. Closes the originals in the issues table
 //
 // The migration uses `bd sql` for beads-side operations (copying agent beads between
 // the issues and wisps tables in bd's own database). Additionally, it ensures that
@@ -70,10 +70,13 @@ func MigrateAgentBeadsToWisps(townRoot, workDir string, dryRun bool) (*MigrateWi
 	result.AuxTablesCreated = auxTables
 
 	// Step 3b: Ensure wisps tables also exist on the gt Dolt server.
-	// The reaper connects directly to the gt Dolt server (port 3307), which is
-	// a separate process from bd's Dolt instance. Without this step, bd creates
-	// the tables on its own server but the reaper fails with "table not found".
-	gtConfig := DefaultConfig(townRoot)
+	// The reaper connects directly to the gt Dolt server, which is a separate
+	// process from bd's Dolt instance. Without this step, bd creates the
+	// tables on its own server but the reaper fails with "table not found".
+	gtConfig, err := DefaultConfig(townRoot)
+	if err != nil {
+		return nil, err
+	}
 	dbName := deriveDBName(townRoot, workDir)
 	if dbName != "" {
 		gtCreated, gtAux, err := ensureWispsOnGTServer(gtConfig.Host, gtConfig.Port, dbName)

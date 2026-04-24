@@ -48,7 +48,7 @@ type convoyRow struct {
 
 func main() {
 	host := flag.String("host", "", "Dolt server host (default: 127.0.0.1)")
-	port := flag.String("port", "", "Dolt server port (default: GT_DOLT_PORT or 3307)")
+	port := flag.String("port", "", "Dolt server port (required; falls back to GT_DOLT_PORT or DOLT_PORT env)")
 	routesFile := flag.String("routes", "", "Path to routes.jsonl (default: ~/gt/.beads/routes.jsonl)")
 	dryRun := flag.Bool("dry-run", false, "Show what would be done without making changes")
 	cleanup := flag.Bool("cleanup", false, "Also escalate stale convoy branches for review")
@@ -118,6 +118,9 @@ func resolveHost(flag string) string {
 	return "127.0.0.1"
 }
 
+// resolvePort returns the Dolt port from --port, GT_DOLT_PORT, or DOLT_PORT,
+// in that order. If none are set, returns "" — callers must fail rather than
+// connecting to a guessed port (gt-9q4j).
 func resolvePort(flag string) string {
 	if flag != "" {
 		return flag
@@ -128,7 +131,7 @@ func resolvePort(flag string) string {
 	if p := os.Getenv("DOLT_PORT"); p != "" {
 		return p
 	}
-	return "3307"
+	return ""
 }
 
 func resolveRoutesFile(flag string) string {

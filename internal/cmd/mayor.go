@@ -112,8 +112,10 @@ is vetoed to allow the Mayor to review worker diffs before they vanish.`,
 	RunE: runMayorAcp,
 }
 
-var acpRigOverride string
-var acpTownRootOverride string
+var (
+	acpRigOverride      string
+	acpTownRootOverride string
+)
 
 func init() {
 	mayorCmd.AddCommand(mayorStartCmd)
@@ -426,7 +428,10 @@ func ensureMayorInfra(townRoot string) error {
 	}
 
 	// Dolt (fatal on failure — Mayor requires database access)
-	doltCfg := doltserver.DefaultConfig(townRoot)
+	doltCfg, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	if !doltCfg.IsRemote() {
 		if _, err := os.Stat(doltCfg.DataDir); err == nil {
 			doltRunning, _, _ := doltserver.IsRunning(townRoot)

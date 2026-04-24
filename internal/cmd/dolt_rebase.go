@@ -84,7 +84,10 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Dolt server is not running — start with 'gt dolt start'")
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=60s&writeTimeout=300s",
 		config.User, config.HostPort(), dbName)
 
@@ -360,6 +363,7 @@ func rebaseCleanup(db *sql.DB, baseBranch, workBranch string) {
 }
 
 // rebaseAbortAndCleanup aborts an in-progress rebase then cleans up branches.
+//
 //nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
 func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -371,6 +375,7 @@ func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 }
 
 // rebaseCleanupAll cleans up both branches after a failed rebase.
+//
 //nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
 func rebaseCleanupAll(db *sql.DB, baseBranch, workBranch string) {
 	rebaseCleanup(db, baseBranch, workBranch)

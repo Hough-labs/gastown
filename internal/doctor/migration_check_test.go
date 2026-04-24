@@ -17,10 +17,10 @@ import (
 func setupDoltDB(t *testing.T, townRoot, dbName string) {
 	t.Helper()
 	nomsDir := filepath.Join(townRoot, ".dolt-data", dbName, ".dolt", "noms")
-	if err := os.MkdirAll(nomsDir, 0755); err != nil {
+	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
 		t.Fatalf("creating noms dir for %s: %v", dbName, err)
 	}
-	if err := os.WriteFile(filepath.Join(nomsDir, "manifest"), []byte("test"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(nomsDir, "manifest"), []byte("test"), 0o644); err != nil {
 		t.Fatalf("writing manifest for %s: %v", dbName, err)
 	}
 }
@@ -34,7 +34,7 @@ func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
 	} else {
 		beadsDir = filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
 	}
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("creating beads dir for %s: %v", rigName, err)
 	}
 	meta := map[string]interface{}{
@@ -46,7 +46,7 @@ func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
 	if err != nil {
 		t.Fatalf("marshaling metadata for %s: %v", rigName, err)
 	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o644); err != nil {
 		t.Fatalf("writing metadata for %s: %v", rigName, err)
 	}
 }
@@ -54,7 +54,7 @@ func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
 // setupServerMetadata creates a .beads/metadata.json with optional host/port fields.
 func setupServerMetadata(t *testing.T, beadsDir, host string, port int) {
 	t.Helper()
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("creating beads dir: %v", err)
 	}
 	meta := map[string]interface{}{
@@ -72,7 +72,7 @@ func setupServerMetadata(t *testing.T, beadsDir, host string, port int) {
 	if err != nil {
 		t.Fatalf("marshaling metadata: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o644); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 }
@@ -81,7 +81,7 @@ func setupServerMetadata(t *testing.T, beadsDir, host string, port int) {
 func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 	t.Helper()
 	mayorDir := filepath.Join(townRoot, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	rigs := "{"
@@ -93,7 +93,7 @@ func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 	}
 	rigs += "}"
 	content := `{"version":1,"rigs":` + rigs + `}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(content), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -101,6 +101,12 @@ func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 func TestGetServerAddr(t *testing.T) {
 	check := NewDoltServerReachableCheck()
 
+	// After the 3307-default rip (gt-9q4j), metadata with no port no longer
+	// falls back to a compiled-in port. When metadata port is 0 AND no
+	// config.yaml / GT_DOLT_PORT / daemon.json resolution succeeds, the
+	// probe is skipped (returns "", false) rather than guessing. Each case
+	// now specifies a port explicitly; "skips when port unknown" tests the
+	// new behavior.
 	tests := []struct {
 		name     string
 		host     string
@@ -109,9 +115,9 @@ func TestGetServerAddr(t *testing.T) {
 		wantOK   bool
 	}{
 		{
-			name:     "defaults to 127.0.0.1:3307",
-			wantAddr: "127.0.0.1:3307",
-			wantOK:   true,
+			name:     "skips probe when host and port unconfigured",
+			wantAddr: "",
+			wantOK:   false,
 		},
 		{
 			name:     "explicit IPv4 host and port",
@@ -121,10 +127,10 @@ func TestGetServerAddr(t *testing.T) {
 			wantOK:   true,
 		},
 		{
-			name:     "IPv6 host gets bracketed",
+			name:     "IPv6 host without port is skipped",
 			host:     "::1",
-			wantAddr: "[::1]:3307",
-			wantOK:   true,
+			wantAddr: "",
+			wantOK:   false,
 		},
 		{
 			name:     "IPv6 host with explicit port",
@@ -134,10 +140,10 @@ func TestGetServerAddr(t *testing.T) {
 			wantOK:   true,
 		},
 		{
-			name:     "explicit host with default port",
+			name:     "explicit host without port is skipped",
 			host:     "dolt.example.com",
-			wantAddr: "dolt.example.com:3307",
-			wantOK:   true,
+			wantAddr: "",
+			wantOK:   false,
 		},
 	}
 
@@ -161,7 +167,7 @@ func TestGetServerAddr(t *testing.T) {
 func TestGetServerAddr_NotServerMode(t *testing.T) {
 	check := NewDoltServerReachableCheck()
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	meta := map[string]interface{}{
@@ -169,7 +175,7 @@ func TestGetServerAddr_NotServerMode(t *testing.T) {
 		"dolt_mode": "local",
 	}
 	data, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,11 +199,11 @@ func TestGetServerAddr_UsesConfigYAMLPort(t *testing.T) {
 
 	// Create config.yaml with custom port
 	doltDataDir := filepath.Join(townRoot, ".dolt-data")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+	if err := os.MkdirAll(doltDataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	configYAML := "listener:\n  port: 13527\n  max_connections: 1000\n"
-	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte(configYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -364,7 +370,7 @@ func writeServerMetadata(t *testing.T, beadsDir, database, host string, port int
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

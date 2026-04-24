@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 var verifyExpectedDatabasesAtConfig = doltserver.VerifyExpectedDatabasesAtConfig
@@ -207,7 +207,7 @@ func (c *DoltMetadataCheck) writeDoltMetadata(townRoot, rigName string) error {
 		return fmt.Errorf("marshaling metadata: %w", err)
 	}
 
-	if err := atomicfile.WriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
+	if err := atomicfile.WriteFile(metadataPath, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("writing metadata.json: %w", err)
 	}
 
@@ -302,7 +302,13 @@ func (c *DoltServerReachableCheck) Run(ctx *CheckContext) *CheckResult {
 			details = append(details, fmt.Sprintf("Server %s unreachable (rigs: %s)", addr, strings.Join(rigNames, ", ")))
 		} else {
 			_ = conn.Close()
-			cfg := doltserver.DefaultConfig(ctx.TownRoot)
+			// We override Host+Port below, so port-not-configured is fine here.
+			// Just need a Config with User/DataDir defaults; if DefaultConfig
+			// fails, construct a minimal one ourselves.
+			cfg, _ := doltserver.DefaultConfig(ctx.TownRoot)
+			if cfg == nil {
+				cfg = &doltserver.Config{TownRoot: ctx.TownRoot}
+			}
 			cfg.Host = hostForAddr(addr)
 			cfg.Port = portForAddr(addr)
 			var expected []string
@@ -421,14 +427,17 @@ func hostForAddr(addr string) string {
 	return host
 }
 
+// portForAddr parses the port out of a host:port address. Returns 0 when the
+// address can't be parsed — callers must treat 0 as "unknown" rather than
+// falling back to a compiled-in default.
 func portForAddr(addr string) int {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return doltserver.DefaultPort
+		return 0
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return doltserver.DefaultPort
+		return 0
 	}
 	return port
 }
@@ -481,12 +490,15 @@ func (c *DoltServerReachableCheck) getServerAddr(beadsDir string, townRoot strin
 	if port == 0 {
 		// Use the same port resolution as Start/Stop/Status: config.yaml takes
 		// precedence over GT_DOLT_PORT env var, which takes precedence over
-		// daemon.json, which falls back to DefaultPort (3307). This ensures
-		// the doctor probes the same port that the server actually uses.
-		port = doltserver.DefaultConfig(townRoot).Port
+		// daemon.json. There is no compiled-in default — if nothing resolves,
+		// the doctor has nothing to probe and should report the probe as
+		// skipped rather than scan a guessed port.
+		if cfg, err := doltserver.DefaultConfig(townRoot); err == nil && cfg != nil {
+			port = cfg.Port
+		}
 	}
 	if port == 0 {
-		port = doltserver.DefaultPort
+		return "", false
 	}
 	return net.JoinHostPort(host, strconv.Itoa(port)), true
 }

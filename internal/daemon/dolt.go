@@ -195,13 +195,10 @@ func (m *DoltServerManager) doSleep(d time.Duration) {
 	time.Sleep(d)
 }
 
-// pidFile returns the path to the Dolt server PID file.
-// Production (port 3307) uses the canonical "dolt.pid" for compatibility with
-// gt dolt start/stop. Other ports get a port-specific name to avoid collisions.
+// pidFile returns the path to the Dolt server PID file. Always port-suffixed
+// now — the old "canonical dolt.pid for port 3307" special case was the
+// compiled-in-default era (gt-9q4j removed that).
 func (m *DoltServerManager) pidFile() string {
-	if m.config.Port == 3307 {
-		return filepath.Join(m.townRoot, "daemon", "dolt.pid")
-	}
 	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("dolt-%d.pid", m.config.Port))
 }
 
@@ -758,12 +755,9 @@ func sendDoltAlertToWitnesses(townRoot, subject, body string, logger func(format
 
 // unhealthySignalFile returns the path to the DOLT_UNHEALTHY signal file.
 // Witness patrols can check for this file to detect degraded Dolt state.
-// Production (port 3307) uses the canonical name; other ports get a suffix
-// so multiple instances don't clobber each other's signal files.
+// Always port-suffixed (the port-3307-canonical special case was removed
+// along with the compiled-in default; gt-9q4j).
 func (m *DoltServerManager) unhealthySignalFile() string {
-	if m.config.Port == 3307 {
-		return filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
-	}
 	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("DOLT_UNHEALTHY_%d", m.config.Port))
 }
 
@@ -772,7 +766,7 @@ func (m *DoltServerManager) unhealthySignalFile() string {
 func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) {
 	payload := fmt.Sprintf(`{"reason":%q,"detail":%q,"timestamp":%q}`,
 		reason, detail, time.Now().UTC().Format(time.RFC3339))
-	if err := os.WriteFile(m.unhealthySignalFile(), []byte(payload), 0644); err != nil {
+	if err := os.WriteFile(m.unhealthySignalFile(), []byte(payload), 0o644); err != nil {
 		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
 	}
 }
@@ -831,7 +825,7 @@ behavior:
 		hostLine,
 		cfg.DataDir,
 	)
-	return os.WriteFile(configPath, []byte(content), 0600)
+	return os.WriteFile(configPath, []byte(content), 0o600)
 }
 
 // Start starts the Dolt SQL server.
@@ -856,7 +850,7 @@ func (m *DoltServerManager) startLocked() error {
 	}
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(m.config.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(m.config.DataDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
@@ -882,7 +876,7 @@ func (m *DoltServerManager) startLocked() error {
 	}
 
 	// Open log file
-	logFile, err := os.OpenFile(m.config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	logFile, err := os.OpenFile(m.config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening log file: %w", err)
 	}

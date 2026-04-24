@@ -40,17 +40,27 @@ func runVitals(cmd *cobra.Command, args []string) error {
 
 func printVitalsDoltServers(townRoot string) {
 	fmt.Println(style.Bold.Render("Dolt Servers"))
-	config := doltserver.DefaultConfig(townRoot)
+	config, cfgErr := doltserver.DefaultConfig(townRoot)
+	if cfgErr != nil {
+		fmt.Printf("  %s (not configured): %v\n", style.Dim.Render("○"), cfgErr)
+		return
+	}
 	running, pid, _ := doltserver.IsRunning(townRoot)
 
 	if running {
-		m := doltserver.GetHealthMetrics(townRoot)
-		fmt.Printf("  %s :%d  production  PID %d  %s  %d/%d conn  %v\n",
-			style.Success.Render("●"), config.Port, pid,
-			m.DiskUsageHuman, m.Connections, m.MaxConnections,
-			m.QueryLatency.Round(time.Millisecond))
-		for _, w := range m.Warnings {
-			fmt.Printf("    %s %s\n", style.Warning.Render("!"), w)
+		m, mErr := doltserver.GetHealthMetrics(townRoot)
+		if mErr != nil {
+			fmt.Printf("  %s :%d  production  PID %d  %s\n",
+				style.Warning.Render("●"), config.Port, pid,
+				style.Dim.Render(fmt.Sprintf("metrics unavailable: %v", mErr)))
+		} else {
+			fmt.Printf("  %s :%d  production  PID %d  %s  %d/%d conn  %v\n",
+				style.Success.Render("●"), config.Port, pid,
+				m.DiskUsageHuman, m.Connections, m.MaxConnections,
+				m.QueryLatency.Round(time.Millisecond))
+			for _, w := range m.Warnings {
+				fmt.Printf("    %s %s\n", style.Warning.Render("!"), w)
+			}
 		}
 	} else {
 		fmt.Printf("  %s :%d  production  %s\n",
@@ -133,7 +143,11 @@ func printVitalsDatabases(townRoot string) {
 		style.Dim.Render("Rig"), style.Dim.Render("Total"),
 		style.Dim.Render("Open"), style.Dim.Render("Closed"), style.Dim.Render("%"))
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, cfgErr := doltserver.DefaultConfig(townRoot)
+	if cfgErr != nil {
+		fmt.Printf("  %s (dolt config unavailable: %v)\n", style.Dim.Render("○"), cfgErr)
+		return
+	}
 	for _, db := range databases {
 		if orphanSet[db] {
 			continue

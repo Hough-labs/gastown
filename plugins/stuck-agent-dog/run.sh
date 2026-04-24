@@ -11,6 +11,38 @@ RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
 log() { echo "[stuck-agent-dog] $*"; }
 
+# find_open_escalation <subject-label>
+# Returns the ID of the first open escalation bead carrying the given subject
+# label, or empty if none. Used to dedup: when a persistent condition (e.g.
+# deacon stuck) is detected every tick, we don't want to file a new escalation
+# each time — one open bead per subject is enough.
+find_open_escalation() {
+  local subject_label="$1"
+  bd list --status=open --label=gt:escalation --label="$subject_label" --json 2>/dev/null \
+    | jq -r '.[0].id // empty' 2>/dev/null
+}
+
+# escalate_once <subject-label> <severity> <description>
+# Escalates iff no open escalation with the given subject label exists.
+# Tags the newly-created escalation with the subject label for future dedup.
+escalate_once() {
+  local subject_label="$1" severity="$2" description="$3"
+  local existing
+  existing=$(find_open_escalation "$subject_label")
+  if [ -n "$existing" ]; then
+    log "  SKIP escalation: existing open bead $existing ($subject_label)"
+    return 0
+  fi
+  local created_id
+  created_id=$(gt escalate "$description" -s "$severity" --json 2>/dev/null | jq -r '.id // empty')
+  if [ -z "$created_id" ]; then
+    log "  WARN: gt escalate failed or returned no id"
+    return 1
+  fi
+  bd tag "$created_id" "$subject_label" >/dev/null 2>&1 || true
+  log "  CREATED escalation $created_id ($subject_label)"
+}
+
 # --- Enumerate agents ---------------------------------------------------------
 
 log "=== Checking agent health ==="
@@ -128,8 +160,8 @@ TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
 if [ "$TOTAL_ISSUES" -ge 3 ]; then
   log ""
   log "MASS DEATH: $TOTAL_ISSUES agents down — escalating instead of restarting"
-  gt escalate "Mass agent death: $TOTAL_ISSUES agents down" \
-    -s CRITICAL 2>/dev/null || true
+  escalate_once "subject:polecats:mass-death" "CRITICAL" \
+    "Mass agent death: $TOTAL_ISSUES agents down" || true
 fi
 
 # --- Take action --------------------------------------------------------------
@@ -158,10 +190,19 @@ action: restart requested
 BODY
 done
 
-# Deacon issues: escalate
+# Deacon issues: escalate (deduped by stable subject key — the variable
+# heartbeat-age is intentionally excluded so repeated ticks update the same
+# escalation instead of filing N new ones).
 if [ -n "$DEACON_ISSUE" ]; then
-  log "Escalating deacon issue: $DEACON_ISSUE"
-  gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" -s HIGH 2>/dev/null || true
+  case "$DEACON_ISSUE" in
+    stuck_heartbeat_*) SUBJECT="subject:deacon:stuck_heartbeat" ;;
+    crashed)           SUBJECT="subject:deacon:crashed" ;;
+    zombie)            SUBJECT="subject:deacon:zombie" ;;
+    *)                 SUBJECT="subject:deacon:$DEACON_ISSUE" ;;
+  esac
+  log "Deacon issue: $DEACON_ISSUE (subject=$SUBJECT)"
+  escalate_once "$SUBJECT" "HIGH" \
+    "Deacon $DEACON_ISSUE detected by stuck-agent-dog" || true
 fi
 
 # --- Report -------------------------------------------------------------------

@@ -3,7 +3,6 @@ package cmd
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -12,20 +11,18 @@ import (
 )
 
 func TestBuildBdInitArgs_AlwaysIncludesServerPort(t *testing.T) {
+	// TODO: this test encodes the old "silent fallback to 3307" behavior that
+	// no longer exists — DefaultConfig now returns ErrPortNotConfigured when
+	// nothing resolves. buildBdInitArgs should therefore return an error here.
+	// Left as-is pending a test-logic rewrite; for now just assert the error
+	// path so the build stays green.
 	townDir := t.TempDir()
 	t.Setenv("GT_DOLT_PORT", "")
 	t.Setenv("BEADS_DOLT_PORT", "")
 
-	args := buildBdInitArgs(townDir)
-
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d: %v", len(args), args)
-	}
-	if args[4] != "--server-port" {
-		t.Fatalf("expected args[4] = --server-port, got %q", args[4])
-	}
-	if args[5] != "3307" {
-		t.Fatalf("expected default port 3307, got %q", args[5])
+	_, err := buildBdInitArgs(townDir)
+	if err == nil {
+		t.Fatalf("expected ErrPortNotConfigured, got nil")
 	}
 }
 
@@ -34,7 +31,10 @@ func TestBuildBdInitArgs_RespectsGTDoltPortEnv(t *testing.T) {
 
 	t.Setenv("GT_DOLT_PORT", "4400")
 
-	args := buildBdInitArgs(townDir)
+	args, err := buildBdInitArgs(townDir)
+	if err != nil {
+		t.Fatalf("buildBdInitArgs: %v", err)
+	}
 
 	if args[5] != "4400" {
 		t.Fatalf("expected port 4400 from GT_DOLT_PORT, got %q", args[5])
@@ -44,17 +44,20 @@ func TestBuildBdInitArgs_RespectsGTDoltPortEnv(t *testing.T) {
 func TestBuildBdInitArgs_ConfigYAMLTakesPrecedence(t *testing.T) {
 	townDir := t.TempDir()
 	doltDataDir := filepath.Join(townDir, ".dolt-data")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+	if err := os.MkdirAll(doltDataDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	configYAML := "listener:\n  host: 127.0.0.1\n  port: 5500\n"
-	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte(configYAML), 0o644); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
 	}
 
 	t.Setenv("GT_DOLT_PORT", "4400")
 
-	args := buildBdInitArgs(townDir)
+	args, err := buildBdInitArgs(townDir)
+	if err != nil {
+		t.Fatalf("buildBdInitArgs: %v", err)
+	}
 
 	if args[5] != "5500" {
 		t.Fatalf("expected port 5500 from config.yaml (precedence over env), got %q", args[5])
@@ -62,13 +65,19 @@ func TestBuildBdInitArgs_ConfigYAMLTakesPrecedence(t *testing.T) {
 }
 
 func TestBuildBdInitArgs_PortMatchesDefaultConfig(t *testing.T) {
+	// TODO: with no port source configured, DefaultConfig now returns
+	// ErrPortNotConfigured. This test used to compare args[5] against the
+	// silent 3307 fallback; asserting the error path preserves test intent
+	// (buildBdInitArgs and DefaultConfig agree on the resolution outcome).
 	townDir := t.TempDir()
+	t.Setenv("GT_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 
-	args := buildBdInitArgs(townDir)
-	cfg := doltserver.DefaultConfig(townDir)
+	_, argsErr := buildBdInitArgs(townDir)
+	_, cfgErr := doltserver.DefaultConfig(townDir)
 
-	if args[5] != strconv.Itoa(cfg.Port) {
-		t.Fatalf("port should match DefaultConfig: args=%q, config=%d", args[5], cfg.Port)
+	if (argsErr == nil) != (cfgErr == nil) {
+		t.Fatalf("buildBdInitArgs err=%v, DefaultConfig err=%v — expected same outcome", argsErr, cfgErr)
 	}
 }
 
@@ -101,7 +110,7 @@ func TestEnsureBeadsConfigYAML_RepairsPrefixKeysAndPreservesOtherLines(t *testin
 		"issue-prefix: wrong",
 		"",
 	}, "\n")
-	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
 	}
 
@@ -128,7 +137,7 @@ func TestEnsureBeadsConfigYAML_RepairsPrefixKeysAndPreservesOtherLines(t *testin
 func TestEnsureBeadsConfigYAML_AddsMissingIssuePrefixKey(t *testing.T) {
 	beadsDir := t.TempDir()
 	path := filepath.Join(beadsDir, "config.yaml")
-	if err := os.WriteFile(path, []byte("prefix: hq\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("prefix: hq\n"), 0o644); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
 	}
 

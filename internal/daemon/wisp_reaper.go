@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -321,10 +322,15 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	mol.closeStep("report")
 }
 
-// doltServerPort returns the configured Dolt server port.
+// doltServerPort returns the configured Dolt server port, or 0 when it cannot
+// be resolved from any source. Callers that need to connect to Dolt must check
+// for 0 and skip rather than defaulting to a compiled-in port (gt-9q4j).
 func (d *Daemon) doltServerPort() int {
 	if d.doltServer != nil {
 		return d.doltServer.config.Port
 	}
-	return 3307
+	if cfg, err := doltserver.DefaultConfig(d.config.TownRoot); err == nil && cfg != nil {
+		return cfg.Port
+	}
+	return 0
 }

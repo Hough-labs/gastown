@@ -162,17 +162,20 @@ func ensureDoltPortEnv(townRoot string) {
 	var port int
 	if state, err := doltserver.LoadState(townRoot); err == nil && state.Port > 0 {
 		port = state.Port
-	} else {
-		port = doltserver.DefaultPort
+	} else if cfg, err := doltserver.DefaultConfig(townRoot); err == nil && cfg != nil {
+		// No compiled-in default — only set env if we could actually resolve
+		// a port from config.yaml / GT_DOLT_PORT / daemon.json.
+		port = cfg.Port
 	}
-	portStr := strconv.Itoa(port)
-	os.Setenv("GT_DOLT_PORT", portStr)
-	os.Setenv("BEADS_DOLT_PORT", portStr)
+	if port > 0 {
+		portStr := strconv.Itoa(port)
+		os.Setenv("GT_DOLT_PORT", portStr)
+		os.Setenv("BEADS_DOLT_PORT", portStr)
+	}
 
 	// Propagate host so bd doesn't fall back to 127.0.0.1.
-	doltCfg := doltserver.DefaultConfig(townRoot)
-	if doltCfg.Host != "" {
-		os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
+	if cfg, err := doltserver.DefaultConfig(townRoot); err == nil && cfg != nil && cfg.Host != "" {
+		os.Setenv("BEADS_DOLT_SERVER_HOST", cfg.Host)
 	}
 }
 

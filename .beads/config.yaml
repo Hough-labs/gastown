@@ -58,3 +58,4 @@ dolt.auto-push: "off"
 backup:
   enabled: false
 
+sync.remote: "git+https://github.com/hunterBhough/gastown.git"

@@ -32,15 +32,15 @@ const (
 // testPollutionPatterns matches issue IDs or titles that indicate test data leaked
 // into production exports. These records are filtered out before writing JSONL.
 var testPollutionPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)^Test Issue`),                              // title: "Test Issue ..."
-	regexp.MustCompile(`(?i)^test[_\s]`),                               // title: "test_something" or "test something"
-	regexp.MustCompile(`^bd-[0-9]{1,2}$`),                              // id: bd-1, bd-99 (suspiciously short IDs)
-	regexp.MustCompile(`^bd-[a-z]{3,5}[0-9]{1,2}$`),                   // id: bd-abc12 (test-style IDs)
-	regexp.MustCompile(`^(testdb_|beads_t|beads_pt|doctest_)`),         // id prefixes from test databases
-	regexp.MustCompile(`(?i)^--help`),                                  // title: "--help" CLI artifacts
-	regexp.MustCompile(`(?i)^Usage:\s`),                                // title: "Usage: ..." CLI help output
-	regexp.MustCompile(`^offlinebrew-`),                                // id: offlinebrew-* test prefixes
-	regexp.MustCompile(`-wisp-`),                                       // id: wisp-pattern IDs leaked into issues table
+	regexp.MustCompile(`(?i)^Test Issue`),                      // title: "Test Issue ..."
+	regexp.MustCompile(`(?i)^test[_\s]`),                       // title: "test_something" or "test something"
+	regexp.MustCompile(`^bd-[0-9]{1,2}$`),                      // id: bd-1, bd-99 (suspiciously short IDs)
+	regexp.MustCompile(`^bd-[a-z]{3,5}[0-9]{1,2}$`),            // id: bd-abc12 (test-style IDs)
+	regexp.MustCompile(`^(testdb_|beads_t|beads_pt|doctest_)`), // id prefixes from test databases
+	regexp.MustCompile(`(?i)^--help`),                          // title: "--help" CLI artifacts
+	regexp.MustCompile(`(?i)^Usage:\s`),                        // title: "Usage: ..." CLI help output
+	regexp.MustCompile(`^offlinebrew-`),                        // id: offlinebrew-* test prefixes
+	regexp.MustCompile(`-wisp-`),                               // id: wisp-pattern IDs leaked into issues table
 }
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
@@ -232,7 +232,7 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 
 	// Create per-database subdirectory.
 	dbDir := filepath.Join(gitRepo, db)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		return 0, fmt.Errorf("creating dir %s: %w", dbDir, err)
 	}
 
@@ -277,8 +277,10 @@ func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, err
 
 	// Prefer querying the running server (accurate, up-to-date data) over embedded
 	// mode (reads on-disk state which may lag behind server commits).
+	// port 0 means "no running server known" — falls back to embedded-mode dolt
+	// below.
 	host := "127.0.0.1"
-	port := 3307
+	port := 0
 	user := "root"
 	password := ""
 	useServer := false
@@ -293,7 +295,7 @@ func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, err
 			user = d.doltServer.config.User
 		}
 		password = d.doltServer.config.Password
-		useServer = true
+		useServer = port != 0
 	}
 
 	var cmd *exec.Cmd
@@ -344,7 +346,7 @@ func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, err
 		buf.WriteByte('\n')
 	}
 
-	if err := os.WriteFile(tmpPath, buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o644); err != nil {
 		return 0, fmt.Errorf("writing %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, outPath); err != nil {
@@ -606,7 +608,7 @@ func saveSpikeBaseline(gitRepo string, counts map[string]int) error {
 	}
 	// Ensure the spike baseline file is git-ignored.
 	ensureGitIgnore(gitRepo, spikeBaselineFile)
-	return os.WriteFile(filepath.Join(gitRepo, spikeBaselineFile), data, 0644)
+	return os.WriteFile(filepath.Join(gitRepo, spikeBaselineFile), data, 0o644)
 }
 
 // ensureGitIgnore adds an entry to .gitignore if not already present.
@@ -624,7 +626,7 @@ func ensureGitIgnore(gitRepo, entry string) {
 		content += "\n"
 	}
 	content += entry + "\n"
-	if err := os.WriteFile(ignorePath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(ignorePath, []byte(content), 0o644); err != nil {
 		// Non-fatal: spike-baseline writes still work without the ignore entry.
 		return
 	}
@@ -799,7 +801,7 @@ func (d *Daemon) applyPollutionFilter(gitRepo string, databases []string) int {
 		filtered, removed := filterTestPollution(data)
 		if removed > 0 {
 			d.logger.Printf("jsonl_git_backup: %s: filtered %d test-pollution record(s)", db, removed)
-			if err := os.WriteFile(issuesPath, filtered, 0644); err != nil {
+			if err := os.WriteFile(issuesPath, filtered, 0o644); err != nil {
 				d.logger.Printf("jsonl_git_backup: %s: error writing filtered file: %v", db, err)
 				continue
 			}

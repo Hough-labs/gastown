@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -157,7 +158,7 @@ var semverPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
 func New(config *Config) (*Daemon, error) {
 	// Ensure daemon directory exists
 	daemonDir := filepath.Dir(config.LogFile)
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
 
@@ -249,9 +250,10 @@ func New(config *Config) (*Daemon, error) {
 	// Fallback: if GT_DOLT_PORT still isn't set (no DoltServerManager, daemon
 	// started independently of gt up), detect the port from dolt config.
 	// This ensures AgentEnv() always has the port for spawned sessions. (GH#2412)
+	// If DefaultConfig can't resolve a port (no config at all), skip — the
+	// caller chain will surface the error when a command actually needs it.
 	if os.Getenv("GT_DOLT_PORT") == "" {
-		doltCfg := doltserver.DefaultConfig(config.TownRoot)
-		if doltCfg.Port > 0 {
+		if doltCfg, err := doltserver.DefaultConfig(config.TownRoot); err == nil && doltCfg.Port > 0 {
 			portStr := strconv.Itoa(doltCfg.Port)
 			os.Setenv("GT_DOLT_PORT", portStr)
 			os.Setenv("BEADS_DOLT_PORT", portStr)
@@ -262,8 +264,7 @@ func New(config *Config) (*Daemon, error) {
 	// Propagate Dolt host to process env so bd doesn't fall back to 127.0.0.1
 	// when the server runs on a remote machine (e.g., mini2 over Tailscale).
 	if os.Getenv("BEADS_DOLT_SERVER_HOST") == "" {
-		doltCfg := doltserver.DefaultConfig(config.TownRoot)
-		if doltCfg.Host != "" {
+		if doltCfg, err := doltserver.DefaultConfig(config.TownRoot); err == nil && doltCfg.Host != "" {
 			os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
 			logger.Printf("Set BEADS_DOLT_SERVER_HOST=%s from Dolt config", doltCfg.Host)
 		}
@@ -356,8 +357,17 @@ func (d *Daemon) Run() (err error) {
 	// This prevents the TOCTOU race condition where multiple concurrent starts
 	// can all pass the IsRunning() check before any writes the PID file.
 	// Uses gofrs/flock for cross-platform compatibility (Unix + Windows).
+	//
+	// O_CLOEXEC is set explicitly so exec'd children (bd subprocesses, feed
+	// curator shells, etc.) don't inherit the lock fd. Go's runtime sets
+	// CLOEXEC by default via fcntl after open, but that leaves a tiny race
+	// window; passing it in the open flags closes the window atomically.
+	// Without this, a child that outlives the daemon can hold the lock and
+	// block every restart attempt with "daemon already running" — the
+	// 2026-04-23 10,868-restart crash-loop.
 	lockFile := filepath.Join(d.config.TownRoot, "daemon", "daemon.lock")
-	fileLock := flock.New(lockFile)
+	fileLock := flock.New(lockFile,
+		flock.SetFlag(os.O_CREATE|os.O_RDONLY|syscall.O_CLOEXEC))
 
 	// Try to acquire exclusive lock (non-blocking)
 	locked, err := fileLock.TryLock()
@@ -365,7 +375,27 @@ func (d *Daemon) Run() (err error) {
 		return fmt.Errorf("acquiring lock: %w", err)
 	}
 	if !locked {
-		return fmt.Errorf("daemon already running (lock held by another process)")
+		// Lock held — but was it by a live daemon, or by an orphaned child
+		// that outlived a dead parent? Ask IsRunning, which checks the PID
+		// file. If no live daemon exists, the lock is stale; break it by
+		// unlinking the lockfile (flock is inode-based, so a new file at
+		// the same path gets a fresh lock while the orphan keeps its lock
+		// on the deleted inode).
+		running, _, _ := IsRunning(d.config.TownRoot)
+		if running {
+			return fmt.Errorf("daemon already running (lock held by another process)")
+		}
+		d.logger.Printf("Stale daemon lock detected (no live daemon); breaking")
+		_ = os.Remove(lockFile)
+		fileLock = flock.New(lockFile,
+			flock.SetFlag(os.O_CREATE|os.O_RDONLY|syscall.O_CLOEXEC))
+		locked, err = fileLock.TryLock()
+		if err != nil {
+			return fmt.Errorf("acquiring lock after stale-lock recovery: %w", err)
+		}
+		if !locked {
+			return fmt.Errorf("daemon already running (lock held by another process, stale-lock recovery failed)")
+		}
 	}
 	defer func() { _ = fileLock.Unlock() }()
 
@@ -937,15 +967,18 @@ func (d *Daemon) ensureDoltServerRunning() {
 	}
 
 	// Update OTel gauges with the latest Dolt health snapshot.
+	// Skip silently if port isn't configured yet — metrics are observability,
+	// not control flow.
 	if d.metrics != nil {
-		h := doltserver.GetHealthMetrics(d.config.TownRoot)
-		d.metrics.updateDoltHealth(
-			int64(h.Connections),
-			int64(h.MaxConnections),
-			float64(h.QueryLatency.Milliseconds()),
-			h.DiskUsageBytes,
-			h.Healthy,
-		)
+		if h, err := doltserver.GetHealthMetrics(d.config.TownRoot); err == nil {
+			d.metrics.updateDoltHealth(
+				int64(h.Connections),
+				int64(h.MaxConnections),
+				float64(h.QueryLatency.Milliseconds()),
+				h.DiskUsageBytes,
+				h.Healthy,
+			)
+		}
 	}
 }
 
@@ -1516,7 +1549,6 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		}
 	}
 }
-
 
 // restartStuckDeacon kills a stuck Deacon session and respawns it.
 // Uses RestartTracker for exponential backoff and crash-loop prevention.
@@ -2698,7 +2730,7 @@ Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")// Identify as daemon, not overseer
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon") // Identify as daemon, not overseer
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}

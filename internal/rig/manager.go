@@ -372,7 +372,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	}
 
 	// Create container directory
-	if err := os.MkdirAll(rigPath, 0755); err != nil {
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
 		return nil, fmt.Errorf("creating rig directory: %w", err)
 	}
 
@@ -503,7 +503,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// avoiding a redundant download from the remote (GH#1059).
 	fmt.Printf("  Creating mayor clone...\n")
 	mayorRigPath := filepath.Join(rigPath, "mayor", "rig")
-	if err := os.MkdirAll(filepath.Dir(mayorRigPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(mayorRigPath), 0o755); err != nil {
 		return nil, fmt.Errorf("creating mayor dir: %w", err)
 	}
 	if opts.CloneFilter != "" {
@@ -593,7 +593,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			// Always pass --server-port so bd connects to gt's central Dolt
 			// server. Without this, bd auto-starts its own server on a random
 			// port, causing "database not found" errors. (GH #2405)
-			doltCfg := doltserver.DefaultConfig(m.townRoot)
+			doltCfg, err := doltserver.DefaultConfig(m.townRoot)
+			if err != nil {
+				return nil, fmt.Errorf("resolving dolt port: %w", err)
+			}
 			initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
 			cmd := exec.Command("bd", initArgs...)
 			cmd.Dir = mayorRigPath
@@ -712,7 +715,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Being on the default branch allows direct merge workflow.
 	fmt.Printf("  Creating refinery worktree...\n")
 	refineryRigPath := filepath.Join(rigPath, "refinery", "rig")
-	if err := os.MkdirAll(filepath.Dir(refineryRigPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(refineryRigPath), 0o755); err != nil {
 		return nil, fmt.Errorf("creating refinery dir: %w", err)
 	}
 	if err := bareGit.WorktreeAddExisting(refineryRigPath, defaultBranch); err != nil {
@@ -740,7 +743,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 
 	// Create empty crew directory with README (crew members added via gt crew add)
 	crewPath := filepath.Join(rigPath, "crew")
-	if err := os.MkdirAll(crewPath, 0755); err != nil {
+	if err := os.MkdirAll(crewPath, 0o755); err != nil {
 		return nil, fmt.Errorf("creating crew dir: %w", err)
 	}
 	// Create README with instructions
@@ -762,12 +765,12 @@ gt crew add <name>    # Creates crew/<name>/ with a git clone
 
 Use crew for your own workspace. Polecats are for batch work dispatch.
 `
-	if err := os.WriteFile(readmePath, []byte(readmeContent), 0644); err != nil {
+	if err := os.WriteFile(readmePath, []byte(readmeContent), 0o644); err != nil {
 		return nil, fmt.Errorf("creating crew README: %w", err)
 	}
 	// Create witness directory (no clone needed)
 	witnessPath := filepath.Join(rigPath, "witness")
-	if err := os.MkdirAll(witnessPath, 0755); err != nil {
+	if err := os.MkdirAll(witnessPath, 0o755); err != nil {
 		return nil, fmt.Errorf("creating witness dir: %w", err)
 	}
 	// NOTE: Witness hooks are installed by witness/manager.go:Start() via EnsureSettingsForRole.
@@ -778,7 +781,7 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// in workDir (other agents). Scaffolding here ensures the settings file exists
 	// before the first polecat session starts, preventing startup failures.
 	polecatsPath := filepath.Join(rigPath, "polecats")
-	if err := os.MkdirAll(polecatsPath, 0755); err != nil {
+	if err := os.MkdirAll(polecatsPath, 0o755); err != nil {
 		return nil, fmt.Errorf("creating polecats dir: %w", err)
 	}
 	// Use the town's default_agent for scaffolding, falling back to claude.
@@ -825,7 +828,7 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 
 	// Create rig-level settings directory (used by gt config for rig overrides)
 	rigSettingsPath := filepath.Join(rigPath, constants.DirSettings)
-	if err := os.MkdirAll(rigSettingsPath, 0755); err != nil {
+	if err := os.MkdirAll(rigSettingsPath, 0o755); err != nil {
 		return nil, fmt.Errorf("creating settings dir: %w", err)
 	}
 
@@ -940,7 +943,7 @@ func (m *Manager) saveRigConfig(rigPath string, cfg *RigConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, data, 0644)
+	return os.WriteFile(configPath, data, 0o644)
 }
 
 // LoadRigConfig reads the rig configuration from config.json.
@@ -998,18 +1001,18 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	// If so, create a redirect file instead of a new database.
 	if _, err := os.Stat(mayorRigBeads); err == nil {
 		// Tracked beads exist - create redirect to mayor/rig/.beads
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 			return err
 		}
 		redirectPath := filepath.Join(beadsDir, "redirect")
-		if err := os.WriteFile(redirectPath, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		if err := os.WriteFile(redirectPath, []byte("mayor/rig/.beads\n"), 0o644); err != nil {
 			return fmt.Errorf("creating redirect file: %w", err)
 		}
 		return nil
 	}
 
 	// No tracked beads - create local database
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		return err
 	}
 
@@ -1060,7 +1063,10 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	initArgs = append(initArgs, "--server")
 	// Always pass --server-port so bd connects to gt's central Dolt server.
 	// Without this, bd auto-starts its own server on a random port. (GH #2405)
-	doltCfg := doltserver.DefaultConfig(m.townRoot)
+	doltCfg, err := doltserver.DefaultConfig(m.townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt port: %w", err)
+	}
 	initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = rigPath
@@ -1206,7 +1212,7 @@ func (m *Manager) ensureGitignoreEntry(gitignorePath, entry string) error {
 	}
 
 	// Append entry
-	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) //nolint:gosec // G302: .gitignore should be readable by git tools
+	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec // G302: .gitignore should be readable by git tools
 	if err != nil {
 		return err
 	}
@@ -1753,7 +1759,7 @@ func (m *Manager) seedPatrolMoleculesManually(rigPath string) error {
 func (m *Manager) createPluginDirectories(rigPath string) error {
 	// Town-level plugins directory
 	townPluginsDir := filepath.Join(m.townRoot, "plugins")
-	if err := os.MkdirAll(townPluginsDir, 0755); err != nil {
+	if err := os.MkdirAll(townPluginsDir, 0o755); err != nil {
 		return fmt.Errorf("creating town plugins directory: %w", err)
 	}
 
@@ -1778,7 +1784,7 @@ Each plugin is a directory containing:
 
 See docs/deacon-plugins.md for full documentation.
 `
-		if writeErr := os.WriteFile(townReadme, []byte(content), 0644); writeErr != nil {
+		if writeErr := os.WriteFile(townReadme, []byte(content), 0o644); writeErr != nil {
 			// Non-fatal
 			return nil
 		}
@@ -1786,7 +1792,7 @@ See docs/deacon-plugins.md for full documentation.
 
 	// Rig-level plugins directory
 	rigPluginsDir := filepath.Join(rigPath, "plugins")
-	if err := os.MkdirAll(rigPluginsDir, 0755); err != nil {
+	if err := os.MkdirAll(rigPluginsDir, 0o755); err != nil {
 		return fmt.Errorf("creating rig plugins directory: %w", err)
 	}
 

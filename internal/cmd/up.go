@@ -8,9 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -211,7 +211,12 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// 0. Dolt server (if configured)
 	go func() {
 		defer startupWg.Done()
-		cfg := doltserver.DefaultConfig(townRoot)
+		cfg, cfgErr := doltserver.DefaultConfig(townRoot)
+		if cfgErr != nil {
+			doltSkipped = true
+			doltDetail = cfgErr.Error()
+			return
+		}
 		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
 			doltSkipped = true
 			return
@@ -327,12 +332,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// bd auto-starts rogue Dolt instances in agent tmux sessions. (GH#2412)
 		// Host propagation prevents bd from falling back to 127.0.0.1 when the
 		// Dolt server runs on a remote machine (e.g., mini2 over Tailscale).
-		doltCfg := doltserver.DefaultConfig(townRoot)
-		portStr := fmt.Sprintf("%d", doltCfg.Port)
-		os.Setenv("GT_DOLT_PORT", portStr)
-		os.Setenv("BEADS_DOLT_PORT", portStr)
-		if doltCfg.Host != "" {
-			os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
+		if doltCfg, err := doltserver.DefaultConfig(townRoot); err == nil {
+			portStr := fmt.Sprintf("%d", doltCfg.Port)
+			os.Setenv("GT_DOLT_PORT", portStr)
+			os.Setenv("BEADS_DOLT_PORT", portStr)
+			if doltCfg.Host != "" {
+				os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
+			}
 		}
 	}
 
@@ -1065,4 +1071,3 @@ func recoverOrphanedBeads(townRoot string, rigs []string, prefetchedRigs map[str
 
 	return services
 }
-

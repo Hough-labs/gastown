@@ -528,7 +528,10 @@ func init() {
 	} else if h := os.Getenv("BEADS_DOLT_SERVER_HOST"); h != "" {
 		defaultHost = h
 	}
-	defaultPort := 3307
+	// No compiled-in default. --port is required at the CLI when env isn't
+	// set; 0 here means "flag default is unset" and ParseFlags will require
+	// the user to pass --port explicitly.
+	defaultPort := 0
 	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
 		if v, err := strconv.Atoi(p); err == nil {
 			defaultPort = v

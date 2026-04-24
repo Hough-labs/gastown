@@ -872,8 +872,11 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 				return nil
 			}
 		}
-		fmt.Println("3307") // DefaultPort
-		return nil
+		// No compiled-in default since gt-9q4j. If nothing is set across
+		// config.yaml / env / daemon.json, report it and exit nonzero so
+		// scripts can react rather than consuming a fake port.
+		fmt.Fprintln(os.Stderr, "(not set)")
+		return fmt.Errorf("dolt port not configured: run 'gt config set dolt.port <port>'")
 
 	default:
 		if strings.HasPrefix(key, "lifecycle.") {

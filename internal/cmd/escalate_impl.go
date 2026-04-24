@@ -98,6 +98,41 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating escalation bead: %w", err)
 	}
 
+	// Auto-ack path: if the description matches an auto_ack_pattern in
+	// escalation.json, close the escalation immediately instead of routing
+	// to mail/mayor. The bead stays in the audit trail but no LLM session
+	// gets spawned to ack it. This breaks feedback loops where a dog-detected
+	// condition fires every tick — the condition still produces an auditable
+	// bead, but 48 of them no longer spawn 48 mayor sessions.
+	if match := escalationConfig.MatchAutoAck(description, severity); match != nil {
+		if ackErr := bd.AckEscalation(issue.ID, "escalation-router/auto-ack"); ackErr != nil {
+			style.PrintWarning("auto-ack: failed to mark acked: %v", ackErr)
+		}
+		if closeErr := bd.Close(issue.ID, match.Reason); closeErr != nil {
+			style.PrintWarning("auto-ack: failed to close: %v", closeErr)
+		}
+		payload := events.EscalationPayload(issue.ID, agentID, "auto-ack", description)
+		payload["severity"] = severity
+		payload["auto_ack_pattern"] = match.Pattern
+		_ = events.LogFeed(events.TypeEscalationSent, agentID, payload)
+		if escalateJSON {
+			result := map[string]interface{}{
+				"id":       issue.ID,
+				"severity": severity,
+				"actions":  []string{"bead", "auto-ack"},
+				"targets":  []string{},
+				"status":   "auto_acked",
+				"reason":   match.Reason,
+				"pattern":  match.Pattern,
+			}
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			fmt.Printf("✓ Escalation %s auto-acked (matched %q): %s\n", issue.ID, match.Pattern, match.Reason)
+		}
+		return nil
+	}
+
 	// Get routing actions for this severity
 	actions := escalationConfig.GetRouteForSeverity(severity)
 	targets := extractMailTargetsFromActions(actions)

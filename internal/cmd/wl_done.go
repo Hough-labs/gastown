@@ -60,7 +60,11 @@ func runWlDone(cmd *cobra.Command, args []string) error {
 	completionID := generateCompletionID(wantedID, rigHandle)
 
 	dbName := wasteland.ResolveDBName(townRoot)
-	if !doltserver.DatabaseExists(townRoot, dbName) {
+	dbExists, dbExistsErr := doltserver.DatabaseExists(townRoot, dbName)
+	if dbExistsErr != nil {
+		return fmt.Errorf("checking database %q: %w", dbName, dbExistsErr)
+	}
+	if !dbExists {
 		// Fallback for wl-commons clone-based workspaces (join creates .wasteland clone).
 		if wlCfg.LocalDir == "" {
 			return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)

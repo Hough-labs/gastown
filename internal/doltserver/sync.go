@@ -162,7 +162,10 @@ func PullDatabaseSQL(townRoot, db, remote string) error {
 	pullQuery := fmt.Sprintf("USE `%s`; CALL DOLT_PULL('%s')", db, remote)
 
 	// Pull can be slow for large databases or slow remotes
-	config := DefaultConfig(townRoot)
+	config, err := DefaultConfig(townRoot)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -359,7 +362,10 @@ func PushDatabaseSQL(townRoot, db, remote string, force bool) error {
 	}
 
 	// Push can be slow for large databases — use a longer timeout
-	config := DefaultConfig(townRoot)
+	config, err := DefaultConfig(townRoot)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -378,7 +384,10 @@ func FindRemoteSQL(townRoot, db string) (name, url string, err error) {
 	if !validSQLName(db) {
 		return "", "", fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+", db)
 	}
-	config := DefaultConfig(townRoot)
+	config, cfgErr := DefaultConfig(townRoot)
+	if cfgErr != nil {
+		return "", "", cfgErr
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

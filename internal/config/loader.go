@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -2949,4 +2950,52 @@ func (c *EscalationConfig) GetMaxReescalations() int {
 		return 2
 	}
 	return *c.MaxReescalations
+}
+
+// MatchAutoAck returns the first AutoAckPattern whose regexp matches description
+// and whose severity_max is >= the given severity. Returns nil if no match, or
+// if severity is "critical" (critical never auto-acks regardless of pattern).
+//
+// Severities are ranked: low < medium < high. A pattern with SeverityMax="medium"
+// matches severities "low" and "medium" but not "high". Empty SeverityMax is
+// treated as "high" (matches all non-critical).
+//
+// The pattern author is responsible for providing a valid regexp; a malformed
+// pattern is silently skipped so one bad entry doesn't disable auto-ack for
+// the whole list. Escalations that fail to match continue through normal
+// mail/mayor routing.
+func (c *EscalationConfig) MatchAutoAck(description, severity string) *AutoAckPattern {
+	if severity == SeverityCritical {
+		return nil
+	}
+	sevRank := func(s string) int {
+		switch s {
+		case SeverityLow:
+			return 1
+		case SeverityMedium:
+			return 2
+		case SeverityHigh:
+			return 3
+		}
+		return 0
+	}
+	reqRank := sevRank(severity)
+	for i := range c.AutoAckPatterns {
+		p := &c.AutoAckPatterns[i]
+		maxRank := sevRank(p.SeverityMax)
+		if p.SeverityMax == "" {
+			maxRank = sevRank(SeverityHigh)
+		}
+		if reqRank > maxRank {
+			continue
+		}
+		re, err := regexp.Compile(p.Pattern)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(description) {
+			return p
+		}
+	}
+	return nil
 }

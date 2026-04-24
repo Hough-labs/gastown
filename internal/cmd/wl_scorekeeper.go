@@ -51,7 +51,11 @@ func runWlScorekeeper(cmd *cobra.Command, args []string) error {
 	}
 
 	dbName := wasteland.ResolveDBName(townRoot)
-	if !doltserver.DatabaseExists(townRoot, dbName) {
+	dbExists, dbExistsErr := doltserver.DatabaseExists(townRoot, dbName)
+	if dbExistsErr != nil {
+		return fmt.Errorf("checking database %q: %w", dbName, dbExistsErr)
+	}
+	if !dbExists {
 		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
 	}
 
@@ -77,10 +81,10 @@ func runScorekeeperWithStore(store doltserver.WLCommonsStore) error {
 
 	if wlScorekeeperJSON {
 		summary := struct {
-			RigsScored   int            `json:"rigs_scored"`
-			TierDist     map[string]int `json:"tier_distribution"`
-			MaxTier      string         `json:"max_tier"`
-			ClusterNote  string         `json:"cluster_note"`
+			RigsScored  int            `json:"rigs_scored"`
+			TierDist    map[string]int `json:"tier_distribution"`
+			MaxTier     string         `json:"max_tier"`
+			ClusterNote string         `json:"cluster_note"`
 		}{
 			RigsScored:  len(entries),
 			TierDist:    tierDist,

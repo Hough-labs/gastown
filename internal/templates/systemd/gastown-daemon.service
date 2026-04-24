@@ -1,13 +1,23 @@
 [Unit]
 Description=Gas Town Daemon
 After=network.target
+# Bound StartLimitBurst prevents runaway crash-loops (2026-04-23: 10,868 restarts
+# in one day when daemon could not acquire its own lock). If the service fails
+# 5 times in 60s, systemd will stop retrying and wait for manual intervention.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart={{.GTPath}} daemon run
 WorkingDirectory={{.TownRoot}}
-Restart=always
+Restart=on-failure
 RestartSec=5s
+# Allow the daemon up to 20s to drain its goroutines (bd subprocesses, feed
+# curator, convoy manager) before systemd escalates SIGTERM → SIGKILL. The
+# default 90s is too long for a crash-loop; 20s is enough for graceful exit
+# without stalling service restart.
+TimeoutStopSec=20
 Environment="GT_TOWN_ROOT={{.TownRoot}}"
 StandardOutput=append:{{.TownRoot}}/daemon/daemon.log
 StandardError=append:{{.TownRoot}}/daemon/daemon.log

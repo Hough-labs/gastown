@@ -15,9 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-var (
-	doltFlattenConfirm bool
-)
+var doltFlattenConfirm bool
 
 var doltFlattenCmd = &cobra.Command{
 	Use:   "flatten <database>",
@@ -64,7 +62,10 @@ func runDoltFlatten(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Dolt server is not running — start with 'gt dolt start'")
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
+	config, err := doltserver.DefaultConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("resolving dolt config: %w", err)
+	}
 	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		config.User, config.HostPort(), dbName)
 

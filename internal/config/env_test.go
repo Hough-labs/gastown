@@ -19,8 +19,8 @@ func TestAgentEnv_Mayor(t *testing.T) {
 	assertEnv(t, env, "GIT_AUTHOR_NAME", "mayor")
 	assertEnv(t, env, "GT_ROOT", "/town")
 	assertEnv(t, env, "GIT_CEILING_DIRECTORIES", "/town") // prevents git walking to umbrella
-	assertEnv(t, env, "NODE_OPTIONS", "")                  // cleared to prevent debugger inheritance
-	assertEnv(t, env, "CLAUDECODE", "")                    // cleared to prevent nested session detection
+	assertEnv(t, env, "NODE_OPTIONS", "")                 // cleared to prevent debugger inheritance
+	assertEnv(t, env, "CLAUDECODE", "")                   // cleared to prevent nested session detection
 	assertNotSet(t, env, "GT_RIG")
 }
 
@@ -55,8 +55,8 @@ func TestAgentEnv_Polecat(t *testing.T) {
 	assertEnv(t, env, "GIT_AUTHOR_NAME", "Toast")
 	assertEnv(t, env, "BEADS_AGENT_NAME", "myrig/Toast")
 	assertEnv(t, env, "BD_DOLT_AUTO_COMMIT", "off") // gt-5cc2p: prevent manifest contention
-	assertEnv(t, env, "NODE_OPTIONS", "")            // cleared to prevent debugger inheritance
-	assertEnv(t, env, "CLAUDECODE", "")              // cleared to prevent nested session detection
+	assertEnv(t, env, "NODE_OPTIONS", "")           // cleared to prevent debugger inheritance
+	assertEnv(t, env, "CLAUDECODE", "")             // cleared to prevent nested session detection
 }
 
 func TestAgentEnv_Crew(t *testing.T) {
@@ -1131,18 +1131,21 @@ func TestResolveDoltPort_FromConfigYAML(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
 	doltDataDir := filepath.Join(tmpDir, ".dolt-data")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+	if err := os.MkdirAll(doltDataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
 		filepath.Join(doltDataDir, "config.yaml"),
 		[]byte("listener:\n  port: 3309\n"),
-		0644,
+		0o644,
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	got := resolveDoltPort(tmpDir)
+	got, err := resolveDoltPort(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveDoltPort() err = %v", err)
+	}
 	if got != 3309 {
 		t.Errorf("resolveDoltPort() = %d, want 3309", got)
 	}
@@ -1152,7 +1155,10 @@ func TestResolveDoltPort_FromEnvVar(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("GT_DOLT_PORT", "3310")
 
-	got := resolveDoltPort(tmpDir)
+	got, err := resolveDoltPort(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveDoltPort() err = %v", err)
+	}
 	if got != 3310 {
 		t.Errorf("resolveDoltPort() = %d, want 3310", got)
 	}
@@ -1163,18 +1169,21 @@ func TestResolveDoltPort_ConfigYAMLTakesPrecedence(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "9999")
 
 	doltDataDir := filepath.Join(tmpDir, ".dolt-data")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+	if err := os.MkdirAll(doltDataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
 		filepath.Join(doltDataDir, "config.yaml"),
 		[]byte("listener:\n  port: 3307\n"),
-		0644,
+		0o644,
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	got := resolveDoltPort(tmpDir)
+	got, err := resolveDoltPort(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveDoltPort() err = %v", err)
+	}
 	if got != 3307 {
 		t.Errorf("resolveDoltPort() = %d, want 3307 (config.yaml > env var)", got)
 	}
@@ -1184,26 +1193,37 @@ func TestResolveDoltPort_FromDaemonJSON(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "") // isolate from live Dolt server
 	tmpDir := t.TempDir()
 	mayorDir := filepath.Join(tmpDir, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	daemonJSON := `{"env": {"GT_DOLT_PORT": "3311"}, "type": "daemon-patrol-config"}`
-	if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got := resolveDoltPort(tmpDir)
+	got, err := resolveDoltPort(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveDoltPort() err = %v", err)
+	}
 	if got != 3311 {
 		t.Errorf("resolveDoltPort() = %d, want 3311", got)
 	}
 }
 
+// TestResolveDoltPort_NoConfig verifies that with no config.yaml, no
+// GT_DOLT_PORT env var, and no daemon.json, the resolver returns
+// ErrDoltPortNotConfigured rather than silently falling back to a hardcoded
+// default. Silent fallback was the root cause of the circuit-breaker storm
+// that motivated ripping out DefaultPort.
 func TestResolveDoltPort_NoConfig(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "") // isolate from live Dolt server
 	tmpDir := t.TempDir()
-	got := resolveDoltPort(tmpDir)
+	got, err := resolveDoltPort(tmpDir)
+	if err == nil {
+		t.Errorf("resolveDoltPort() = %d, want ErrDoltPortNotConfigured", got)
+	}
 	if got != 0 {
-		t.Errorf("resolveDoltPort() = %d, want 0 (no config)", got)
+		t.Errorf("resolveDoltPort() port = %d, want 0 when unconfigured", got)
 	}
 }
 
@@ -1211,13 +1231,13 @@ func TestAgentEnv_InjectsDoltPort(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
 	doltDataDir := filepath.Join(tmpDir, ".dolt-data")
-	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+	if err := os.MkdirAll(doltDataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
 		filepath.Join(doltDataDir, "config.yaml"),
 		[]byte("listener:\n  port: 3307\n"),
-		0644,
+		0o644,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1245,7 +1265,7 @@ func TestAgentEnv_InjectsDoltPort(t *testing.T) {
 }
 
 func TestAgentEnv_NoDoltPortWithoutTownRoot(t *testing.T) {
-	t.Setenv("GT_DOLT_PORT", "")   // isolate from live Dolt server
+	t.Setenv("GT_DOLT_PORT", "")    // isolate from live Dolt server
 	t.Setenv("BEADS_DOLT_PORT", "") // isolate from live Dolt server
 	env := AgentEnv(AgentEnvConfig{
 		Role: "mayor",
@@ -1255,7 +1275,7 @@ func TestAgentEnv_NoDoltPortWithoutTownRoot(t *testing.T) {
 }
 
 func TestAgentEnv_NoDoltPortWithoutConfig(t *testing.T) {
-	t.Setenv("GT_DOLT_PORT", "")   // isolate from live Dolt server
+	t.Setenv("GT_DOLT_PORT", "")    // isolate from live Dolt server
 	t.Setenv("BEADS_DOLT_PORT", "") // isolate from live Dolt server
 	tmpDir := t.TempDir()
 	env := AgentEnv(AgentEnvConfig{

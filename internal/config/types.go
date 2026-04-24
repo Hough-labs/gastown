@@ -1627,6 +1627,33 @@ type EscalationConfig struct {
 	// re-escalated. Default: 2 (low→medium→high, then stops)
 	// Pointer type to distinguish "not configured" (nil) from explicit 0.
 	MaxReescalations *int `json:"max_reescalations,omitempty"`
+
+	// AutoAckPatterns lets routine escalations skip the mail/spawn chain.
+	// When an escalation's description matches a pattern here, the bead is
+	// still created (for audit) but is immediately acked+closed without
+	// routing to mail/mayor. This prevents feedback loops where the same
+	// dog-detected condition spawns a mayor session every tick.
+	//
+	// Patterns are evaluated in order; first match wins. Critical severity
+	// never auto-acks regardless of pattern — a pattern's SeverityMax caps
+	// which severities it applies to.
+	AutoAckPatterns []AutoAckPattern `json:"auto_ack_patterns,omitempty"`
+}
+
+// AutoAckPattern defines a single auto-ack rule. An escalation whose
+// description matches Pattern (Go regexp) is closed immediately with Reason
+// instead of being routed to mail/mayor.
+type AutoAckPattern struct {
+	// Pattern is a Go regexp matched against the escalation description.
+	Pattern string `json:"pattern"`
+
+	// Reason is the close_reason recorded on the escalation bead.
+	Reason string `json:"reason"`
+
+	// SeverityMax caps which severities this pattern applies to.
+	// Valid values: "low", "medium", "high". Never applies to "critical".
+	// Empty means "high" (applies to low/medium/high).
+	SeverityMax string `json:"severity_max,omitempty"`
 }
 
 // EscalationContacts contains contact information for external notification channels.

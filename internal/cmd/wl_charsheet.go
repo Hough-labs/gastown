@@ -55,7 +55,11 @@ func runWlCharsheet(cmd *cobra.Command, args []string) error {
 	}
 
 	dbName := wasteland.ResolveDBName(townRoot)
-	if !doltserver.DatabaseExists(townRoot, dbName) {
+	dbExists, dbExistsErr := doltserver.DatabaseExists(townRoot, dbName)
+	if dbExistsErr != nil {
+		return fmt.Errorf("checking database %q: %w", dbName, dbExistsErr)
+	}
+	if !dbExists {
 		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", dbName)
 	}
 
