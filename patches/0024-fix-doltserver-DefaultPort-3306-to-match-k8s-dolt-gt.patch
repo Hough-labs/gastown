@@ -1,0 +1,101 @@
+From ffd763ac2d9036676a8ec10d1250c9cb1175f2dd Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 23 Apr 2026 22:56:25 -0400
+Subject: [PATCH 24/24] fix(doltserver): DefaultPort 3306 to match k8s dolt
+ (gt-9q4j)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 3307 default pre-dated the k8s dolt migration to native :3306. Silent
+fallback caused the 2026-04-23 circuit-breaker storm ($789 burned, 45
+spurious stuck_heartbeat beads).
+
+Test updates: expected-value fixes in migration_check_test and
+doltserver_test DSN assertions.
+
+Known env-specific failure: TestRemoveDatabase_RefusesLargeDBWhenServerDown
+assumes nothing listens on DefaultPort — held by luck on 3307. Follow-up
+needed if it blocks CI.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ internal/doctor/migration_check_test.go | 8 ++++----
+ internal/doltserver/doltserver.go       | 2 +-
+ internal/doltserver/doltserver_test.go  | 8 ++++----
+ 3 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/internal/doctor/migration_check_test.go b/internal/doctor/migration_check_test.go
+index 04adfb02..584f0b63 100644
+--- a/internal/doctor/migration_check_test.go
++++ b/internal/doctor/migration_check_test.go
+@@ -109,8 +109,8 @@ func TestGetServerAddr(t *testing.T) {
+ 		wantOK   bool
+ 	}{
+ 		{
+-			name:     "defaults to 127.0.0.1:3307",
+-			wantAddr: "127.0.0.1:3307",
++			name:     "defaults to 127.0.0.1:3306",
++			wantAddr: "127.0.0.1:3306",
+ 			wantOK:   true,
+ 		},
+ 		{
+@@ -123,7 +123,7 @@ func TestGetServerAddr(t *testing.T) {
+ 		{
+ 			name:     "IPv6 host gets bracketed",
+ 			host:     "::1",
+-			wantAddr: "[::1]:3307",
++			wantAddr: "[::1]:3306",
+ 			wantOK:   true,
+ 		},
+ 		{
+@@ -136,7 +136,7 @@ func TestGetServerAddr(t *testing.T) {
+ 		{
+ 			name:     "explicit host with default port",
+ 			host:     "dolt.example.com",
+-			wantAddr: "dolt.example.com:3307",
++			wantAddr: "dolt.example.com:3306",
+ 			wantOK:   true,
+ 		},
+ 	}
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index fa2a56d9..e35557be 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -136,7 +136,7 @@ func setDoltGlobalConfig(key, value string) error {
+ 
+ // Default configuration
+ const (
+-	DefaultPort           = 3307
++	DefaultPort           = 3306
+ 	DefaultUser           = "root" // Default Dolt user (no password for local access)
+ 	DefaultMaxConnections = 1000   // Dolt default; no reason to limit below (Tim Sehn confirmed 1k is fine)
+ 
+diff --git a/internal/doltserver/doltserver_test.go b/internal/doltserver/doltserver_test.go
+index 75295fa8..a0ee1a20 100644
+--- a/internal/doltserver/doltserver_test.go
++++ b/internal/doltserver/doltserver_test.go
+@@ -2151,16 +2151,16 @@ func TestListDatabases_MixedContent(t *testing.T) {
+ func TestGetConnectionString(t *testing.T) {
+ 	townRoot := t.TempDir()
+ 	s := GetConnectionString(townRoot)
+-	if s != "root@tcp(127.0.0.1:3307)/" {
+-		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/", s)
++	if s != "root@tcp(127.0.0.1:3306)/" {
++		t.Errorf("got %q, want root@tcp(127.0.0.1:3306)/", s)
+ 	}
+ }
+ 
+ func TestGetConnectionStringForRig(t *testing.T) {
+ 	townRoot := t.TempDir()
+ 	s := GetConnectionStringForRig(townRoot, "hq")
+-	if s != "root@tcp(127.0.0.1:3307)/hq" {
+-		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/hq", s)
++	if s != "root@tcp(127.0.0.1:3306)/hq" {
++		t.Errorf("got %q, want root@tcp(127.0.0.1:3306)/hq", s)
+ 	}
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

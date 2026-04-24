@@ -1,7 +1,7 @@
 From 4ba02193b5c5590f42702d534c26acafc3ddbe59 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 7 Apr 2026 15:02:46 -0400
-Subject: [PATCH 06/23] fix(doltserver): treat 0.0.0.0 (bind-all) as local in
+Subject: [PATCH 06/24] fix(doltserver): treat 0.0.0.0 (bind-all) as local in
  IsRemote
 
 GT_DOLT_HOST=0.0.0.0 lets Dolt bind all interfaces (reachable over

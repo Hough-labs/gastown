@@ -1,7 +1,7 @@
 From fb22d8198858af0a340d4e907889c0870f59bb75 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 16 Apr 2026 19:08:30 -0400
-Subject: [PATCH 15/23] chore(beads): migrate dolt remote to anvil k8s
+Subject: [PATCH 15/24] chore(beads): migrate dolt remote to anvil k8s
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

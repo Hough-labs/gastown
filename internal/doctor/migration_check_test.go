@@ -109,8 +109,8 @@ func TestGetServerAddr(t *testing.T) {
 		wantOK   bool
 	}{
 		{
-			name:     "defaults to 127.0.0.1:3307",
-			wantAddr: "127.0.0.1:3307",
+			name:     "defaults to 127.0.0.1:3306",
+			wantAddr: "127.0.0.1:3306",
 			wantOK:   true,
 		},
 		{
@@ -123,7 +123,7 @@ func TestGetServerAddr(t *testing.T) {
 		{
 			name:     "IPv6 host gets bracketed",
 			host:     "::1",
-			wantAddr: "[::1]:3307",
+			wantAddr: "[::1]:3306",
 			wantOK:   true,
 		},
 		{
@@ -136,7 +136,7 @@ func TestGetServerAddr(t *testing.T) {
 		{
 			name:     "explicit host with default port",
 			host:     "dolt.example.com",
-			wantAddr: "dolt.example.com:3307",
+			wantAddr: "dolt.example.com:3306",
 			wantOK:   true,
 		},
 	}

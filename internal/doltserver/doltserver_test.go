@@ -2151,16 +2151,16 @@ func TestListDatabases_MixedContent(t *testing.T) {
 func TestGetConnectionString(t *testing.T) {
 	townRoot := t.TempDir()
 	s := GetConnectionString(townRoot)
-	if s != "root@tcp(127.0.0.1:3307)/" {
-		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/", s)
+	if s != "root@tcp(127.0.0.1:3306)/" {
+		t.Errorf("got %q, want root@tcp(127.0.0.1:3306)/", s)
 	}
 }
 
 func TestGetConnectionStringForRig(t *testing.T) {
 	townRoot := t.TempDir()
 	s := GetConnectionStringForRig(townRoot, "hq")
-	if s != "root@tcp(127.0.0.1:3307)/hq" {
-		t.Errorf("got %q, want root@tcp(127.0.0.1:3307)/hq", s)
+	if s != "root@tcp(127.0.0.1:3306)/hq" {
+		t.Errorf("got %q, want root@tcp(127.0.0.1:3306)/hq", s)
 	}
 }
 
