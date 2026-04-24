@@ -1,0 +1,132 @@
+From d27542ca78b7a6ad62d7accc0283859af6d08876 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 22 Apr 2026 22:01:15 -0400
+Subject: [PATCH 22/28] fix(config): gate exec_wrapper on role (polecat/crew
+ only)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+runtime.exec_wrapper was applied rig-wide, so witness and refinery
+sessions got wrapped into the sandbox pod along with polecats. Witness
+and refinery are per-rig metal agents; only polecat (and crew) are
+per-bead sandbox occupants.
+
+resolveExecWrapperForRole now returns the wrapper only for polecat/crew;
+the two call sites in BuildStartupCommand / BuildStartupCommandWithAgentOverride
+read GT_ROLE and gate accordingly. Witness and refinery managers drop
+their ResolveExecWrapper branches — they always run on metal, so the
+unwrapped readiness probes (WaitForCommand / WaitForRuntimeReady) are
+always correct. ResolveExecWrapper stays exported for polecat's probe
+selection.
+---
+ internal/config/loader.go    | 28 +++++++++++++++++++++++-----
+ internal/refinery/manager.go | 11 +++--------
+ internal/witness/manager.go  | 12 +++---------
+ 3 files changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/internal/config/loader.go b/internal/config/loader.go
+index 4a4a78c8..23199385 100644
+--- a/internal/config/loader.go
++++ b/internal/config/loader.go
+@@ -2240,9 +2240,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
+ 	}
+ 
+ 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
+-	// ExecWrapper is a deployment-level setting (sandbox/container) independent of agent choice.
++	// ExecWrapper is a deployment-level setting (sandbox/container) independent of agent choice,
++	// but gated on role: only polecat/crew run inside the sandbox pod; witness, refinery,
++	// mayor, and deacon always run on metal.
+ 	if len(rc.ExecWrapper) == 0 {
+-		rc.ExecWrapper = resolveExecWrapper(rigPath)
++		rc.ExecWrapper = resolveExecWrapperForRole(rigPath, envVars["GT_ROLE"])
+ 	}
+ 
+ 	// Copy env vars to avoid mutating caller map
+@@ -2499,8 +2501,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
+ 	rc = withRoleSettingsFlag(rc, role, rigPath)
+ 
+ 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
++	// Gated on role: only polecat/crew are wrapped (sandbox pod). Witness, refinery,
++	// mayor, and deacon run on metal and must not be wrapped.
+ 	if len(rc.ExecWrapper) == 0 {
+-		rc.ExecWrapper = resolveExecWrapper(rigPath)
++		rc.ExecWrapper = resolveExecWrapperForRole(rigPath, envVars["GT_ROLE"])
+ 	}
+ 
+ 	// Copy env vars to avoid mutating caller map
+@@ -2722,10 +2726,24 @@ func resolveExecWrapper(rigPath string) []string {
+ 	return nil
+ }
+ 
++// resolveExecWrapperForRole returns the rig's exec_wrapper only for roles that
++// belong inside a sandbox pod. Witness, refinery, mayor, and deacon run on
++// metal (one per rig on the host) and must never be wrapped; only polecat and
++// crew sessions are per-bead/per-session and live in the sandbox.
++func resolveExecWrapperForRole(rigPath, role string) []string {
++	switch role {
++	case constants.RolePolecat, constants.RoleCrew:
++		return resolveExecWrapper(rigPath)
++	default:
++		return nil
++	}
++}
++
+ // ResolveExecWrapper is the exported form of resolveExecWrapper, for callers
+ // that need to branch on whether a rig runs its agents through a sandbox/container
+-// wrapper. Start paths (witness, refinery, polecat) use this to pick the right
+-// tmux readiness signal — GT_AGENT_READY vs pane_current_command.
++// wrapper. Polecat start paths use this to pick the right tmux readiness signal —
++// GT_AGENT_READY vs pane_current_command. Witness/refinery no longer use it
++// since they always run on metal.
+ func ResolveExecWrapper(rigPath string) []string {
+ 	return resolveExecWrapper(rigPath)
+ }
+diff --git a/internal/refinery/manager.go b/internal/refinery/manager.go
+index e2566a85..308a6ddf 100644
+--- a/internal/refinery/manager.go
++++ b/internal/refinery/manager.go
+@@ -245,14 +245,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
+ 	_ = t.AcceptStartupDialogs(sessionID)
+ 
+ 	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch.
+-	// For wrapped rigs, the runtime-prompt probe can't see past the wrapper
+-	// (kubectl/daytona/exitbox stdio), so require the agent-ready sentinel instead.
+-	var refineryWaitErr error
+-	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
+-		refineryWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
+-	} else {
+-		refineryWaitErr = t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
+-	}
++	// Refinery runs on metal (never wrapped), so the runtime-prompt probe is the
++	// correct readiness signal regardless of rig exec_wrapper settings.
++	refineryWaitErr := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
+ 	if refineryWaitErr != nil {
+ 		_ = t.KillSessionWithProcesses(sessionID)
+ 		return fmt.Errorf("waiting for refinery to start: %w", refineryWaitErr)
+diff --git a/internal/witness/manager.go b/internal/witness/manager.go
+index 00d8ec2a..431cdf5e 100644
+--- a/internal/witness/manager.go
++++ b/internal/witness/manager.go
+@@ -240,15 +240,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
+ 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
+ 
+ 	// Wait for Claude to start - fatal if Claude fails to launch.
+-	// For wrapped rigs (ExecWrapper set — e.g. devbox/daytona/exitbox), the
+-	// pane foreground is the wrapper, not the agent, so pane_current_command
+-	// probing returns a false positive. Require the agent-ready sentinel instead.
+-	var startWaitErr error
+-	if len(config.ResolveExecWrapper(m.rig.Path)) > 0 {
+-		startWaitErr = t.WaitForAgentReady(sessionID, constants.ClaudeStartTimeout)
+-	} else {
+-		startWaitErr = t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout)
+-	}
++	// Witness runs on metal (never wrapped), so shell-prompt probing is the
++	// correct readiness signal regardless of rig exec_wrapper settings.
++	startWaitErr := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout)
+ 	if startWaitErr != nil {
+ 		_ = t.KillSessionWithProcesses(sessionID)
+ 		return fmt.Errorf("waiting for witness to start: %w", startWaitErr)
+-- 
+2.50.1 (Apple Git-155)
+

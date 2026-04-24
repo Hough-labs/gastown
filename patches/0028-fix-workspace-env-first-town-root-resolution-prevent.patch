@@ -1,0 +1,322 @@
+From 9918b79aa591707b33ed2b003d9d899e185556a1 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Apr 2026 17:33:23 -0400
+Subject: [PATCH 28/28] fix(workspace): env-first town-root resolution prevents
+ phantom-town split-brain
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+FindFromCwdOrError walked up from CWD looking for mayor/ or mayor/town.json,
+and only consulted GT_TOWN_ROOT / GT_ROOT as a last-resort fallback. That made
+the env var unreachable whenever any parent dir happened to contain a mayor/
+subdir.
+
+Incident (2026-04-23 → 2026-04-24 on anvil): a failed pre-push deploy ssh'd
+into anvil with CWD=$HOME and spawned a daemon that scaffolded mayor/,
+.beads/, daemon/, rigs.json under /home/hunter. From that point, any shell
+rooted at $HOME that invoked 'gt daemon run' (notably deacon's tmux spawn
+with PWD=/home/hunter) walked up from CWD, found /home/hunter/mayor, and
+started a parallel daemon there — ignoring GT_TOWN_ROOT=/home/hunter/gt.
+The phantom ran its own Dolt server and processed molecules/wisps for ~18h
+as split-brain with the real town, undetected.
+
+Fix: trust the session manager / agent spawner when it explicitly sets
+GT_TOWN_ROOT or GT_ROOT. Validate the path via IsWorkspace before using it.
+Only fall back to the CWD walk when no env var is set or the env target
+isn't a workspace. Normal agent and shell flows are unchanged; the only
+behavior delta is that a stray/phantom mayor/ on the CWD walk path no
+longer shadows an explicit env override.
+
+Adds two regression tests: env wins over a phantom CWD town; invalid env
+degrades gracefully to the CWD walk.
+
+Also reconciles patches/ with current upstream/main: the prior commit
+regenerated patches/ against a stale upstream ref and inadvertently exported
+~80 upstream commits as local patches. 'make patches' against the current
+upstream/main restores the minimal local-only patch set (28 patches).
+---
+ internal/workspace/find.go      |  30 +++++----
+ internal/workspace/find_test.go | 114 +++++++++++++++++++++++++-------
+ 2 files changed, 108 insertions(+), 36 deletions(-)
+
+diff --git a/internal/workspace/find.go b/internal/workspace/find.go
+index fc1ef982..0644caaa 100644
+--- a/internal/workspace/find.go
++++ b/internal/workspace/find.go
+@@ -84,28 +84,32 @@ func FindFromCwd() (string, error) {
+ 	return Find(cwd)
+ }
+ 
+-// FindFromCwdOrError is like FindFromCwd but returns an error if not found.
+-// It searches for a workspace starting from the CWD. If none is found, it
+-// falls back to the GT_TOWN_ROOT or GT_ROOT environment variables.
++// FindFromCwdOrError resolves the town root with env-first precedence:
++// GT_TOWN_ROOT/GT_ROOT win when set and pointing to a valid workspace;
++// otherwise it walks up from CWD. Env-first prevents a phantom-town attack
++// where any directory that happens to contain a mayor/ subdir (e.g. $HOME
++// scaffolded by a previously failed bootstrap) would shadow the agent's
++// actual workspace and cause a parallel daemon to start there.
+ func FindFromCwdOrError() (string, error) {
+-	cwd, err := os.Getwd()
+-	if err == nil {
+-		root, err := Find(cwd)
+-		if err == nil && root != "" {
+-			return root, nil
+-		}
+-	}
+-
+-	// Fallback: try GT_TOWN_ROOT or GT_ROOT env vars (set by shell integration or session manager)
++	// Env-first: trust the session manager / agent spawner when it has
++	// explicitly told us where the town is.
+ 	for _, envName := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
+ 		if townRoot := os.Getenv(envName); townRoot != "" {
+-			// Verify it's actually a workspace
+ 			if ok, _ := IsWorkspace(townRoot); ok {
+ 				return townRoot, nil
+ 			}
+ 		}
+ 	}
+ 
++	// No usable env hint — walk up from CWD.
++	cwd, err := os.Getwd()
++	if err == nil {
++		root, err := Find(cwd)
++		if err == nil && root != "" {
++			return root, nil
++		}
++	}
++
+ 	if err != nil {
+ 		return "", fmt.Errorf("getting current directory: %w", err)
+ 	}
+diff --git a/internal/workspace/find_test.go b/internal/workspace/find_test.go
+index 67df7128..c94cdd42 100644
+--- a/internal/workspace/find_test.go
++++ b/internal/workspace/find_test.go
+@@ -19,17 +19,17 @@ func TestFindWithPrimaryMarker(t *testing.T) {
+ 	// Create temp workspace structure
+ 	root := realPath(t, t.TempDir())
+ 	mayorDir := filepath.Join(root, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 	townFile := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0644); err != nil {
++	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+ 	// Create nested directory
+ 	nested := filepath.Join(root, "some", "deep", "path")
+-	if err := os.MkdirAll(nested, 0755); err != nil {
++	if err := os.MkdirAll(nested, 0o755); err != nil {
+ 		t.Fatalf("mkdir nested: %v", err)
+ 	}
+ 
+@@ -47,13 +47,13 @@ func TestFindWithSecondaryMarker(t *testing.T) {
+ 	// Create temp workspace with just mayor/ directory
+ 	root := realPath(t, t.TempDir())
+ 	mayorDir := filepath.Join(root, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 
+ 	// Create nested directory
+ 	nested := filepath.Join(root, "rigs", "test")
+-	if err := os.MkdirAll(nested, 0755); err != nil {
++	if err := os.MkdirAll(nested, 0o755); err != nil {
+ 		t.Fatalf("mkdir nested: %v", err)
+ 	}
+ 
+@@ -93,11 +93,11 @@ func TestFindAtRoot(t *testing.T) {
+ 	// Create workspace at temp root level
+ 	root := realPath(t, t.TempDir())
+ 	mayorDir := filepath.Join(root, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 	townFile := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0644); err != nil {
++	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+@@ -125,11 +125,11 @@ func TestIsWorkspace(t *testing.T) {
+ 
+ 	// Add primary marker (mayor/town.json)
+ 	mayorDir := filepath.Join(root, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 	townFile := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0644); err != nil {
++	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+@@ -146,16 +146,16 @@ func TestIsWorkspace(t *testing.T) {
+ func TestFindFromSymlinkedDir(t *testing.T) {
+ 	root := realPath(t, t.TempDir())
+ 	mayorDir := filepath.Join(root, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 	townFile := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0644); err != nil {
++	if err := os.WriteFile(townFile, []byte(`{"type":"town"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+ 	linkTarget := filepath.Join(root, "actual")
+-	if err := os.MkdirAll(linkTarget, 0755); err != nil {
++	if err := os.MkdirAll(linkTarget, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 
+@@ -186,16 +186,16 @@ func TestFindPreservesSymlinkPath(t *testing.T) {
+ 	}
+ 
+ 	mayorDir := filepath.Join(symRoot, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 	townFile := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townFile, []byte(`{}`), 0644); err != nil {
++	if err := os.WriteFile(townFile, []byte(`{}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+ 	subdir := filepath.Join(symRoot, "rigs", "project", "polecats", "worker")
+-	if err := os.MkdirAll(subdir, 0755); err != nil {
++	if err := os.MkdirAll(subdir, 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+ 
+@@ -221,18 +221,18 @@ func TestFindPreservesSymlinkPath(t *testing.T) {
+ func TestFindSkipsNestedWorkspaceInWorktree(t *testing.T) {
+ 	root := realPath(t, t.TempDir())
+ 
+-	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"outer"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"outer"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+ 	polecatDir := filepath.Join(root, "myrig", "polecats", "worker")
+-	if err := os.MkdirAll(filepath.Join(polecatDir, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(polecatDir, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(polecatDir, "mayor", "town.json"), []byte(`{"name":"inner"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(polecatDir, "mayor", "town.json"), []byte(`{"name":"inner"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+@@ -254,18 +254,18 @@ func TestFindSkipsNestedWorkspaceInWorktree(t *testing.T) {
+ func TestFindSkipsNestedWorkspaceInCrew(t *testing.T) {
+ 	root := realPath(t, t.TempDir())
+ 
+-	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"outer"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{"name":"outer"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+ 	crewDir := filepath.Join(root, "myrig", "crew", "worker")
+-	if err := os.MkdirAll(filepath.Join(crewDir, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(crewDir, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(crewDir, "mayor", "town.json"), []byte(`{"name":"inner"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(crewDir, "mayor", "town.json"), []byte(`{"name":"inner"}`), 0o644); err != nil {
+ 		t.Fatalf("write: %v", err)
+ 	}
+ 
+@@ -278,3 +278,71 @@ func TestFindSkipsNestedWorkspaceInCrew(t *testing.T) {
+ 		t.Errorf("Find = %q, want %q (should skip nested workspace in crew/)", found, root)
+ 	}
+ }
++
++// TestFindFromCwdOrError_EnvWinsOverPhantomCwd regression-guards the
++// phantom-town incident: CWD happens to contain a mayor/ subdir that
++// isn't the agent's real workspace. With env-first precedence
++// GT_TOWN_ROOT must win. Otherwise the agent's next `gt daemon run`
++// would acquire a lock in the phantom and start a parallel daemon.
++func TestFindFromCwdOrError_EnvWinsOverPhantomCwd(t *testing.T) {
++	tmp := realPath(t, t.TempDir())
++
++	realTown := filepath.Join(tmp, "real")
++	phantom := filepath.Join(tmp, "phantom")
++	for _, root := range []string{realTown, phantom} {
++		if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
++			t.Fatalf("mkdir %s: %v", root, err)
++		}
++	}
++
++	orig, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getwd: %v", err)
++	}
++	t.Cleanup(func() { _ = os.Chdir(orig) })
++
++	if err := os.Chdir(phantom); err != nil {
++		t.Fatalf("chdir phantom: %v", err)
++	}
++	t.Setenv("GT_TOWN_ROOT", realTown)
++	t.Setenv("GT_ROOT", "")
++
++	got, err := FindFromCwdOrError()
++	if err != nil {
++		t.Fatalf("FindFromCwdOrError: %v", err)
++	}
++	if got != realTown {
++		t.Errorf("got %q, want %q (env-set town must win over CWD-derived phantom)", got, realTown)
++	}
++}
++
++// TestFindFromCwdOrError_FallsBackToCwdWhenEnvInvalid confirms the env-first
++// branch degrades gracefully: env set to a non-workspace path falls through
++// to the CWD walk.
++func TestFindFromCwdOrError_FallsBackToCwdWhenEnvInvalid(t *testing.T) {
++	tmp := realPath(t, t.TempDir())
++	town := filepath.Join(tmp, "town")
++	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0o755); err != nil {
++		t.Fatalf("mkdir town: %v", err)
++	}
++
++	orig, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getwd: %v", err)
++	}
++	t.Cleanup(func() { _ = os.Chdir(orig) })
++
++	if err := os.Chdir(town); err != nil {
++		t.Fatalf("chdir: %v", err)
++	}
++	t.Setenv("GT_TOWN_ROOT", filepath.Join(tmp, "does-not-exist"))
++	t.Setenv("GT_ROOT", "")
++
++	got, err := FindFromCwdOrError()
++	if err != nil {
++		t.Fatalf("FindFromCwdOrError: %v", err)
++	}
++	if got != town {
++		t.Errorf("got %q, want %q (invalid env must fall through to CWD walk)", got, town)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

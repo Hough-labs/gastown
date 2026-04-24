@@ -1,0 +1,44 @@
+From fb22d8198858af0a340d4e907889c0870f59bb75 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 16 Apr 2026 19:08:30 -0400
+Subject: [PATCH 15/28] chore(beads): migrate dolt remote to anvil k8s
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Point bd at anvil:3306 (Happy Eyeballs → Thunderbolt preferred,
+Tailscale fallback) instead of local 127.0.0.1:3307. Disables
+file-based backup — dolt server is remote and has its own nightly
+dumps via anvil systemd timer.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .beads/config.yaml | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/.beads/config.yaml b/.beads/config.yaml
+index 2464ef0f..f2b7ded6 100644
+--- a/.beads/config.yaml
++++ b/.beads/config.yaml
+@@ -44,4 +44,17 @@ types.custom: "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merg
+ 
+ prefix: 
+ issue-prefix: 
+-dolt.idle-timeout: "0"
++
++# Dolt on Anvil k8s — 'anvil' hostname uses Happy Eyeballs:
++# Thunderbolt (169.254.100.1) first, Tailscale (100.99.108.41) fallback
++dolt.mode: "server"
++dolt.host: "anvil"
++dolt.port: 3306
++dolt.database: "gastown"
++dolt.auto-start: false
++dolt.auto-push: "off"
++
++# Backup disabled — dolt server is remote (k8s on Anvil)
++backup:
++  enabled: false
++
+-- 
+2.50.1 (Apple Git-155)
+

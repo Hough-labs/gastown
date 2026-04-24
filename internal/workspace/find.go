@@ -84,25 +84,29 @@ func FindFromCwd() (string, error) {
 	return Find(cwd)
 }
 
-// FindFromCwdOrError is like FindFromCwd but returns an error if not found.
-// It searches for a workspace starting from the CWD. If none is found, it
-// falls back to the GT_TOWN_ROOT or GT_ROOT environment variables.
+// FindFromCwdOrError resolves the town root with env-first precedence:
+// GT_TOWN_ROOT/GT_ROOT win when set and pointing to a valid workspace;
+// otherwise it walks up from CWD. Env-first prevents a phantom-town attack
+// where any directory that happens to contain a mayor/ subdir (e.g. $HOME
+// scaffolded by a previously failed bootstrap) would shadow the agent's
+// actual workspace and cause a parallel daemon to start there.
 func FindFromCwdOrError() (string, error) {
+	// Env-first: trust the session manager / agent spawner when it has
+	// explicitly told us where the town is.
+	for _, envName := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
+		if townRoot := os.Getenv(envName); townRoot != "" {
+			if ok, _ := IsWorkspace(townRoot); ok {
+				return townRoot, nil
+			}
+		}
+	}
+
+	// No usable env hint — walk up from CWD.
 	cwd, err := os.Getwd()
 	if err == nil {
 		root, err := Find(cwd)
 		if err == nil && root != "" {
 			return root, nil
-		}
-	}
-
-	// Fallback: try GT_TOWN_ROOT or GT_ROOT env vars (set by shell integration or session manager)
-	for _, envName := range []string{"GT_TOWN_ROOT", "GT_ROOT"} {
-		if townRoot := os.Getenv(envName); townRoot != "" {
-			// Verify it's actually a workspace
-			if ok, _ := IsWorkspace(townRoot); ok {
-				return townRoot, nil
-			}
 		}
 	}
 

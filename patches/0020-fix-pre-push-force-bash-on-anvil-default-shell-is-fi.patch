@@ -1,0 +1,42 @@
+From 80f89c9b5940261e11919a4848dd1ee0692c80cf Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 20 Apr 2026 13:43:10 -0400
+Subject: [PATCH 20/28] fix(pre-push): force bash on anvil (default shell is
+ fish)
+
+REMOTE_CMD uses bash if/then/fi syntax but ssh anvil '...' invokes
+fish by default. Pipe the script via stdin to 'bash -s' and capture
+the exit code so failures surface in the log instead of silently
+succeeding.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .githooks/pre-push | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index 46208f63..b28516e1 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -175,9 +175,15 @@ fi
+             REMOTE_SHA=$(git ls-remote --quiet origin refs/heads/anvil 2>/dev/null | awk '{print $1}')
+             if [ "$REMOTE_SHA" = "$EXPECTED_SHA" ]; then
+                 echo "[$(date '+%F %T')] gastown sync-anvil: origin reached $EXPECTED_SHA — triggering remote deploy"
+-                ssh -o BatchMode=yes anvil "$REMOTE_CMD"
+-                echo "[$(date '+%F %T')] gastown sync-anvil: done"
+-                exit 0
++                # Pipe to bash -s: anvil's default shell is fish, but REMOTE_CMD is bash.
++                printf '%s\n' "$REMOTE_CMD" | ssh -o BatchMode=yes anvil bash -s
++                RC=$?
++                if [ "$RC" -eq 0 ]; then
++                    echo "[$(date '+%F %T')] gastown sync-anvil: done"
++                else
++                    echo "[$(date '+%F %T')] gastown sync-anvil: remote deploy failed (rc=$RC)"
++                fi
++                exit "$RC"
+             fi
+             sleep 2
+         done
+-- 
+2.50.1 (Apple Git-155)
+

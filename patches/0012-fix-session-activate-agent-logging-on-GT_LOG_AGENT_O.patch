@@ -1,0 +1,33 @@
+From b5691b6c23d17d7ef8b7f5f3dc7b4e0a743cba07 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 12 Apr 2026 14:13:12 -0400
+Subject: [PATCH 12/28] fix(session): activate agent logging on
+ GT_LOG_AGENT_OUTPUT alone
+
+Remove the GT_OTEL_LOGS_URL guard from ActivateAgentLogging. The
+gt agent-log subprocess already handles a missing OTel URL gracefully
+(warning, no error). Requiring GT_OTEL_LOGS_URL silently blocked the
+watcher even when GT_LOG_AGENT_OUTPUT=true was explicitly set, causing
+agent.event/agent.usage to never flow.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ internal/session/lifecycle.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/internal/session/lifecycle.go b/internal/session/lifecycle.go
+index ae9df267..5a8cb0a0 100644
+--- a/internal/session/lifecycle.go
++++ b/internal/session/lifecycle.go
+@@ -291,7 +291,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
+ 	// 14. Stream agent conversation events to VictoriaLogs (opt-in).
+ 	// Reads ~/.claude/projects/<hash>/<session>.jsonl and emits agent.event logs.
+ 	// Non-fatal: observability failures must never block agent startup.
+-	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
++	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" {
+ 		if err := ActivateAgentLogging(cfg.SessionID, cfg.WorkDir, runID); err != nil {
+ 			fmt.Fprintf(os.Stderr, "warning: agent log watcher setup failed for %s: %v\n", cfg.SessionID, err)
+ 		}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,37 @@
+From 7e6d22006a2d6fa5c509848600a17f9a98c2014e Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 8 Apr 2026 09:14:53 -0400
+Subject: [PATCH 09/28] fix(doctor): crash-reports check ignores .diag files
+
+macOS writes two kinds of reports to DiagnosticReports/:
+  - .ips files: actual crashes
+  - .diag files: performance microstackshots (disk writes, hangs)
+
+Only .ips files are crashes. The check was flagging a benign node
+.diag performance sample as a crash, producing a misleading warning.
+Filter by .ips extension.
+---
+ internal/doctor/crash_report_check.go | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/internal/doctor/crash_report_check.go b/internal/doctor/crash_report_check.go
+index ef1357db..847c082c 100644
+--- a/internal/doctor/crash_report_check.go
++++ b/internal/doctor/crash_report_check.go
+@@ -90,6 +90,13 @@ func (c *CrashReportCheck) Run(ctx *CheckContext) *CheckResult {
+ 
+ 			name := entry.Name()
+ 
++			// Only consider actual crash reports (.ips). Skip .diag files,
++			// which are performance microstackshots ("disk writes", "hang",
++			// etc.) — not crashes, just diagnostic telemetry.
++			if !strings.HasSuffix(name, ".ips") {
++				continue
++			}
++
+ 			// Check if this is a crash report for a relevant process
+ 			var matchedProcess string
+ 			nameLower := strings.ToLower(name)
+-- 
+2.50.1 (Apple Git-155)
+
