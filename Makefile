@@ -192,8 +192,19 @@ check-version-tag:
 
 # Export current local commits (anvil..upstream/main divergence) to patches/.
 # Run this after adding or editing a local patch commit.
+#
+# Fetches upstream/main first so the export is computed against the real
+# upstream tip. Without this, an agent whose upstream ref is stale will
+# mistakenly export upstream commits as local patches (landed on anvil
+# 2026-04-24 by a deacon agent — 80+ upstream commits leaked into
+# patches/ and were only caught when the pre-push validator re-exported
+# and diffed). Fetch is non-fatal so offline/sandboxed runs still work;
+# they'll produce the same old-baseline output they used to produce.
 #   make patches
 patches:
+	@echo "Fetching upstream/main for a correct patch baseline..."
+	@git fetch --no-tags upstream main 2>/dev/null || \
+		echo "warning: could not fetch upstream (offline?); using cached upstream/main"
 	@echo "Exporting patches from anvil -> upstream/main divergence..."
 	@rm -f patches/*.patch
 	@git format-patch upstream/main..HEAD --output-directory patches/ -- . ':!patches/'
