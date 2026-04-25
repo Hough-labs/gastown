@@ -1,0 +1,317 @@
+From e3af2da8a44c796c1783624837146f617a68364a Mon Sep 17 00:00:00 2001
+From: rust <epibuilder38@gmail.com>
+Date: Tue, 28 Apr 2026 22:27:10 +0900
+Subject: [PATCH 30/34] fix: reduce status dolt query load (gst-2nv)
+
+---
+ internal/cmd/status.go     |  53 ++++++++++++--------
+ internal/cmd/statusline.go | 100 +++++++++++++++++++++++++++++++++++++
+ internal/web/api.go        |  23 ++++++++-
+ 3 files changed, 155 insertions(+), 21 deletions(-)
+
+diff --git a/internal/cmd/status.go b/internal/cmd/status.go
+index db3df460..c0716249 100644
+--- a/internal/cmd/status.go
++++ b/internal/cmd/status.go
+@@ -120,15 +120,15 @@ type DNDInfo struct {
+ 
+ // AgentRuntime represents the runtime state of an agent.
+ type AgentRuntime struct {
+-	Name         string `json:"name"`                    // Display name (e.g., "mayor", "witness")
+-	Address      string `json:"address"`                 // Full address (e.g., "greenplace/witness")
+-	Session      string `json:"session"`                 // tmux session name
+-	Role         string `json:"role"`                    // Role type
+-	Running      bool   `json:"running"`                 // Is tmux session running?
+-	ACP          bool   `json:"acp"`                     // Is ACP session active?
+-	HasWork      bool   `json:"has_work"`                // Has pinned work?
+-	WorkTitle    string `json:"work_title,omitempty"`    // Title of pinned work
+-	HookBead     string `json:"hook_bead,omitempty"`     // Pinned bead ID from agent bead
++	Name              string `json:"name"`                         // Display name (e.g., "mayor", "witness")
++	Address           string `json:"address"`                      // Full address (e.g., "greenplace/witness")
++	Session           string `json:"session"`                      // tmux session name
++	Role              string `json:"role"`                         // Role type
++	Running           bool   `json:"running"`                      // Is tmux session running?
++	ACP               bool   `json:"acp"`                          // Is ACP session active?
++	HasWork           bool   `json:"has_work"`                     // Has pinned work?
++	WorkTitle         string `json:"work_title,omitempty"`         // Title of pinned work
++	HookBead          string `json:"hook_bead,omitempty"`          // Pinned bead ID from agent bead
+ 	State             string `json:"state,omitempty"`              // Agent state from agent bead
+ 	NotificationLevel string `json:"notification_level,omitempty"` // Notification level (verbose, normal, muted)
+ 	UnreadMail        int    `json:"unread_mail"`                  // Number of unread messages
+@@ -890,17 +890,6 @@ func gatherStatus() (TownStatus, error) {
+ 			// independent bd/beads calls.
+ 			var rigWg sync.WaitGroup
+ 
+-			// Discover hooks for all agents in this rig
+-			// In --fast mode, skip expensive handoff bead lookups. Hook info comes from
+-			// preloaded agent beads via discoverRigAgents instead.
+-			if !statusFast {
+-				rigWg.Add(1)
+-				go func() {
+-					defer rigWg.Done()
+-					rs.Hooks = discoverRigHooks(r, rs.Crews)
+-				}()
+-			}
+-
+ 			// Get MQ summary if rig has a refinery
+ 			// Skip in --fast mode to avoid expensive bd queries
+ 			if !statusFast {
+@@ -921,6 +910,13 @@ func gatherStatus() (TownStatus, error) {
+ 
+ 			rigWg.Wait()
+ 
++			// Hook data is already preloaded from agent beads above. Avoid a
++			// second rig-level handoff scan here; status rendering only needs
++			// the active hook ID/title per agent.
++			if !statusFast {
++				rs.Hooks = hooksFromAgentRuntime(rs.Agents)
++			}
++
+ 			activeHooks := 0
+ 			for _, hook := range rs.Hooks {
+ 				if hook.HasWork {
+@@ -968,6 +964,23 @@ func gatherStatus() (TownStatus, error) {
+ 	return status, nil
+ }
+ 
++func hooksFromAgentRuntime(agents []AgentRuntime) []AgentHookInfo {
++	hooks := make([]AgentHookInfo, 0, len(agents))
++	for _, agent := range agents {
++		hook := AgentHookInfo{
++			Agent: agent.Address,
++			Role:  agent.Role,
++		}
++		if agent.HookBead != "" || agent.WorkTitle != "" {
++			hook.HasWork = true
++			hook.Molecule = agent.HookBead
++			hook.Title = agent.WorkTitle
++		}
++		hooks = append(hooks, hook)
++	}
++	return hooks
++}
++
+ func outputStatusJSON(status TownStatus) error {
+ 	enc := json.NewEncoder(os.Stdout)
+ 	enc.SetIndent("", "  ")
+diff --git a/internal/cmd/statusline.go b/internal/cmd/statusline.go
+index a58d5013..cb9600ac 100644
+--- a/internal/cmd/statusline.go
++++ b/internal/cmd/statusline.go
+@@ -1,11 +1,15 @@
+ package cmd
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/spf13/cobra"
+ 	"github.com/steveyegge/gastown/internal/beads"
+@@ -21,6 +25,19 @@ var (
+ 	statusLineSession string
+ )
+ 
++const statusLineLookupCacheTTL = 5 * time.Second
++
++type statusLineHookCacheEntry struct {
++	Value    string `json:"value"`
++	StoredAt int64  `json:"stored_at"`
++}
++
++type statusLineMailCacheEntry struct {
++	Unread   int    `json:"unread"`
++	Subject  string `json:"subject"`
++	StoredAt int64  `json:"stored_at"`
++}
++
+ var statusLineCmd = &cobra.Command{
+ 	Use:   "status-line",
+ 	Short: "Output status line content for tmux (internal use)",
+@@ -665,12 +682,18 @@ func isSessionWorking(t *tmux.Tmux, session string) bool {
+ // getMailPreviewWithRoot returns unread count and a truncated subject of the first unread message,
+ // using an explicit town root.
+ func getMailPreviewWithRoot(identity string, maxLen int, townRoot string) (int, string) {
++	cacheKey := fmt.Sprintf("mail\x00%s\x00%d\x00%s", identity, maxLen, townRoot)
++	if entry, ok := readStatusLineCache[statusLineMailCacheEntry](townRoot, cacheKey); ok {
++		return entry.Unread, entry.Subject
++	}
++
+ 	// Use NewMailboxFromAddress to normalize identity (e.g., gastown/crew/gus -> gastown/gus)
+ 	mailbox := mail.NewMailboxFromAddress(identity, townRoot)
+ 
+ 	// Get unread messages
+ 	messages, err := mailbox.ListUnread()
+ 	if err != nil || len(messages) == 0 {
++		writeStatusLineCache(townRoot, cacheKey, statusLineMailCacheEntry{StoredAt: time.Now().UnixNano()})
+ 		return 0, ""
+ 	}
+ 
+@@ -680,6 +703,11 @@ func getMailPreviewWithRoot(identity string, maxLen int, townRoot string) (int,
+ 		subject = subject[:maxLen-1] + "…"
+ 	}
+ 
++	writeStatusLineCache(townRoot, cacheKey, statusLineMailCacheEntry{
++		Unread:   len(messages),
++		Subject:  subject,
++		StoredAt: time.Now().UnixNano(),
++	})
+ 	return len(messages), subject
+ }
+ 
+@@ -697,6 +725,12 @@ func getHookedWork(identity string, maxLen int, beadsDir string) string {
+ 		}
+ 	}
+ 
++	cacheRoot := statusLineCacheRoot(beadsDir)
++	cacheKey := fmt.Sprintf("hook\x00%s\x00%d\x00%s", identity, maxLen, beadsDir)
++	if entry, ok := readStatusLineCache[statusLineHookCacheEntry](cacheRoot, cacheKey); ok {
++		return entry.Value
++	}
++
+ 	b := beads.New(beadsDir)
+ 
+ 	// Query for hooked beads assigned to this agent
+@@ -706,6 +740,7 @@ func getHookedWork(identity string, maxLen int, beadsDir string) string {
+ 		Priority: -1,
+ 	})
+ 	if err != nil || len(hookedBeads) == 0 {
++		writeStatusLineCache(cacheRoot, cacheKey, statusLineHookCacheEntry{StoredAt: time.Now().UnixNano()})
+ 		return ""
+ 	}
+ 
+@@ -715,9 +750,74 @@ func getHookedWork(identity string, maxLen int, beadsDir string) string {
+ 	if len(display) > maxLen {
+ 		display = display[:maxLen-1] + "…"
+ 	}
++	writeStatusLineCache(cacheRoot, cacheKey, statusLineHookCacheEntry{
++		Value:    display,
++		StoredAt: time.Now().UnixNano(),
++	})
+ 	return display
+ }
+ 
++func statusLineCacheRoot(path string) string {
++	if townRoot, err := workspace.Find(path); err == nil && townRoot != "" {
++		return townRoot
++	}
++	return path
++}
++
++func statusLineCachePath(root, key string) string {
++	sum := sha256.Sum256([]byte(key))
++	name := hex.EncodeToString(sum[:]) + ".json"
++	return filepath.Join(root, ".runtime", "status-line-cache", name)
++}
++
++func readStatusLineCache[T interface {
++	statusLineHookCacheEntry | statusLineMailCacheEntry
++}](root, key string) (T, bool) {
++	var zero T
++	if root == "" {
++		return zero, false
++	}
++
++	data, err := os.ReadFile(statusLineCachePath(root, key))
++	if err != nil {
++		return zero, false
++	}
++
++	var entry T
++	if err := json.Unmarshal(data, &entry); err != nil {
++		return zero, false
++	}
++
++	var storedAt int64
++	switch v := any(entry).(type) {
++	case statusLineHookCacheEntry:
++		storedAt = v.StoredAt
++	case statusLineMailCacheEntry:
++		storedAt = v.StoredAt
++	default:
++		return zero, false
++	}
++	if storedAt == 0 || time.Since(time.Unix(0, storedAt)) > statusLineLookupCacheTTL {
++		return zero, false
++	}
++	return entry, true
++}
++
++func writeStatusLineCache(root, key string, entry any) {
++	if root == "" {
++		return
++	}
++	path := statusLineCachePath(root, key)
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		return
++	}
++	data, err := json.Marshal(entry)
++	if err != nil {
++		return
++	}
++	_ = os.WriteFile(path, data, 0644)
++}
++
+ // getCurrentWork returns a truncated title of the first in_progress issue assigned to identity.
+ // Uses the pane's working directory to find the beads.
+ func getCurrentWork(t *tmux.Tmux, session string, identity string, maxLen int) string {
+diff --git a/internal/web/api.go b/internal/web/api.go
+index 16071544..8f40d068 100644
+--- a/internal/web/api.go
++++ b/internal/web/api.go
+@@ -61,9 +61,15 @@ type APIHandler struct {
+ 	cmdSem chan struct{}
+ 	// csrfToken is validated on POST requests to prevent cross-site request forgery.
+ 	csrfToken string
++	// Dashboard hash cache avoids every SSE client spawning status/hooks/mail
++	// commands every poll interval.
++	dashboardHashMu   sync.Mutex
++	dashboardHash     string
++	dashboardHashTime time.Time
+ }
+ 
+ const optionsCacheTTL = 30 * time.Second
++const dashboardHashCacheTTL = 5 * time.Second
+ 
+ // maxConcurrentCommands limits how many gt subprocesses can run at once.
+ // handleOptions alone spawns 7; allow headroom for other concurrent handlers.
+@@ -2121,6 +2127,18 @@ func (h *APIHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
+ // computeDashboardHash generates a lightweight hash of key dashboard state.
+ // It runs quick commands in parallel and hashes their output to detect changes.
+ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
++	h.dashboardHashMu.Lock()
++	if h.dashboardHash != "" && time.Since(h.dashboardHashTime) < dashboardHashCacheTTL {
++		hash := h.dashboardHash
++		h.dashboardHashMu.Unlock()
++		return hash
++	}
++	defer h.dashboardHashMu.Unlock()
++
++	if h.dashboardHash != "" && time.Since(h.dashboardHashTime) < dashboardHashCacheTTL {
++		return h.dashboardHash
++	}
++
+ 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+ 	defer cancel()
+ 
+@@ -2167,7 +2185,10 @@ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
+ 	}
+ 
+ 	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
+-	return fmt.Sprintf("%x", h256[:8])
++	hash := fmt.Sprintf("%x", h256[:8])
++	h.dashboardHash = hash
++	h.dashboardHashTime = time.Now()
++	return hash
+ }
+ 
+ // handleRigAdd creates a new rig, optionally with a local bare repo.
+-- 
+2.50.1 (Apple Git-155)
+

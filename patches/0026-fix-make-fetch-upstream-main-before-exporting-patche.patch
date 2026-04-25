@@ -1,7 +1,7 @@
 From 4f41ccc6c1149dad136a7146c338ded8aed97d8e Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 17:48:25 -0400
-Subject: [PATCH 26/26] fix(make): fetch upstream/main before exporting patches
+Subject: [PATCH 26/34] fix(make): fetch upstream/main before exporting patches
 
 'make patches' computes anvil..upstream/main and exports the
 divergence. If the local upstream ref is stale, upstream commits

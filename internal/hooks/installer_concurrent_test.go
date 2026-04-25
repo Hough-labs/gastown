@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -87,5 +89,79 @@ func TestInstallForRole_ConcurrentSpawnsProduceValidJSON(t *testing.T) {
 	}
 	if string(data) != string(want) {
 		t.Errorf("settings.json content mismatch after concurrent writes: got %d bytes, want %d bytes", len(data), len(want))
+	}
+}
+
+// TestInstallForRole_AtomicWriteErrorPropagates covers the error-return
+// branch added in the gh#3500 fix: when the underlying atomic write fails
+// (here: target dir is read-only so os.CreateTemp returns EACCES), the
+// installer must surface the error rather than silently swallowing it.
+func TestInstallForRole_AtomicWriteErrorPropagates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory write semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+
+	dir := t.TempDir()
+	dotClaude := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(dotClaude, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Seed the target with a stale marker so InstallForRole takes the write
+	// path (rather than the early-return on file-exists-and-current).
+	target := filepath.Join(dotClaude, "settings.json")
+	if err := os.WriteFile(target, []byte(`{"stale":true,"hint":"export PATH=/foo"}`), 0600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	// Make the directory read-only so atomicfile.WriteFile's CreateTemp fails.
+	if err := os.Chmod(dotClaude, 0555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dotClaude, 0755) })
+
+	err := InstallForRole("claude", dir, dir, "polecat", ".claude", "settings.json", true)
+	if err == nil {
+		t.Fatal("expected error from read-only directory, got nil")
+	}
+	if !strings.Contains(err.Error(), "writing hooks file") {
+		t.Errorf("expected wrapped 'writing hooks file' error, got: %v", err)
+	}
+}
+
+// TestSyncForRole_AtomicWriteErrorPropagates is the SyncForRole counterpart
+// to TestInstallForRole_AtomicWriteErrorPropagates — covers the second
+// atomic-write call site introduced in gh#3500.
+func TestSyncForRole_AtomicWriteErrorPropagates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory write semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+
+	dir := t.TempDir()
+	pluginsDir := filepath.Join(dir, ".opencode", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(pluginsDir, "gastown.js")
+	// Seed with content that differs from the template so SyncForRole takes
+	// the write path (not the "content equal" early-return).
+	if err := os.WriteFile(target, []byte("// stale\n"), 0644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	if err := os.Chmod(pluginsDir, 0555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(pluginsDir, 0755) })
+
+	_, err := SyncForRole("opencode", dir, dir, "polecat", ".opencode/plugins", "gastown.js", false)
+	if err == nil {
+		t.Fatal("expected error from read-only directory, got nil")
+	}
+	if !strings.Contains(err.Error(), "writing hooks file") {
+		t.Errorf("expected wrapped 'writing hooks file' error, got: %v", err)
 	}
 }

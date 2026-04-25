@@ -1,7 +1,7 @@
 From 9b818910fd62dc1f3ad34ec47aad8033af5b82ec Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Apr 2026 09:21:31 -0400
-Subject: [PATCH 10/26] fix(doctor): tolerate bd stdout noise in stuck-wisp CSV
+Subject: [PATCH 10/34] fix(doctor): tolerate bd stdout noise in stuck-wisp CSV
  parse
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

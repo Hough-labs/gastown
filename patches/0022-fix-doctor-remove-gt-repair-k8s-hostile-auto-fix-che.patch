@@ -1,7 +1,7 @@
 From 772d06920b8a13805cf5d70b7bd632258eced67c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 16:26:17 -0400
-Subject: [PATCH 22/26] fix(doctor): remove gt repair + k8s-hostile auto-fix
+Subject: [PATCH 22/34] fix(doctor): remove gt repair + k8s-hostile auto-fix
  checks
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

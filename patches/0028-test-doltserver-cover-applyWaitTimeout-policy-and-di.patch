@@ -1,0 +1,145 @@
+From 560dbcc904d93b55b090af9644e9933071359149 Mon Sep 17 00:00:00 2001
+From: gtmain <gastown.crew.gtmain@gastown.local>
+Date: Sat, 25 Apr 2026 20:37:29 +0000
+Subject: [PATCH 28/34] test(doltserver): cover applyWaitTimeout policy and
+ dispatch (gh-3623)
+
+Codecov flagged applyWaitTimeout as 0% covered because it shells out to
+serverExecSQL which needs a running Dolt to round-trip. Add a function
+seam (applyWaitTimeoutFn) so tests can stub the SQL exec and verify:
+  - WaitTimeoutSec <= 0 short-circuits without invoking the seam
+  - positive timeouts dispatch the exact "SET GLOBAL wait_timeout = N"
+  - SQL failures are best-effort (no panic, no error propagated)
+
+Extract the query string into buildWaitTimeoutQuery so the SQL itself is
+asserted directly. Both new helpers now report 100% coverage.
+---
+ internal/doltserver/doltserver.go        | 15 ++++-
+ internal/doltserver/wait_timeout_test.go | 70 ++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index bccc8265..4ce05aed 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -3853,6 +3853,11 @@ func moveDir(src, dest string) error {
+ // Always connects via explicit --host/--port flags to ensure the command goes
+ // through the running sql-server process. Without these flags, `dolt sql` runs
+ // in embedded mode (even from the data directory), which creates databases on
++// applyWaitTimeoutFn is the SQL-exec seam used by applyWaitTimeout. Tests
++// override it to verify the policy decision (skip vs. send) and the
++// query-formatting without spawning a real dolt subprocess.
++var applyWaitTimeoutFn = serverExecSQL
++
+ // applyWaitTimeout sets MySQL's `wait_timeout` server variable on the running
+ // Dolt server so idle connections close in seconds rather than Dolt's 8-hour
+ // default. Under sustained load this is the difference between healthy
+@@ -3866,12 +3871,18 @@ func applyWaitTimeout(townRoot string, config *Config) {
+ 	if config.WaitTimeoutSec <= 0 {
+ 		return
+ 	}
+-	query := fmt.Sprintf("SET GLOBAL wait_timeout = %d", config.WaitTimeoutSec)
+-	if err := serverExecSQL(townRoot, query); err != nil {
++	query := buildWaitTimeoutQuery(config.WaitTimeoutSec)
++	if err := applyWaitTimeoutFn(townRoot, query); err != nil {
+ 		fmt.Fprintf(os.Stderr, "Warning: could not set Dolt wait_timeout=%ds: %v\n", config.WaitTimeoutSec, err)
+ 	}
+ }
+ 
++// buildWaitTimeoutQuery returns the SET GLOBAL statement applyWaitTimeout
++// dispatches. Extracted for direct testability.
++func buildWaitTimeoutQuery(seconds int) string {
++	return fmt.Sprintf("SET GLOBAL wait_timeout = %d", seconds)
++}
++
+ // disk but does NOT register them with the live server catalog. This caused
+ // "database not found" errors during gt rig add.
+ func serverExecSQL(townRoot, query string) error {
+diff --git a/internal/doltserver/wait_timeout_test.go b/internal/doltserver/wait_timeout_test.go
+index f4cc1d89..e20fe8df 100644
+--- a/internal/doltserver/wait_timeout_test.go
++++ b/internal/doltserver/wait_timeout_test.go
+@@ -1,6 +1,7 @@
+ package doltserver
+ 
+ import (
++	"errors"
+ 	"testing"
+ )
+ 
+@@ -55,3 +56,72 @@ func TestDefaultConfig_WaitTimeoutInvalidIgnored(t *testing.T) {
+ 		t.Errorf("WaitTimeoutSec = %d, want default %d when env var is invalid", config.WaitTimeoutSec, DefaultWaitTimeoutSec)
+ 	}
+ }
++
++// TestBuildWaitTimeoutQuery verifies the exact SQL emitted by applyWaitTimeout.
++func TestBuildWaitTimeoutQuery(t *testing.T) {
++	got := buildWaitTimeoutQuery(30)
++	want := "SET GLOBAL wait_timeout = 30"
++	if got != want {
++		t.Errorf("buildWaitTimeoutQuery(30) = %q, want %q", got, want)
++	}
++}
++
++// TestApplyWaitTimeout_DisabledShortCircuits verifies that a non-positive
++// WaitTimeoutSec opts out of the SET GLOBAL — the SQL seam must never be
++// invoked.
++func TestApplyWaitTimeout_DisabledShortCircuits(t *testing.T) {
++	prev := applyWaitTimeoutFn
++	t.Cleanup(func() { applyWaitTimeoutFn = prev })
++
++	called := false
++	applyWaitTimeoutFn = func(_, _ string) error {
++		called = true
++		return nil
++	}
++
++	for _, sec := range []int{0, -1, -3600} {
++		applyWaitTimeout("/some/town", &Config{WaitTimeoutSec: sec})
++	}
++
++	if called {
++		t.Errorf("applyWaitTimeoutFn called for non-positive WaitTimeoutSec")
++	}
++}
++
++// TestApplyWaitTimeout_DispatchesQuery verifies that a positive timeout
++// dispatches the expected SET GLOBAL statement against the seam.
++func TestApplyWaitTimeout_DispatchesQuery(t *testing.T) {
++	prev := applyWaitTimeoutFn
++	t.Cleanup(func() { applyWaitTimeoutFn = prev })
++
++	var gotTownRoot, gotQuery string
++	applyWaitTimeoutFn = func(townRoot, query string) error {
++		gotTownRoot = townRoot
++		gotQuery = query
++		return nil
++	}
++
++	applyWaitTimeout("/town/root", &Config{WaitTimeoutSec: 45})
++
++	if gotTownRoot != "/town/root" {
++		t.Errorf("townRoot = %q, want /town/root", gotTownRoot)
++	}
++	if want := "SET GLOBAL wait_timeout = 45"; gotQuery != want {
++		t.Errorf("query = %q, want %q", gotQuery, want)
++	}
++}
++
++// TestApplyWaitTimeout_ErrorIsBestEffort verifies that a SQL failure does
++// not panic or propagate. The Dolt server is already up by the time we
++// apply this; failing here would needlessly fail the start.
++func TestApplyWaitTimeout_ErrorIsBestEffort(t *testing.T) {
++	prev := applyWaitTimeoutFn
++	t.Cleanup(func() { applyWaitTimeoutFn = prev })
++
++	applyWaitTimeoutFn = func(_, _ string) error {
++		return errors.New("simulated SQL failure")
++	}
++
++	// Must not panic. No return value to check — best-effort by contract.
++	applyWaitTimeout("/town/root", &Config{WaitTimeoutSec: 30})
++}
+-- 
+2.50.1 (Apple Git-155)
+

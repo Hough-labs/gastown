@@ -1,0 +1,160 @@
+From 578597f46c45b6bad0d359d89dcdeedab581eacc Mon Sep 17 00:00:00 2001
+From: gtmain <gastown.crew.gtmain@gastown.local>
+Date: Sat, 25 Apr 2026 20:00:53 +0000
+Subject: [PATCH 33/34] fix(hooks): atomic settings.json write to prevent
+ concurrent-spawn corruption (gh-3500)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Polecats spawned together share <rig>/polecats/.claude/settings.json, and
+the previous os.WriteFile path opened with O_TRUNC then wrote — concurrent
+spawns could interleave the truncate and write phases, leaving Claude
+to read a partial JSON file and exit at startup. Three or more simultaneous
+spawns reliably crashed; staggering by ~8s worked around it.
+
+Switch both InstallForRole's syncFile and writeTemplate writes to
+atomicfile.WriteFile (write to a unique temp file, atomic rename over
+target). The rename is POSIX-atomic, so concurrent writers each produce a
+self-consistent temp file and the final settings.json is always one
+writer's complete output.
+---
+ internal/hooks/installer.go                 |  9 +-
+ internal/hooks/installer_concurrent_test.go | 91 +++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 2 deletions(-)
+ create mode 100644 internal/hooks/installer_concurrent_test.go
+
+diff --git a/internal/hooks/installer.go b/internal/hooks/installer.go
+index b3eba62b..790c177d 100644
+--- a/internal/hooks/installer.go
++++ b/internal/hooks/installer.go
+@@ -14,6 +14,7 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 
++	"github.com/steveyegge/gastown/internal/atomicfile"
+ 	"github.com/steveyegge/gastown/internal/hookutil"
+ )
+ 
+@@ -122,7 +123,10 @@ func SyncForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile strin
+ 		perm = 0600
+ 	}
+ 
+-	if err := os.WriteFile(targetPath, content, perm); err != nil {
++	// Atomic write (temp + rename) prevents concurrent polecat spawns from
++	// interleaving truncates+writes into a partial JSON file that Claude
++	// rejects at startup. See gh#3500.
++	if err := atomicfile.WriteFile(targetPath, content, perm); err != nil {
+ 		return 0, fmt.Errorf("writing hooks file: %w", err)
+ 	}
+ 
+@@ -180,7 +184,8 @@ func writeTemplate(provider, role, hooksFile, targetPath string) error {
+ 		perm = 0600
+ 	}
+ 
+-	if err := os.WriteFile(targetPath, content, perm); err != nil {
++	// Atomic write (temp + rename) — see gh#3500.
++	if err := atomicfile.WriteFile(targetPath, content, perm); err != nil {
+ 		return fmt.Errorf("writing hooks file: %w", err)
+ 	}
+ 
+diff --git a/internal/hooks/installer_concurrent_test.go b/internal/hooks/installer_concurrent_test.go
+new file mode 100644
+index 00000000..0c3dd6d4
+--- /dev/null
++++ b/internal/hooks/installer_concurrent_test.go
+@@ -0,0 +1,91 @@
++package hooks
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++)
++
++// TestInstallForRole_ConcurrentSpawnsProduceValidJSON covers gh#3500: when
++// multiple polecats spawn at the same time they all call InstallForRole on
++// the same shared settings file. The previous implementation used
++// os.WriteFile (open with O_TRUNC then write); on the affected platforms an
++// observer between truncate and write saw a partial JSON file that Claude
++// rejected at startup.
++//
++// With atomic writes (temp + rename), the final settings.json is always a
++// well-formed copy of one writer's full output.
++//
++// Note: the exact corruption reported in the issue is timing-sensitive and
++// may not reproduce on every filesystem (single-syscall writes ≤ a few KB
++// often serialize at the OS layer on Linux tmpfs). This test asserts the
++// post-condition contract — N concurrent writers leave a valid JSON file
++// matching the template — which is what atomic-via-rename guarantees.
++func TestInstallForRole_ConcurrentSpawnsProduceValidJSON(t *testing.T) {
++	dir := t.TempDir()
++	const concurrency = 64
++
++	// Pre-create the target file with content that differs from the template,
++	// so every writer takes the write path (not the "content equal, skip"
++	// early-return). This forces the truncate+write race that gh#3500
++	// describes when N polecats race to install settings.json simultaneously.
++	dotClaude := filepath.Join(dir, ".claude")
++	if err := os.MkdirAll(dotClaude, 0755); err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++	target := filepath.Join(dotClaude, "settings.json")
++	// Seed with the legacy `export PATH=` marker so InstallForRole's
++	// needsUpgrade() check fires for every writer and they all proceed past
++	// the early-return into the racy write path (gh#3500).
++	if err := os.WriteFile(target, []byte(`{"stale":true,"hint":"export PATH=/foo"}`), 0600); err != nil {
++		t.Fatalf("seed file: %v", err)
++	}
++
++	// Release all goroutines simultaneously to maximize overlap on the
++	// truncate+write window.
++	start := make(chan struct{})
++	var ready, wg sync.WaitGroup
++	errs := make(chan error, concurrency)
++	for i := 0; i < concurrency; i++ {
++		ready.Add(1)
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			ready.Done()
++			<-start
++			if err := InstallForRole("claude", dir, dir, "polecat", ".claude", "settings.json", true); err != nil {
++				errs <- err
++			}
++		}()
++	}
++	ready.Wait()
++	close(start)
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		t.Fatalf("InstallForRole: %v", err)
++	}
++
++	data, err := os.ReadFile(target)
++	if err != nil {
++		t.Fatalf("read settings.json: %v", err)
++	}
++
++	// The file must be parseable JSON — corruption from interleaved truncates
++	// would produce a syntax error here.
++	var v any
++	if err := json.Unmarshal(data, &v); err != nil {
++		t.Fatalf("settings.json is not valid JSON after concurrent writes: %v\n--- file contents (%d bytes) ---\n%s", err, len(data), string(data))
++	}
++
++	// And it must match the resolved template byte-for-byte.
++	want, err := resolveAndSubstitute("claude", "settings-autonomous.json", "polecat")
++	if err != nil {
++		t.Fatalf("resolveAndSubstitute: %v", err)
++	}
++	if string(data) != string(want) {
++		t.Errorf("settings.json content mismatch after concurrent writes: got %d bytes, want %d bytes", len(data), len(want))
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

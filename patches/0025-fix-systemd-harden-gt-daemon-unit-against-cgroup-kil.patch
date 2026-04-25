@@ -1,7 +1,7 @@
 From a4986667d81e64108301a6dc70005996a7386f2e Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 17:48:22 -0400
-Subject: [PATCH 25/26] fix(systemd): harden gt-daemon unit against cgroup-kill
+Subject: [PATCH 25/34] fix(systemd): harden gt-daemon unit against cgroup-kill
  failures
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

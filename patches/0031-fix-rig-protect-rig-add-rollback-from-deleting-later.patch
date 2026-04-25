@@ -1,0 +1,245 @@
+From 0adc728e72b472c9c2cfc37f77e1e8ac2c33b2aa Mon Sep 17 00:00:00 2001
+From: gtmain <gastown.crew.gtmain@gastown.local>
+Date: Sat, 25 Apr 2026 19:31:11 +0000
+Subject: [PATCH 31/34] fix(rig): protect rig add rollback from deleting later
+ successful re-add (gh-3683)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Stamp each rig directory with a per-invocation ownership token at MkdirAll
+time and gate the deferred rollback on the token still matching. A stale
+background `gt rig add` whose context has been lost can no longer wipe a
+directory that a later, successful re-add of the same rig name has populated.
+
+When the on-disk token differs (a competing successful add overwrote it) or
+is missing on a non-empty directory (a successful add cleared its token),
+the rollback logs a warning and leaves the path intact. Directories with
+neither token nor content are still removed — there's nothing to protect.
+---
+ internal/rig/add_token_test.go | 96 ++++++++++++++++++++++++++++++++++
+ internal/rig/manager.go        | 88 ++++++++++++++++++++++++++++++-
+ 2 files changed, 182 insertions(+), 2 deletions(-)
+ create mode 100644 internal/rig/add_token_test.go
+
+diff --git a/internal/rig/add_token_test.go b/internal/rig/add_token_test.go
+new file mode 100644
+index 00000000..30706f18
+--- /dev/null
++++ b/internal/rig/add_token_test.go
+@@ -0,0 +1,96 @@
++package rig
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// TestRemoveRigPathIfOwned_TokenMatches verifies that when the on-disk token
++// matches the expected token, the directory is removed.
++func TestRemoveRigPathIfOwned_TokenMatches(t *testing.T) {
++	rigPath := t.TempDir()
++	if err := os.WriteFile(filepath.Join(rigPath, "some-file"), []byte("x"), 0644); err != nil {
++		t.Fatalf("write file: %v", err)
++	}
++
++	token, err := newAddOwnershipToken()
++	if err != nil {
++		t.Fatalf("token: %v", err)
++	}
++	if err := writeAddOwnershipToken(rigPath, token); err != nil {
++		t.Fatalf("write token: %v", err)
++	}
++
++	removeRigPathIfOwned(rigPath, token)
++
++	if _, err := os.Stat(rigPath); !os.IsNotExist(err) {
++		t.Fatalf("expected rig path to be removed, stat err=%v", err)
++	}
++}
++
++// TestRemoveRigPathIfOwned_TokenMismatch verifies that when the on-disk token
++// belongs to a different invocation, the directory is preserved (gh#3683).
++func TestRemoveRigPathIfOwned_TokenMismatch(t *testing.T) {
++	rigPath := t.TempDir()
++	preserved := filepath.Join(rigPath, "preserve-me")
++	if err := os.WriteFile(preserved, []byte("important"), 0644); err != nil {
++		t.Fatalf("write file: %v", err)
++	}
++
++	// Disk has a token from a *different* (later, successful) add.
++	if err := writeAddOwnershipToken(rigPath, "newer-token"); err != nil {
++		t.Fatalf("write token: %v", err)
++	}
++
++	// Stale rollback runs with its own (older) token.
++	removeRigPathIfOwned(rigPath, "older-token")
++
++	if _, err := os.Stat(preserved); err != nil {
++		t.Fatalf("preserved file was deleted: %v", err)
++	}
++}
++
++// TestRemoveRigPathIfOwned_TokenMissingNonEmpty verifies that a missing token
++// on a non-empty directory is treated as not-owned and skipped — covers the
++// case where a successful re-add has already cleared its token.
++func TestRemoveRigPathIfOwned_TokenMissingNonEmpty(t *testing.T) {
++	rigPath := t.TempDir()
++	preserved := filepath.Join(rigPath, "rig-content")
++	if err := os.WriteFile(preserved, []byte("important"), 0644); err != nil {
++		t.Fatalf("write file: %v", err)
++	}
++
++	removeRigPathIfOwned(rigPath, "stale-token")
++
++	if _, err := os.Stat(preserved); err != nil {
++		t.Fatalf("preserved file was deleted: %v", err)
++	}
++}
++
++// TestRemoveRigPathIfOwned_TokenMissingEmpty verifies that an empty directory
++// (no token, no content) is removed — there's nothing to protect.
++func TestRemoveRigPathIfOwned_TokenMissingEmpty(t *testing.T) {
++	rigPath := t.TempDir()
++
++	removeRigPathIfOwned(rigPath, "stale-token")
++
++	if _, err := os.Stat(rigPath); !os.IsNotExist(err) {
++		t.Fatalf("expected empty rig path to be removed, stat err=%v", err)
++	}
++}
++
++// TestRemoveRigPathIfOwned_NoExpectedToken verifies that when no token was
++// ever issued (early failure path), cleanup proceeds unconditionally.
++func TestRemoveRigPathIfOwned_NoExpectedToken(t *testing.T) {
++	rigPath := t.TempDir()
++	if err := os.WriteFile(filepath.Join(rigPath, "x"), []byte("x"), 0644); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	removeRigPathIfOwned(rigPath, "")
++
++	if _, err := os.Stat(rigPath); !os.IsNotExist(err) {
++		t.Fatalf("expected rig path to be removed, stat err=%v", err)
++	}
++}
+diff --git a/internal/rig/manager.go b/internal/rig/manager.go
+index 84a2b77c..fcf6d5f1 100644
+--- a/internal/rig/manager.go
++++ b/internal/rig/manager.go
+@@ -2,6 +2,8 @@ package rig
+ 
+ import (
+ 	"cmp"
++	"crypto/rand"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -376,8 +378,22 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
+ 		return nil, fmt.Errorf("creating rig directory: %w", err)
+ 	}
+ 
+-	// Track cleanup on failure (best-effort cleanup)
+-	cleanup := func() { _ = os.RemoveAll(rigPath) }
++	// Stamp the directory with an ownership token so a stale rollback (e.g.
++	// from a long-running clone whose parent shell has lost track of it)
++	// cannot delete a later, successful re-add of the same rig name.
++	// See gh#3683.
++	addToken, err := newAddOwnershipToken()
++	if err != nil {
++		_ = os.RemoveAll(rigPath)
++		return nil, fmt.Errorf("generating ownership token: %w", err)
++	}
++	if err := writeAddOwnershipToken(rigPath, addToken); err != nil {
++		_ = os.RemoveAll(rigPath)
++		return nil, fmt.Errorf("writing ownership token: %w", err)
++	}
++
++	// Track cleanup on failure (best-effort cleanup, ownership-checked).
++	cleanup := func() { removeRigPathIfOwned(rigPath, addToken) }
+ 	success := false
+ 	defer func() {
+ 		if !success {
+@@ -887,9 +903,77 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
+ 	}
+ 
+ 	success = true
++	// Best-effort: clear the ownership token now that the add has completed
++	// successfully. It's fine if this fails — the token's only purpose is
++	// gating rollback inside this AddRig call.
++	_ = clearAddOwnershipToken(rigPath)
+ 	return m.loadRig(opts.Name, m.config.Rigs[opts.Name])
+ }
+ 
++// addOwnershipTokenFile is the per-rig sentinel that proves a `gt rig add`
++// invocation owns the directory. Used to make rollback safe under
++// concurrent/stale invocations — see gh#3683.
++const addOwnershipTokenFile = ".gt-add-token"
++
++// newAddOwnershipToken generates a 16-byte random token, hex-encoded.
++func newAddOwnershipToken() (string, error) {
++	var buf [16]byte
++	if _, err := rand.Read(buf[:]); err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(buf[:]), nil
++}
++
++func writeAddOwnershipToken(rigPath, token string) error {
++	return os.WriteFile(filepath.Join(rigPath, addOwnershipTokenFile), []byte(token), 0644)
++}
++
++func readAddOwnershipToken(rigPath string) string {
++	data, err := os.ReadFile(filepath.Join(rigPath, addOwnershipTokenFile))
++	if err != nil {
++		return ""
++	}
++	return strings.TrimSpace(string(data))
++}
++
++func clearAddOwnershipToken(rigPath string) error {
++	return os.Remove(filepath.Join(rigPath, addOwnershipTokenFile))
++}
++
++// removeRigPathIfOwned cleans up a rig directory, but only if the on-disk
++// ownership token matches `expectedToken`. If the token is missing the
++// directory is removed only when empty; otherwise we log a warning and
++// leave the directory intact so an unrelated successful add isn't deleted.
++func removeRigPathIfOwned(rigPath, expectedToken string) {
++	if expectedToken == "" {
++		// Caller never issued a token (early failure before we wrote one).
++		// Safe to remove since nothing meaningful could have been created.
++		_ = os.RemoveAll(rigPath)
++		return
++	}
++	onDisk := readAddOwnershipToken(rigPath)
++	if onDisk == expectedToken {
++		_ = os.RemoveAll(rigPath)
++		return
++	}
++	if onDisk == "" {
++		// Token file is gone. The directory may have been wiped and
++		// re-populated by another add (which then cleared its own token on
++		// success), or the path may be empty. Only remove when empty.
++		if entries, err := os.ReadDir(rigPath); err == nil && len(entries) == 0 {
++			_ = os.RemoveAll(rigPath)
++			return
++		}
++		fmt.Fprintf(os.Stderr,
++			"  ⚠ Skipping rollback of %s: ownership token missing and directory is non-empty (gh#3683 protection)\n",
++			rigPath)
++		return
++	}
++	fmt.Fprintf(os.Stderr,
++		"  ⚠ Skipping rollback of %s: another rig add now owns this path (gh#3683 protection)\n",
++		rigPath)
++}
++
+ // verifyRigIdentity checks that metadata.json points to the correct Dolt database
+ // for this rig. This catches identity mismatches early — before polecats are spawned
+ // and get stuck in retry loops. (gas-tc4)
+-- 
+2.50.1 (Apple Git-155)
+

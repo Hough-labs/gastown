@@ -1,0 +1,195 @@
+From 37a87ffeb69b93f7728e80a08d3820a22d427549 Mon Sep 17 00:00:00 2001
+From: gtmain <gastown.crew.gtmain@gastown.local>
+Date: Sat, 25 Apr 2026 20:06:37 +0000
+Subject: [PATCH 27/34] fix(doltserver): clamp Dolt idle session wait_timeout
+ to prevent connection exhaustion (gh-3623)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dolt inherits MySQL's wait_timeout default of 28800s (8 hours). Under sustained
+Gas Town load (mayor + deacon + witness + refinery + polecats + dashboard),
+short-lived bd processes leak connections faster than the 8-hour timeout
+reclaims them; once the 1000-connection cap is hit, every subsequent bd
+hangs and the only fix is `pkill bd && Dolt restart`.
+
+After Start() verifies the server is up and serving its expected databases,
+issue `SET GLOBAL wait_timeout = N` with N=30 by default. The override is
+best-effort: if the SQL fails the start does not — Dolt is already serving,
+the operator just keeps the long default. The value is configurable via
+GT_DOLT_WAIT_TIMEOUT (negative disables the override).
+---
+ internal/doltserver/doltserver.go        | 54 +++++++++++++++++++++-
+ internal/doltserver/wait_timeout_test.go | 57 ++++++++++++++++++++++++
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+ create mode 100644 internal/doltserver/wait_timeout_test.go
+
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index d742c61c..bccc8265 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -153,6 +153,16 @@ const (
+ 	// Dolt detects the dead connection within this timeout rather than holding CLOSE_WAIT
+ 	// for Dolt's default 8 hours. Set to match compactor GC timeout.
+ 	DefaultWriteTimeoutMs = 5 * 60 * 1000 // 5 minutes in milliseconds
++
++	// DefaultWaitTimeoutSec is how long Dolt keeps an idle session alive before
++	// closing it. Dolt's MySQL-compat default is 28800s (8 hours). Under Gas
++	// Town load (mayor + deacon + witness + refinery + N polecats + dashboard
++	// polling), short-lived `bd` processes leak connections faster than the
++	// default timeout reclaims them, leading to a death spiral at the 1000-
++	// connection cap. 30s is aggressive but matches the documented workaround
++	// in gh-3623 and is far longer than any healthy bd query takes.
++	// Override with GT_DOLT_WAIT_TIMEOUT.
++	DefaultWaitTimeoutSec = 30
+ )
+ 
+ // doltConfigYAML represents the subset of Dolt's config.yaml that we need to read.
+@@ -239,6 +249,12 @@ type Config struct {
+ 	// Set to 0 to use Dolt's default (28800000 = 8 hours — strongly discouraged).
+ 	WriteTimeoutMs int
+ 
++	// WaitTimeoutSec is the idle-session timeout (MySQL `wait_timeout` server
++	// variable) in seconds. Set after the server is reachable via
++	// `SET GLOBAL wait_timeout = N`. See gh-3623.
++	// Set to 0 to skip the override and let Dolt use its 8-hour default.
++	WaitTimeoutSec int
++
+ 	// LogLevel is the Dolt server log level (trace, debug, info, warning, error, fatal).
+ 	// Default is "warning" to suppress connection open/close noise. Override with
+ 	// GT_DOLT_LOGLEVEL=info (or debug) for diagnostics.
+@@ -272,9 +288,22 @@ func DefaultConfig(townRoot string) *Config {
+ 		MaxConnections: DefaultMaxConnections,
+ 		ReadTimeoutMs:  DefaultReadTimeoutMs,
+ 		WriteTimeoutMs: DefaultWriteTimeoutMs,
++		WaitTimeoutSec: DefaultWaitTimeoutSec,
+ 		LogLevel:       "warning",
+ 	}
+ 
++	// Optional override for the idle-session timeout. Negative values disable
++	// the override entirely (use Dolt's 8-hour default).
++	if v := os.Getenv("GT_DOLT_WAIT_TIMEOUT"); v != "" {
++		if n, err := strconv.Atoi(v); err == nil {
++			if n < 0 {
++				config.WaitTimeoutSec = 0
++			} else {
++				config.WaitTimeoutSec = n
++			}
++		}
++	}
++
+ 	if h := os.Getenv("GT_DOLT_HOST"); h != "" {
+ 		config.Host = h
+ 	} else if townRoot != "" {
+@@ -1658,7 +1687,8 @@ func Start(townRoot string) error {
+ 		// SHOW DATABASES showing no rig databases until the user manually
+ 		// runs gt dolt stop + gt dolt start. (gt-nq1)
+ 		if len(databases) == 0 {
+-			return nil // Nothing to verify — fresh install or empty data dir
++			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
++			return nil                         // Nothing to verify — fresh install or empty data dir
+ 		}
+ 		_, missing, verifyErr := VerifyDatabases(townRoot)
+ 		if verifyErr != nil {
+@@ -1666,7 +1696,8 @@ func Start(townRoot string) error {
+ 			continue
+ 		}
+ 		if len(missing) == 0 {
+-			return nil // Server is up and serving every expected database
++			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
++			return nil                         // Server is up and serving every expected database
+ 		}
+ 		lastErr = fmt.Errorf("server is reachable but %d/%d databases not yet served (missing: %v)",
+ 			len(missing), len(databases), missing)
+@@ -3822,6 +3853,25 @@ func moveDir(src, dest string) error {
+ // Always connects via explicit --host/--port flags to ensure the command goes
+ // through the running sql-server process. Without these flags, `dolt sql` runs
+ // in embedded mode (even from the data directory), which creates databases on
++// applyWaitTimeout sets MySQL's `wait_timeout` server variable on the running
++// Dolt server so idle connections close in seconds rather than Dolt's 8-hour
++// default. Under sustained load this is the difference between healthy
++// connection turnover and a death spiral that exhausts max_connections.
++// See gh-3623.
++//
++// Best-effort: a failure here is logged but does not fail the start, since
++// the server is already up and serving traffic. Callers can still operate;
++// they just inherit the long Dolt default.
++func applyWaitTimeout(townRoot string, config *Config) {
++	if config.WaitTimeoutSec <= 0 {
++		return
++	}
++	query := fmt.Sprintf("SET GLOBAL wait_timeout = %d", config.WaitTimeoutSec)
++	if err := serverExecSQL(townRoot, query); err != nil {
++		fmt.Fprintf(os.Stderr, "Warning: could not set Dolt wait_timeout=%ds: %v\n", config.WaitTimeoutSec, err)
++	}
++}
++
+ // disk but does NOT register them with the live server catalog. This caused
+ // "database not found" errors during gt rig add.
+ func serverExecSQL(townRoot, query string) error {
+diff --git a/internal/doltserver/wait_timeout_test.go b/internal/doltserver/wait_timeout_test.go
+new file mode 100644
+index 00000000..f4cc1d89
+--- /dev/null
++++ b/internal/doltserver/wait_timeout_test.go
+@@ -0,0 +1,57 @@
++package doltserver
++
++import (
++	"testing"
++)
++
++// TestDefaultConfig_WaitTimeoutDefault verifies that the default config
++// applies the gh-3623 idle-session timeout.
++func TestDefaultConfig_WaitTimeoutDefault(t *testing.T) {
++	townRoot := t.TempDir()
++	t.Setenv("GT_DOLT_WAIT_TIMEOUT", "")
++
++	config := DefaultConfig(townRoot)
++
++	if config.WaitTimeoutSec != DefaultWaitTimeoutSec {
++		t.Errorf("WaitTimeoutSec = %d, want %d", config.WaitTimeoutSec, DefaultWaitTimeoutSec)
++	}
++}
++
++// TestDefaultConfig_WaitTimeoutEnvOverride verifies the GT_DOLT_WAIT_TIMEOUT
++// env var raises or lowers the configured timeout.
++func TestDefaultConfig_WaitTimeoutEnvOverride(t *testing.T) {
++	townRoot := t.TempDir()
++	t.Setenv("GT_DOLT_WAIT_TIMEOUT", "120")
++
++	config := DefaultConfig(townRoot)
++
++	if config.WaitTimeoutSec != 120 {
++		t.Errorf("WaitTimeoutSec = %d, want 120", config.WaitTimeoutSec)
++	}
++}
++
++// TestDefaultConfig_WaitTimeoutNegativeDisables verifies that a negative
++// value opts out of the override, leaving Dolt's default in place.
++func TestDefaultConfig_WaitTimeoutNegativeDisables(t *testing.T) {
++	townRoot := t.TempDir()
++	t.Setenv("GT_DOLT_WAIT_TIMEOUT", "-1")
++
++	config := DefaultConfig(townRoot)
++
++	if config.WaitTimeoutSec != 0 {
++		t.Errorf("WaitTimeoutSec = %d, want 0 (disabled)", config.WaitTimeoutSec)
++	}
++}
++
++// TestDefaultConfig_WaitTimeoutInvalidIgnored verifies that a non-numeric
++// env value falls back to the default rather than zeroing the timeout.
++func TestDefaultConfig_WaitTimeoutInvalidIgnored(t *testing.T) {
++	townRoot := t.TempDir()
++	t.Setenv("GT_DOLT_WAIT_TIMEOUT", "not-a-number")
++
++	config := DefaultConfig(townRoot)
++
++	if config.WaitTimeoutSec != DefaultWaitTimeoutSec {
++		t.Errorf("WaitTimeoutSec = %d, want default %d when env var is invalid", config.WaitTimeoutSec, DefaultWaitTimeoutSec)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

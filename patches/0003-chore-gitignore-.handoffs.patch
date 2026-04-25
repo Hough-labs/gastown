@@ -1,7 +1,7 @@
 From 00d8fa0af7d5d93a39747d5c19136545e3b2a001 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 06:09:54 -0400
-Subject: [PATCH 03/26] chore: gitignore .handoffs/
+Subject: [PATCH 03/34] chore: gitignore .handoffs/
 
 Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 ---

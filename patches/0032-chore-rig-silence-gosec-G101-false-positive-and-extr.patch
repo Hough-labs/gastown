@@ -1,0 +1,146 @@
+From b7cd091bc07df4a0e66dc6293c58ae9e5ab407df Mon Sep 17 00:00:00 2001
+From: gtmain <gastown.crew.gtmain@gastown.local>
+Date: Sat, 25 Apr 2026 20:33:49 +0000
+Subject: [PATCH 32/34] chore(rig): silence gosec G101 false positive and
+ extract token-stamp helper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Annotate addOwnershipTokenFile const with //nolint:gosec — gosec flags
+  any identifier containing "token" as a potential hardcoded credential;
+  this constant holds a filename, not a secret.
+- Extract the token-stamp prelude in AddRig into stampAddOwnershipToken
+  so the create-token / write / cleanup-on-error path is unit-testable
+  in isolation. Moves several uncovered diff lines out of AddRig (which
+  needs git/dolt to integration-test) and into a small helper that the
+  existing add_token_test.go now exercises directly.
+- Add coverage for the os.ReadDir error branch of removeRigPathIfOwned
+  (rigPath does not exist) and for clearAddOwnershipToken's error return.
+---
+ internal/rig/add_token_test.go | 59 ++++++++++++++++++++++++++++++++++
+ internal/rig/manager.go        | 31 +++++++++++++-----
+ 2 files changed, 82 insertions(+), 8 deletions(-)
+
+diff --git a/internal/rig/add_token_test.go b/internal/rig/add_token_test.go
+index 30706f18..a1871571 100644
+--- a/internal/rig/add_token_test.go
++++ b/internal/rig/add_token_test.go
+@@ -94,3 +94,62 @@ func TestRemoveRigPathIfOwned_NoExpectedToken(t *testing.T) {
+ 		t.Fatalf("expected rig path to be removed, stat err=%v", err)
+ 	}
+ }
++
++// TestRemoveRigPathIfOwned_PathMissing covers the os.ReadDir error path
++// inside removeRigPathIfOwned (rigPath does not exist).
++func TestRemoveRigPathIfOwned_PathMissing(t *testing.T) {
++	missing := filepath.Join(t.TempDir(), "does-not-exist")
++
++	// Should not panic; should not create the path.
++	removeRigPathIfOwned(missing, "stale-token")
++
++	if _, err := os.Stat(missing); !os.IsNotExist(err) {
++		t.Fatalf("expected missing path to remain missing, stat err=%v", err)
++	}
++}
++
++// TestStampAddOwnershipToken_RoundTrip covers the success path: a fresh
++// token is written and round-trips via readAddOwnershipToken.
++func TestStampAddOwnershipToken_RoundTrip(t *testing.T) {
++	rigPath := t.TempDir()
++
++	token, err := stampAddOwnershipToken(rigPath)
++	if err != nil {
++		t.Fatalf("stamp: %v", err)
++	}
++	if token == "" {
++		t.Fatal("token is empty")
++	}
++
++	got := readAddOwnershipToken(rigPath)
++	if got != token {
++		t.Errorf("readAddOwnershipToken = %q, want %q", got, token)
++	}
++}
++
++// TestStampAddOwnershipToken_WriteFailureCleansUp covers the error path
++// where the underlying os.WriteFile call fails (the rigPath's parent does
++// not exist). The helper must surface the error rather than silently
++// returning an empty token.
++func TestStampAddOwnershipToken_WriteFailureCleansUp(t *testing.T) {
++	parent := t.TempDir()
++	bogus := filepath.Join(parent, "missing-parent", "rig")
++
++	token, err := stampAddOwnershipToken(bogus)
++	if err == nil {
++		t.Fatalf("expected error for unwritable rigPath, got token=%q", token)
++	}
++	if token != "" {
++		t.Errorf("token should be empty on error, got %q", token)
++	}
++}
++
++// TestClearAddOwnershipToken_OnAbsentFile covers the error-return path of
++// clearAddOwnershipToken (called best-effort on success in AddRig).
++func TestClearAddOwnershipToken_OnAbsentFile(t *testing.T) {
++	rigPath := t.TempDir()
++
++	if err := clearAddOwnershipToken(rigPath); err == nil {
++		t.Fatal("expected error removing nonexistent token file")
++	}
++}
+diff --git a/internal/rig/manager.go b/internal/rig/manager.go
+index fcf6d5f1..8b36eaba 100644
+--- a/internal/rig/manager.go
++++ b/internal/rig/manager.go
+@@ -382,14 +382,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
+ 	// from a long-running clone whose parent shell has lost track of it)
+ 	// cannot delete a later, successful re-add of the same rig name.
+ 	// See gh#3683.
+-	addToken, err := newAddOwnershipToken()
++	addToken, err := stampAddOwnershipToken(rigPath)
+ 	if err != nil {
+-		_ = os.RemoveAll(rigPath)
+-		return nil, fmt.Errorf("generating ownership token: %w", err)
+-	}
+-	if err := writeAddOwnershipToken(rigPath, addToken); err != nil {
+-		_ = os.RemoveAll(rigPath)
+-		return nil, fmt.Errorf("writing ownership token: %w", err)
++		return nil, err
+ 	}
+ 
+ 	// Track cleanup on failure (best-effort cleanup, ownership-checked).
+@@ -912,9 +907,29 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
+ 
+ // addOwnershipTokenFile is the per-rig sentinel that proves a `gt rig add`
+ // invocation owns the directory. Used to make rollback safe under
+-// concurrent/stale invocations — see gh#3683.
++// concurrent/stale invocations — see gh#3683. Despite the name it holds
++// no secret material; it's a random hex marker for ownership.
++//
++//nolint:gosec // G101: filename, not a credential
+ const addOwnershipTokenFile = ".gt-add-token"
+ 
++// stampAddOwnershipToken generates a fresh ownership token and writes it into
++// rigPath. On any failure the (possibly half-stamped) directory is cleaned up
++// so the caller doesn't leak partial state. Returns the token on success so
++// the caller can pass it to removeRigPathIfOwned.
++func stampAddOwnershipToken(rigPath string) (string, error) {
++	token, err := newAddOwnershipToken()
++	if err != nil {
++		_ = os.RemoveAll(rigPath)
++		return "", fmt.Errorf("generating ownership token: %w", err)
++	}
++	if err := writeAddOwnershipToken(rigPath, token); err != nil {
++		_ = os.RemoveAll(rigPath)
++		return "", fmt.Errorf("writing ownership token: %w", err)
++	}
++	return token, nil
++}
++
+ // newAddOwnershipToken generates a 16-byte random token, hex-encoded.
+ func newAddOwnershipToken() (string, error) {
+ 	var buf [16]byte
+-- 
+2.50.1 (Apple Git-155)
+

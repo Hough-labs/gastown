@@ -1,7 +1,7 @@
 From 9556c99e650c961eeb2b3ea1c44be91b376f476a Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 21 Apr 2026 09:40:52 -0400
-Subject: [PATCH 20/26] fix(tmux): fail loud when wrapped agent dies
+Subject: [PATCH 20/34] fix(tmux): fail loud when wrapped agent dies
  mid-startup
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
