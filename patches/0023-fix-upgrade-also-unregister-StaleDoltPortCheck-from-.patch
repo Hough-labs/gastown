@@ -1,0 +1,41 @@
+From dd63a066614cedd19764a8cc2a426469ba30d0ed Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Apr 2026 16:29:22 -0400
+Subject: [PATCH 23/26] fix(upgrade): also unregister StaleDoltPortCheck from
+ gt upgrade
+
+Companion to the prior commit. gt upgrade runs FixStreaming on its own
+check list and still had StaleDoltPortCheck registered, so a fork
+upgrade would re-apply the same destructive rewrite that gt doctor
+--fix no longer does.
+---
+ internal/cmd/upgrade.go | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/internal/cmd/upgrade.go b/internal/cmd/upgrade.go
+index d039d54b..1adae95e 100644
+--- a/internal/cmd/upgrade.go
++++ b/internal/cmd/upgrade.go
+@@ -143,7 +143,9 @@ func upgradeDoctor(townRoot string) upgradeResult {
+ 	d.Register(doctor.NewDeprecatedMergeQueueKeysCheck())
+ 	d.Register(doctor.NewStaleTaskDispatchCheck())
+ 	d.Register(doctor.NewHooksSyncCheck())
+-	d.Register(doctor.NewStaleDoltPortCheck())
++	// StaleDoltPortCheck unregistered on this fork — see doctor.go for the
++	// full reason. In short: its Fix() rewrites metadata.json away from our
++	// k8s Dolt server.
+ 	d.Register(doctor.NewStaleSQLServerInfoCheck())
+ 	d.Register(doctor.NewSparseCheckoutCheck())
+ 	d.Register(doctor.NewPrimingCheck())
+@@ -209,7 +211,7 @@ func upgradeCLAUDEMD(townRoot string) upgradeResult {
+ 		return result
+ 	}
+ 
+-	if err := os.WriteFile(claudePath, []byte(expected), 0644); err != nil {
++	if err := os.WriteFile(claudePath, []byte(expected), 0o644); err != nil {
+ 		result.details = append(result.details, fmt.Sprintf("error writing: %v", err))
+ 		fmt.Printf("     %s Could not write CLAUDE.md: %v\n", style.ErrorPrefix, err)
+ 		return result
+-- 
+2.50.1 (Apple Git-155)
+

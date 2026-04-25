@@ -1,0 +1,58 @@
+From a4986667d81e64108301a6dc70005996a7386f2e Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Apr 2026 17:48:22 -0400
+Subject: [PATCH 25/26] fix(systemd): harden gt-daemon unit against cgroup-kill
+ failures
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The gastown daemon spawns claude agents through tmux, which uses
+systemd-run to place each pane in its own tmux-spawn-<uuid>.scope —
+sibling to the gt-daemon.service cgroup, not child. With the default
+KillMode=control-group, 'systemctl stop gt-daemon' tries to signal
+every process in the service cgroup and intermittently fails the
+eventual cgroup.kill with "Failed to kill control group: Invalid
+argument", landing the unit in 'failed' state.
+
+Incident (anvil, 2026-04-23 23:11:44): 'systemctl restart gt-daemon'
+during the pre-push deploy timed out on stop, SIGKILL'd the daemon
+but couldn't clean the cgroup, and the unit sat failed for 17h.
+Subsequent restart attempts silently no-op'd on the failed unit,
+which is why the deploy script logs 'Daemon restarted.' but the
+binary in memory never swapped.
+
+Fix: add KillMode=mixed + TimeoutStopSec=30s. Mixed mode sends SIGTERM
+to the main gt process only (it drains its own bd children cleanly),
+and only the cgroup.kill at timeout can tickle the EINVAL — which
+for our usage pattern effectively never fires.
+
+Applies to the embedded template; anvil's hand-rolled
+gt-daemon.service was patched in place separately.
+---
+ internal/templates/systemd/gastown-daemon.service | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/internal/templates/systemd/gastown-daemon.service b/internal/templates/systemd/gastown-daemon.service
+index b78a4492..1a9e5954 100644
+--- a/internal/templates/systemd/gastown-daemon.service
++++ b/internal/templates/systemd/gastown-daemon.service
+@@ -11,6 +11,15 @@ RestartSec=5s
+ Environment="GT_TOWN_ROOT={{.TownRoot}}"
+ StandardOutput=append:{{.TownRoot}}/daemon/daemon.log
+ StandardError=append:{{.TownRoot}}/daemon/daemon.log
++# KillMode=mixed: SIGTERM the main gt process only, then SIGKILL the cgroup at
++# timeout. The daemon spawns claude agents via tmux-spawn-<uuid>.scope sibling
++# cgroups; with the default control-group KillMode, systemd tries to signal
++# every process in the service cgroup including transiently-adopted children,
++# which intermittently fails with "Failed to kill control group: Invalid
++# argument" and strands the unit in 'failed' state. Mixed mode lets the
++# daemon's own graceful shutdown drain its bd children cleanly.
++KillMode=mixed
++TimeoutStopSec=30s
+ 
+ [Install]
+ WantedBy=default.target
+-- 
+2.50.1 (Apple Git-155)
+

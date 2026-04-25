@@ -1,0 +1,48 @@
+From 4f41ccc6c1149dad136a7146c338ded8aed97d8e Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 24 Apr 2026 17:48:25 -0400
+Subject: [PATCH 26/26] fix(make): fetch upstream/main before exporting patches
+
+'make patches' computes anvil..upstream/main and exports the
+divergence. If the local upstream ref is stale, upstream commits
+get mistakenly exported as local patches.
+
+Incident (2026-04-24): a deacon agent ran make patches with its
+upstream ref behind, and ~80 upstream commits landed in patches/.
+The pre-push validator caught the mismatch only on the next push,
+forcing a cleanup rebase.
+
+Fix: fetch --no-tags upstream main first. Non-fatal on failure so
+offline or sandboxed runs (where fetch may not reach the internet)
+still produce the same output they produced before.
+---
+ Makefile | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 80dbaceb..f95cd76a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -169,8 +169,19 @@ check-version-tag:
+ 
+ # Export current local commits (anvil..upstream/main divergence) to patches/.
+ # Run this after adding or editing a local patch commit.
++#
++# Fetches upstream/main first so the export is computed against the real
++# upstream tip. Without this, an agent whose upstream ref is stale will
++# mistakenly export upstream commits as local patches (landed on anvil
++# 2026-04-24 by a deacon agent — 80+ upstream commits leaked into
++# patches/ and were only caught when the pre-push validator re-exported
++# and diffed). Fetch is non-fatal so offline/sandboxed runs still work;
++# they'll produce the same old-baseline output they used to produce.
+ #   make patches
+ patches:
++	@echo "Fetching upstream/main for a correct patch baseline..."
++	@git fetch --no-tags upstream main 2>/dev/null || \
++		echo "warning: could not fetch upstream (offline?); using cached upstream/main"
+ 	@echo "Exporting patches from anvil -> upstream/main divergence..."
+ 	@rm -f patches/*.patch
+ 	@git format-patch upstream/main..HEAD --output-directory patches/ -- . ':!patches/'
+-- 
+2.50.1 (Apple Git-155)
+
