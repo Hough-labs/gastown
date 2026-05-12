@@ -1068,6 +1068,51 @@ func TestDiscoverRoleLocations_SkipsNonRigs(t *testing.T) {
 	}
 }
 
+// events/ is the witness/refinery event-stream channel directory at town root,
+// not a rig. It contains subdirectories named "witness" and "refinery" which
+// store .event files. Without an explicit skip, isRig() trips on those subdir
+// names and the discovery walkers emit phantom Claude settings.json targets.
+func TestDiscoverTargets_SkipsEventsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "realrig", "witness"), 0755)
+	// events/ shadows the rig-marker subdir names but is not itself a rig.
+	os.MkdirAll(filepath.Join(tmpDir, "events", "witness"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "events", "refinery"), 0755)
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	for _, tgt := range targets {
+		if tgt.Rig == "events" {
+			t.Errorf("events/ should not be discovered as a rig, got target: %s", tgt.DisplayKey())
+		}
+	}
+}
+
+func TestDiscoverRoleLocations_SkipsEventsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "realrig", "witness"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "events", "witness"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "events", "refinery"), 0755)
+
+	locations, err := DiscoverRoleLocations(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverRoleLocations failed: %v", err)
+	}
+
+	for _, loc := range locations {
+		if loc.Rig == "events" {
+			t.Errorf("events/ should not be discovered as a rig, got location: rig=%q role=%q", loc.Rig, loc.Role)
+		}
+	}
+}
+
 func TestDiscoverWorktrees(t *testing.T) {
 	tmpDir := t.TempDir()
 

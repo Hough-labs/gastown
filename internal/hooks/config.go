@@ -527,8 +527,8 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
-			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
+		if !entry.IsDir() || isNonRigTownDir(entry.Name()) ||
+			strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 
@@ -621,8 +621,8 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
-			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
+		if !entry.IsDir() || isNonRigTownDir(entry.Name()) ||
+			strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 
@@ -715,6 +715,19 @@ func isRig(path string) bool {
 		if err == nil && info.IsDir() {
 			return true
 		}
+	}
+	return false
+}
+
+// isNonRigTownDir returns true for well-known town-root subdirectories that
+// must never be treated as rigs by the discovery walkers. Town-level role dirs
+// (mayor, deacon) are added explicitly elsewhere; events/ is the witness/
+// refinery event-stream channel and has subdirs named "witness" and "refinery"
+// that would otherwise trip isRig().
+func isNonRigTownDir(name string) bool {
+	switch name {
+	case "mayor", "deacon", "events", ".beads":
+		return true
 	}
 	return false
 }
