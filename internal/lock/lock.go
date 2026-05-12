@@ -56,8 +56,11 @@ func New(workerDir string) *Lock {
 }
 
 // Acquire attempts to acquire the lock for this worker.
-// Returns ErrLocked if another live process holds the lock.
-// Automatically cleans up stale locks.
+// Returns ErrLocked if another live process in a different tmux session
+// holds the lock. Automatically cleans up stale locks, and reclaims locks
+// held by an earlier process in the same tmux session (e.g. a sling
+// bootstrap process that briefly held the lock before the polecat itself
+// began claiming identity).
 //
 // Uses OS-level advisory locking (flock) to prevent TOCTOU races
 // where two processes could both see no lock and both write one.
@@ -89,6 +92,13 @@ func (l *Lock) Acquire(sessionID string) error {
 			// Active lock - check if it's us
 			if info.PID == os.Getpid() {
 				// We already hold it - refresh
+				return l.write(sessionID)
+			}
+			// Same tmux session = same logical worker. A bootstrap process
+			// (e.g. gt sling's spawn helper) may briefly hold the lock from
+			// within our pane before the polecat's own claim runs; treat
+			// that case as our own and reclaim instead of erroring.
+			if sessionID != "" && info.SessionID == sessionID {
 				return l.write(sessionID)
 			}
 			// Another process holds it
