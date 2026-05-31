@@ -7,10 +7,13 @@
 #    (Upstream logic — do not remove.)
 
 # ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
+# Baseline tag this fork tracks. Keep in sync with UPSTREAM_BASE in the Makefile;
+# bump both on every upstream upgrade.
+UPSTREAM_BASE="v1.2.0"
 BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
 if [ "$BRANCH_NAME" = "anvil" ]; then
     PATCH_TMPDIR=$(mktemp -d)
-    git format-patch upstream/main..HEAD --output-directory "$PATCH_TMPDIR" -- . ':!patches/' >/dev/null 2>&1
+    git format-patch "$UPSTREAM_BASE"..HEAD --output-directory "$PATCH_TMPDIR" -- . ':!patches/' >/dev/null 2>&1
     EXPECTED=$(ls "$PATCH_TMPDIR"/*.patch 2>/dev/null | wc -l | tr -d ' ')
     ACTUAL=$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
     if [ "$EXPECTED" != "$ACTUAL" ]; then
