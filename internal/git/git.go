@@ -614,7 +614,7 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 
 	// Ensure destination directory's parent exists
 	destParent := filepath.Dir(dest)
-	if err := os.MkdirAll(destParent, 0755); err != nil {
+	if err := os.MkdirAll(destParent, 0o755); err != nil {
 		return fmt.Errorf("creating destination parent: %w", err)
 	}
 	// Run clone from a temporary directory to completely isolate from any
@@ -1448,24 +1448,52 @@ func (g *Git) FindPRNumber(branch string) (int, error) {
 	return prs[0].Number, nil
 }
 
-// IsPRApproved checks whether a GitHub PR has at least one approving review.
-// Returns true if approved, false if not (or on error).
+// IsPRApproved reports whether a GitHub PR has an effective APPROVED decision.
+//
+// Computed from the reviews list (latest decision per reviewer), NOT gh's
+// `reviewDecision` field: `reviewDecision` is only populated when the repo
+// enforces reviews via branch protection / rulesets, which are unavailable on
+// GitHub Free *private* repos (the field is then permanently empty). The reviews
+// API works on every plan. Mirrors github.Client.GetPRReviewStatus (otherwise
+// unused) and GitHub's own reviewDecision semantics.
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
-	// Use gh pr view which includes review decision
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviews")
 	cmd.Dir = g.workDir
 	out, err := cmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("gh pr view failed: %w", err)
 	}
 	var result struct {
-		ReviewDecision string `json:"reviewDecision"`
+		Reviews []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			State string `json:"state"`
+		} `json:"reviews"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
 		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
 	}
-	// APPROVED is the GitHub review decision when at least one approving review exists
-	return result.ReviewDecision == "APPROVED", nil
+	// Latest *decision* (APPROVED / CHANGES_REQUESTED) per reviewer; ignore
+	// COMMENTED / DISMISSED / PENDING. gh returns reviews chronologically, so the
+	// last decision seen for a login is their current one.
+	latest := make(map[string]string)
+	for _, r := range result.Reviews {
+		if r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		latest[r.Author.Login] = r.State
+	}
+	hasApproval := false
+	for _, state := range latest {
+		if state == "CHANGES_REQUESTED" {
+			return false, nil // any outstanding changes-requested blocks merge
+		}
+		if state == "APPROVED" {
+			hasApproval = true
+		}
+	}
+	return hasApproval, nil
 }
 
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
