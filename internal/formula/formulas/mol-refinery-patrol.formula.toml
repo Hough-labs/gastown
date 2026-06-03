@@ -698,12 +698,24 @@ Then skip to Step 4 (archive mail) and continue patrol.
 **Step 1.7 (pr only): CHECK REVIEW APPROVAL STATUS (gas-fk4)**
 
 ⚠️ **DO NOT merge a PR that has not been explicitly approved.**
-Plain review comments (COMMENTED) are NOT approval. Only an explicit
-"APPROVED" reviewDecision allows the merge to proceed.
+Plain review comments (COMMENTED) are NOT approval. Only an explicit APPROVED
+review not superseded by a later CHANGES_REQUESTED from the same reviewer
+allows the merge to proceed.
+
+**Why not `reviewDecision`:** GitHub only populates `reviewDecision` when the
+repo enforces reviews via branch protection / rulesets — unavailable on Free
+private repos (permanently empty). Compute the decision from the reviews API
+(latest decision per reviewer), which is what reviewDecision does internally.
 
 ```bash
-REVIEW_DECISION=$(gh pr view <polecat-branch> --repo "$REPO_URL" --json reviewDecision -q '.reviewDecision')
-echo "Review decision: $REVIEW_DECISION"
+PR_NUM=$(gh pr view <polecat-branch> --repo "$REPO_URL" --json number -q '.number')
+REVIEW_DECISION=$(gh api "repos/$REPO_URL/pulls/$PR_NUM/reviews?per_page=100" --jq '
+  [ .[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED") ]
+  | [ group_by(.user.login)[] | max_by(.submitted_at) | .state ]
+  | if   any(.[]; . == "CHANGES_REQUESTED") then "CHANGES_REQUESTED"
+    elif any(.[]; . == "APPROVED")          then "APPROVED"
+    else "REVIEW_REQUIRED" end')
+echo "Review decision (computed from reviews API): $REVIEW_DECISION"
 ```
 
 | reviewDecision | Action |
