@@ -908,8 +908,17 @@ func (g *Git) FetchPrune(remote string) error {
 }
 
 // FetchBranch fetches a specific branch from the remote.
+//
+// It uses an explicit refspec (src:dst) rather than a bare branch argument so
+// the remote-tracking ref (e.g. origin/<branch>) is created, and so the ref is
+// resolved unambiguously as a literal name. Polecat branches are suffixed with
+// an id (e.g. polecat/furiosa/gaunt-8ro8.1@mpznbgnd); a bare
+// `git fetch origin <branch>@<id>` was observed to fail with "couldn't find
+// remote ref" when resuming onto an existing PR branch. The refspec form mirrors
+// FetchBranchShallow and resolves it reliably. (hq-w4z7)
 func (g *Git) FetchBranch(remote, branch string) error {
-	_, err := g.run("fetch", remote, branch)
+	refspec := branch + ":refs/remotes/" + remote + "/" + branch
+	_, err := g.run("fetch", remote, refspec)
 	return err
 }
 
