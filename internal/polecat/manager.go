@@ -217,7 +217,7 @@ func (m *Manager) GetNamePool() *NamePool {
 // Caller must defer fl.Unlock().
 func (m *Manager) lockPolecat(name string) (*flock.Flock, error) {
 	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
-	if err := os.MkdirAll(lockDir, 0755); err != nil {
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
 	}
 	lockPath := filepath.Join(lockDir, fmt.Sprintf("polecat-%s.lock", name))
@@ -233,7 +233,7 @@ func (m *Manager) lockPolecat(name string) (*flock.Flock, error) {
 // Caller must defer fl.Unlock().
 func (m *Manager) lockPool() (*flock.Flock, error) {
 	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
-	if err := os.MkdirAll(lockDir, 0755); err != nil {
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
 	}
 	lockPath := filepath.Join(lockDir, "polecat-pool.lock")
@@ -693,7 +693,7 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 
 	// Create polecat directory while holding both locks
 	polecatDir := m.polecatDir(name)
-	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+	if err := os.MkdirAll(polecatDir, 0o755); err != nil {
 		_ = polecatLock.Unlock()
 		_ = poolLock.Unlock()
 		return "", nil, fmt.Errorf("creating polecat dir: %w", err)
@@ -914,7 +914,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	}
 
 	// Create polecat directory (polecats/<name>/)
-	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+	if err := os.MkdirAll(polecatDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating polecat dir: %w", err)
 	}
 
@@ -1353,10 +1353,10 @@ func forceRemoveDir(dir string) error {
 		// Make writable (0755 for dirs, 0644 for files)
 		if d.IsDir() {
 			//nolint:gosec // Controlled cleanup of a path inside the allocated polecat directory.
-			_ = os.Chmod(path, 0755)
+			_ = os.Chmod(path, 0o755)
 		} else {
 			//nolint:gosec // Controlled cleanup of a path inside the allocated polecat directory.
-			_ = os.Chmod(path, 0644)
+			_ = os.Chmod(path, 0o644)
 		}
 		return nil
 	})
@@ -1400,10 +1400,10 @@ func (m *Manager) AllocateName() (string, error) {
 	// directory until AddWithOptions removes it after os.MkdirAll succeeds.
 	// Stale markers (process crashed before AddWithOptions) are cleaned up by
 	// cleanupOrphanPolecatState after pendingMaxAge.
-	if err := os.MkdirAll(filepath.Join(m.rig.Path, "polecats"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(m.rig.Path, "polecats"), 0o755); err != nil {
 		return "", fmt.Errorf("creating polecats dir for reservation marker: %w", err)
 	}
-	if err := os.WriteFile(m.pendingPath(name), []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+	if err := os.WriteFile(m.pendingPath(name), []byte(fmt.Sprintf("%d", os.Getpid())), 0o644); err != nil {
 		return "", fmt.Errorf("writing reservation marker: %w", err)
 	}
 
@@ -1485,7 +1485,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	_ = repoGit.Fetch("origin")
 
 	// Ensure polecat directory exists for new structure
-	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+	if err := os.MkdirAll(polecatDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating polecat dir: %w", err)
 	}
 
@@ -2182,6 +2182,11 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 
 func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
 	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
+	// A live, non-stale session protects the polecat from reuse/recovery even when
+	// its recorded state reads idle (e.g. an in-progress review with no commits). (hq-zxhx)
+	if running, stale := m.polecatSessionState(name); m.tmux != nil && running && !stale {
+		input.SessionRunning = true
+	}
 	agentID := m.agentBeadID(name)
 	activeMR := ""
 	sourceHint := ""
@@ -2608,6 +2613,10 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// session state, so we must NOT assume the session is dead — default to alive.
 	sessionRunning, sessionStale := m.polecatSessionState(name)
 	sessionDead := m.tmux != nil && (!sessionRunning || sessionStale)
+	// sessionLive is the protective signal for recovery: only true when tmux is
+	// available and reports a running, non-stale session. When tmux is nil (tests
+	// or no tmux) we cannot tell, so it stays false and behavior is unchanged. (hq-zxhx)
+	sessionLive := m.tmux != nil && sessionRunning && !sessionStale
 
 	// Primary source: the work bead itself (status=hooked + assignee).
 	// This is the direct-tracking model introduced in hq-l6mm5.
@@ -2622,12 +2631,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 			state = StateStalled
 		}
 		return &Polecat{
-			Name:      name,
-			Rig:       m.rig.Name,
-			State:     state,
-			ClonePath: clonePath,
-			Branch:    branchName,
-			Issue:     hookedBeads[0].ID,
+			Name:           name,
+			Rig:            m.rig.Name,
+			State:          state,
+			ClonePath:      clonePath,
+			Branch:         branchName,
+			Issue:          hookedBeads[0].ID,
+			SessionRunning: sessionLive,
 		}, nil
 	}
 
@@ -2644,12 +2654,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 				state = StateStalled
 			}
 			return &Polecat{
-				Name:      name,
-				Rig:       m.rig.Name,
-				State:     state,
-				ClonePath: clonePath,
-				Branch:    branchName,
-				Issue:     fields.HookBead,
+				Name:           name,
+				Rig:            m.rig.Name,
+				State:          state,
+				ClonePath:      clonePath,
+				Branch:         branchName,
+				Issue:          fields.HookBead,
+				SessionRunning: sessionLive,
 			}, nil
 		}
 	}
@@ -2667,11 +2678,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 			state = StateReviewNeeded
 		}
 		return &Polecat{
-			Name:      name,
-			Rig:       m.rig.Name,
-			State:     state,
-			ClonePath: clonePath,
-			Branch:    branchName,
+			Name:           name,
+			Rig:            m.rig.Name,
+			State:          state,
+			ClonePath:      clonePath,
+			Branch:         branchName,
+			SessionRunning: sessionLive,
 		}, nil
 	}
 
@@ -2694,12 +2706,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	}
 
 	return &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     state,
-		ClonePath: clonePath,
-		Branch:    branchName,
-		Issue:     issueID,
+		Name:           name,
+		Rig:            m.rig.Name,
+		State:          state,
+		ClonePath:      clonePath,
+		Branch:         branchName,
+		Issue:          issueID,
+		SessionRunning: sessionLive,
 	}, nil
 }
 
@@ -2790,7 +2803,8 @@ func (m *Manager) runSetupCommand(worktreePath string) error {
 	cmd.Dir = worktreePath
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(
+		os.Environ(),
 		fmt.Sprintf("GT_WORKTREE_PATH=%s", worktreePath),
 		fmt.Sprintf("GT_RIG_PATH=%s", m.rig.Path),
 	)
