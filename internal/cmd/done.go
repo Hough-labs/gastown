@@ -945,7 +945,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString("---\n")
 					prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
 					prBody := prBodyBuilder.String()
-					ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
+					ghCmd := exec.CommandContext(
+						context.Background(), "gh", "pr", "create",
 						"--base", defaultBranch,
 						"--head", branch,
 						"--title", prTitle,
@@ -1062,7 +1063,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					var closeErr error
 					for attempt := 1; attempt <= 3; attempt++ {
 						closeErr = bd.ForceCloseWithReason(
-							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
+							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID,
+						)
 						if closeErr == nil {
 							fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
 							break
@@ -1743,6 +1745,21 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
+// prMergeStrategyForRig reports whether the rig's merge queue uses
+// merge_strategy=pr, in which case the refinery — not gt done — owns closing the
+// source bead, doing so only when the PR actually merges. (hq-6wd2)
+func prMergeStrategyForRig(townRoot, rigName string) bool {
+	if townRoot == "" || rigName == "" {
+		return false
+	}
+	settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+	settings, err := config.LoadRigSettings(settingsPath)
+	if err != nil || settings.MergeQueue == nil {
+		return false
+	}
+	return settings.MergeQueue.MergeStrategy == "pr"
+}
+
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
@@ -1873,6 +1890,14 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
+			} else if prMergeStrategyForRig(townRoot, ctx.Rig) {
+				// Under merge_strategy=pr the work is not complete until its PR
+				// MERGES, and the refinery closes the source bead at merge time
+				// (engineer.closeMergedMR). Closing here on MR submission would
+				// mark the bead done while the PR is still open/under review, and
+				// convoy wave-advance keys on bead status — dispatching the next
+				// wave against an unmerged base. Leave it for the refinery. (hq-6wd2)
+				fmt.Fprintf(os.Stderr, "Note: merge_strategy=pr — leaving bead %s open for the refinery to close on PR merge (hq-6wd2)\n", hookedBeadID)
 			} else if err := bd.Close(hookedBeadID); err != nil {
 				// Non-fatal: warn but continue
 				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
