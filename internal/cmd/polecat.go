@@ -403,6 +403,11 @@ type PolecatListItem struct {
 	SessionRunning       bool          `json:"session_running"`
 	Zombie               bool          `json:"zombie,omitempty"`
 	SessionName          string        `json:"session_name,omitempty"`
+	// Formula is the hooked work bead's attached formula (e.g. mol-polecat-review-pr).
+	// PRURL is the formula's pr_url var when set. Both are omitted when empty so a
+	// dispatch wrapper can dedup live reviewers per-PR without scraping bd show. (hq-6wd2)
+	Formula string `json:"formula,omitempty"`
+	PRURL   string `json:"pr_url,omitempty"`
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
@@ -525,6 +530,18 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				SessionRunning:       item.SessionRunning,
 				CountsTowardCapacity: disposition.CountsTowardCapacity,
 			})
+			// Surface the hooked work bead's formula + pr_url so --json consumers
+			// can dedup live reviewers per-PR. Best-effort; empty when absent. (hq-6wd2)
+			formula := ""
+			prURL := ""
+			if item.Issue != "" {
+				if issue, showErr := bd.Show(item.Issue); showErr == nil {
+					if af := beads.ParseAttachmentFields(issue); af != nil {
+						formula = af.AttachedFormula
+						prURL = extractFormulaVar(af.FormulaVars, "pr_url")
+					}
+				}
+			}
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:                  r.Name,
 				Name:                 name,
@@ -545,6 +562,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				Blockers:             disposition.Blockers,
 				SessionRunning:       item.SessionRunning,
 				SessionName:          item.SessionName,
+				Formula:              formula,
+				PRURL:                prURL,
 			})
 			knownNames[name] = true
 		}
