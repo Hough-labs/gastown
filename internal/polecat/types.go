@@ -108,6 +108,11 @@ type Polecat struct {
 
 	// UpdatedAt is when the polecat was last updated.
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// SessionRunning is true when the polecat's tmux session is live and not
+	// stale. Derived during state reconciliation and exposed so recovery never
+	// reaps an actively-running session that has no commits yet. (hq-zxhx)
+	SessionRunning bool `json:"session_running,omitempty"`
 }
 
 // Summary provides a concise view of polecat status.

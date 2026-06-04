@@ -37,6 +37,12 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+	// SessionRunning is true when the polecat has a live, non-stale tmux session.
+	// A live session means the agent is actively working even when its recorded
+	// State reads idle — review polecats (mol-polecat-review-pr) never commit, and
+	// a coder may have an empty worktree before its first commit. Such a polecat
+	// must never be classified SAFE_TO_NUKE or recovery will reap in-flight work. (hq-zxhx)
+	SessionRunning bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -83,6 +89,18 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.Blockers = append(d.Blockers, in.ActiveWorkBlocker)
 		}
 		return d
+	}
+
+	// A live, non-stale tmux session means the polecat is actively working even
+	// though its recorded state reads idle (a review produces no commits; a coder
+	// may have an empty worktree before its first commit). Reaping it loses
+	// in-flight work, so never treat a live session as reusable or safe-to-nuke. (hq-zxhx)
+	if in.SessionRunning {
+		return WorkstateDisposition{
+			Verdict:              WorkstateVerdictWorking,
+			Reason:               "session-running",
+			CountsTowardCapacity: true,
+		}
 	}
 
 	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}

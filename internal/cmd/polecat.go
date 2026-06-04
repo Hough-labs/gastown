@@ -1063,7 +1063,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
 	workTerminal := beadTerminal
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
-	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
+	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch, SessionRunning: p.SessionRunning}
 	var gitState *GitState
 	var gitErr error
 	gitStateLoaded := false

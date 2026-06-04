@@ -118,6 +118,13 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean, ActiveWorkBlocker: "assigned_work=gt-open status=open", ActiveWorkCountsTowardCapacity: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"assigned_work=gt-open status=open"}},
 		},
+		{
+			// hq-zxhx: a live, non-stale session reads idle+clean (reviews never
+			// commit) but is actively working — must NOT be safe-to-nuke.
+			name: "live session on idle-clean polecat is protected, not nukeable",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/review", SessionRunning: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-running", CountsTowardCapacity: true},
+		},
 	}
 
 	for _, tt := range tests {
