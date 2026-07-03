@@ -107,3 +107,6 @@ GEMINI.md
 # Handoff docs (ephemeral agent notes — local only)
 handoffs/
 .handoffs/
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/

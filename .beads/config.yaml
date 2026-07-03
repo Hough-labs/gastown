@@ -38,17 +38,24 @@
 # Format: external:<project>:<capability> in bd dep commands
 external_projects:
   beads: ../../../beads/mayor/rig
-
 # Custom issue types for Gas Town (fallback when database is unavailable)
 types.custom: "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
-
-prefix:
-issue-prefix:
+prefix: gfork
+issue-prefix: gfork
 dolt.idle-timeout: "0"
-
 # Molecules are internal GT scaffolding (patrol instances etc.) and must never
 # reach the GitHub issue tracker. Disabling auto-export prevents silent
 # regressions when the bd binary is upgraded. (gt-b48)
 export.auto: "false"
-
-sync.remote: "git+https://github.com/steveyegge/gastown.git"
+# Fork-local tracker — a normal project, SEPARATE from the gastown hq/~/gt town
+# (whose DB is 'hq'/prefix 'hq'). Prefix 'gfork', database 'gastown-fork' on the
+# hammer:3307 Dolt server (bastion-backed), mirroring ~/code/gauntlet's setup.
+# The prior 677-issue 'gt-*' history is preserved on Hough-labs/gastown
+# refs/dolt/data + .beads/backup/; not imported into this fresh tracker.
+dolt.mode: "server"
+dolt.host: 127.0.0.1
+dolt.port: 3307
+dolt.database: "gastown-fork"
+dolt.auto-start: false
+dolt.auto-push: "off"
+sync.remote: "git+ssh://git@github.com/Hough-labs/gastown.git"
