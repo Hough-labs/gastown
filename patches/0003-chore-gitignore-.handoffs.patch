@@ -1,0 +1,23 @@
+From d1c4406f0f1054d1d9e21d0922d0f26bb0fb76ab Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 6 Apr 2026 06:09:54 -0400
+Subject: [PATCH 03/26] chore: gitignore .handoffs/
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+(cherry picked from commit 2cfca9cd428a4005bbdd546877f7b1ea2e66f1c0)
+---
+ .gitignore | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/.gitignore b/.gitignore
+index e9b33ed1..f85344c2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -106,3 +106,4 @@ GEMINI.md
+ 
+ # Handoff docs (ephemeral agent notes — local only)
+ handoffs/
++.handoffs/
+-- 
+2.50.1 (Apple Git-155)
+
