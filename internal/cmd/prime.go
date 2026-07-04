@@ -28,17 +28,21 @@ import (
 	worktreeintegrity "github.com/steveyegge/gastown/internal/worktree"
 )
 
-var primeHookMode bool
-var primeDryRun bool
-var primeState bool
-var primeStateJSON bool
-var primeExplain bool
-var primeStructuredSessionStartOutput bool
+var (
+	primeHookMode                     bool
+	primeDryRun                       bool
+	primeState                        bool
+	primeStateJSON                    bool
+	primeExplain                      bool
+	primeStructuredSessionStartOutput bool
+)
 
 // Prime's external injections are best-effort; role context should still
 // return when bd/mail is slow or wedged.
-var primeExternalToolTimeout = 5 * time.Second
-var primeExternalToolWaitDelay = time.Second
+var (
+	primeExternalToolTimeout   = 5 * time.Second
+	primeExternalToolWaitDelay = time.Second
+)
 
 // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
 // when running in hook mode. Used to provide lighter output on compaction/resume.
@@ -47,6 +51,19 @@ var primeHookSource string
 // primeHandoffReason stores the reason from the handoff marker (e.g., "compaction").
 // Set by checkHandoffMarker when a marker with a reason field is found.
 var primeHandoffReason string
+
+// primeLiteMode is set when this prime is a steady-state patrol respawn
+// (primeHandoffReason == "patrol-cycle", written by runHandoff for deacon/
+// witness/refinery — see patrolCycleReason in handoff.go). Unlike
+// isCompactResume, the normal prime path still runs in full (setup, work
+// discovery, patrol context) — only the role-template payload and startup
+// directive are swapped for a lighter tier, and ONLY for deacon/witness
+// (outputPrimeContext, outputStartupDirective). Refinery is deliberately
+// carved out: showFormulaStepsFull's step details are its primary
+// instructions, so a refinery mid-queue respawn always gets the full
+// formula regardless of this flag (gfork-47p.4; full trim deferred to
+// gfork-47p.4.1).
+var primeLiteMode bool
 
 // Role represents a detected agent role.
 type Role string
@@ -178,6 +195,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	if isCompactResume() {
 		runPrimeCompactResume(ctx)
 		return nil
+	}
+
+	// Steady-state patrol respawn: continue the NORMAL prime path (setup,
+	// work discovery, patrol context all still run) but flag the lighter
+	// role-template/startup-directive tier for deacon/witness (gfork-47p.4).
+	// The successor's context is genuinely empty here — unlike compact/resume
+	// above, it did NOT keep the prior conversation, so runPrimeCompactResume's
+	// "Continue your current task" would be meaningless.
+	if shouldUsePrimeLiteMode(primeHandoffReason) {
+		primeLiteMode = true
 	}
 
 	if err := setupPrimeSession(ctx, roleInfo); err != nil {
@@ -407,6 +434,17 @@ func signalAgentReady() {
 // causing the agent to re-initialize instead of continuing. (GH#1965)
 func isCompactResume() bool {
 	return primeHookSource == "compact" || primeHookSource == "resume" || primeHandoffReason == "compaction"
+}
+
+// shouldUsePrimeLiteMode returns whether primeLiteMode should be set, given
+// the parsed handoff-marker reason. Only "patrol-cycle" (auto-derived by
+// patrolCycleReason in handoff.go for a normal patrol-role handoff) triggers
+// it — a marker-less respawn or any other reason takes the normal full-prime
+// path. Distinct from isCompactResume: that gate short-circuits to a
+// separate lighter path entirely, while this one continues the normal prime
+// path and only swaps the role-template/startup-directive tier downstream.
+func shouldUsePrimeLiteMode(handoffReason string) bool {
+	return handoffReason == "patrol-cycle"
 }
 
 // warnRoleMismatch outputs a prominent warning if GT_ROLE disagrees with cwd detection.

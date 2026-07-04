@@ -329,11 +329,20 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	// Write handoff marker for successor detection (prevents handoff loop bug).
 	// The marker is cleared by gt prime after it outputs the warning.
 	// This tells the new session "you're post-handoff, don't re-run /handoff"
+	// Format: "session_id\nreason" — same convention as runHandoffCycle (GH#1965).
+	// Patrol roles auto-derive a "patrol-cycle" reason when no explicit
+	// --reason is given, so the successor's next `gt prime` can offer the
+	// lighter steady-state payload instead of full re-initialization
+	// (gfork-47p.4).
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
 		_ = os.MkdirAll(runtimeDir, 0o755)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		_ = os.WriteFile(markerPath, []byte(currentSession), 0o644)
+		markerContent := currentSession
+		if reason := patrolCycleReason(handoffReason, sessionToGTRole(currentSession)); reason != "" {
+			markerContent += "\n" + reason
+		}
+		_ = os.WriteFile(markerPath, []byte(markerContent), 0o644)
 	}
 
 	// Record handoff time for cooldown enforcement (gt-058d).
@@ -1743,6 +1752,24 @@ func isPatrolRole(role string) bool {
 		return true
 	}
 	return false
+}
+
+// patrolCycleReason returns the handoff marker reason to write for a normal
+// (non --cycle) handoff. An explicit --reason always wins. Otherwise, patrol
+// roles (deacon/witness/refinery) auto-derive "patrol-cycle" so the
+// successor's next `gt prime` can offer a lighter steady-state payload
+// instead of a full re-initialization every cycle (gfork-47p.4). Non-patrol
+// roles get no reason, same as before this change. gtRole is the compound
+// GT_ROLE form (e.g. "rig/witness") as returned by sessionToGTRole —
+// ExtractSimpleRole bridges that to the bare role name isPatrolRole expects.
+func patrolCycleReason(explicitReason, gtRole string) string {
+	if explicitReason != "" {
+		return explicitReason
+	}
+	if isPatrolRole(config.ExtractSimpleRole(gtRole)) {
+		return "patrol-cycle"
+	}
+	return ""
 }
 
 // cycleRestartOpts computes the buildRestartCommandOpts for `gt handoff

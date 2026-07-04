@@ -50,7 +50,7 @@ func captureStdout(t *testing.T, fn func()) string {
 func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
 	t.Helper()
 	beadsDir := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("create beads dir: %v", err)
 	}
 	if err := beads.WriteRoutes(beadsDir, routes); err != nil {
@@ -261,13 +261,13 @@ func TestCheckHandoffMarkerDryRun(t *testing.T) {
 
 	// Create .runtime directory and handoff marker
 	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatalf("create runtime dir: %v", err)
 	}
 
 	markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
 	prevSession := "test-session-123"
-	if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
+	if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
 		t.Fatalf("write handoff marker: %v", err)
 	}
 
@@ -307,7 +307,7 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
 
 	// Create .runtime directory but no marker
 	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatalf("create runtime dir: %v", err)
 	}
 
@@ -351,12 +351,12 @@ func TestDetectSessionState(t *testing.T) {
 
 		// Create handoff marker
 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 			t.Fatalf("create runtime dir: %v", err)
 		}
 		prevSession := "predecessor-session-abc"
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
+		if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
 			t.Fatalf("write handoff marker: %v", err)
 		}
 
@@ -556,12 +556,12 @@ func TestOutputState(t *testing.T) {
 
 		// Create handoff marker
 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 			t.Fatalf("create runtime dir: %v", err)
 		}
 		prevSession := "prev-session-xyz"
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
+		if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
 			t.Fatalf("write marker: %v", err)
 		}
 
@@ -651,7 +651,7 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
 
 	// Set up minimal workspace structure
 	beadsDir := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("create beads dir: %v", err)
 	}
 
@@ -663,11 +663,11 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
 
 	// Create handoff marker that should NOT be removed in dry-run
 	runtimeDir := filepath.Join(townRoot, constants.DirRuntime)
-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatalf("create runtime dir: %v", err)
 	}
 	markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-	if err := os.WriteFile(markerPath, []byte("prev-session"), 0644); err != nil {
+	if err := os.WriteFile(markerPath, []byte("prev-session"), 0o644); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 
@@ -762,6 +762,32 @@ func TestIsCompactResume(t *testing.T) {
 	}
 }
 
+// TestShouldUsePrimeLiteMode covers the Lever A gate (gfork-47p.4): only a
+// "patrol-cycle" marker reason triggers the lighter steady-state prime tier.
+// A marker-less respawn (empty reason) or any other reason (e.g.
+// "compaction", already routed through isCompactResume above) takes the
+// normal full-prime path.
+func TestShouldUsePrimeLiteMode(t *testing.T) {
+	cases := []struct {
+		name          string
+		handoffReason string
+		want          bool
+	}{
+		{"patrol-cycle marker triggers lite mode", "patrol-cycle", true},
+		{"no marker (empty reason) stays full", "", false},
+		{"compaction reason stays full (handled by isCompactResume)", "compaction", false},
+		{"unrelated reason stays full", "idle", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldUsePrimeLiteMode(tc.handoffReason); got != tc.want {
+				t.Fatalf("shouldUsePrimeLiteMode(%q) = %v, want %v", tc.handoffReason, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHookSessionBeaconLines(t *testing.T) {
 	origStructured := primeStructuredSessionStartOutput
 	defer func() {
@@ -832,13 +858,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
 		workDir := t.TempDir()
 
 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 			t.Fatalf("create runtime dir: %v", err)
 		}
 
 		// Write marker with session ID and reason
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		if err := os.WriteFile(markerPath, []byte("test-session-456\ncompaction"), 0644); err != nil {
+		if err := os.WriteFile(markerPath, []byte("test-session-456\ncompaction"), 0o644); err != nil {
 			t.Fatalf("write marker: %v", err)
 		}
 
@@ -863,13 +889,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
 		workDir := t.TempDir()
 
 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 			t.Fatalf("create runtime dir: %v", err)
 		}
 
 		// Write marker with session ID only (backward compat)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		if err := os.WriteFile(markerPath, []byte("test-session-789"), 0644); err != nil {
+		if err := os.WriteFile(markerPath, []byte("test-session-789"), 0o644); err != nil {
 			t.Fatalf("write marker: %v", err)
 		}
 
@@ -1157,10 +1183,10 @@ func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
 	rigRoot := filepath.Join(townRoot, "testrig")
 	witnessDir := filepath.Join(rigRoot, "witness")
 	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
 		t.Fatalf("mkdir witness dir: %v", err)
 	}
-	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorBeadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir mayor beads dir: %v", err)
 	}
 
@@ -1190,26 +1216,26 @@ func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
 	workDir := filepath.Join(rigRoot, "polecats", "worker1", "testrig")
 	workBeadsDir := filepath.Join(workDir, ".beads")
 
-	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorBeadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir mayor beads dir: %v", err)
 	}
-	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+	if err := os.MkdirAll(rigBeadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir rig beads dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0o644); err != nil {
 		t.Fatalf("write rig redirect: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0o644); err != nil {
 		t.Fatalf("write rig metadata: %v", err)
 	}
-	if err := os.MkdirAll(workBeadsDir, 0755); err != nil {
+	if err := os.MkdirAll(workBeadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir work beads dir: %v", err)
 	}
 
 	// Old polecat worktrees can keep this bd-incompatible chain:
 	// worktree/.beads -> rig/.beads -> mayor/rig/.beads.
 	redirectPath := filepath.Join(workBeadsDir, "redirect")
-	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0644); err != nil {
+	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0o644); err != nil {
 		t.Fatalf("write stale redirect: %v", err)
 	}
 

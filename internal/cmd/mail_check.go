@@ -92,8 +92,15 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 		if unread > 0 {
 			messages = filterUnreadMessages(messages)
-			fmt.Print(formatInjectOutput(messages))
+			visible, collapsed := partitionInjectMessages(messages)
+			if len(visible) > 0 {
+				fmt.Print(formatInjectOutput(visible))
+			}
+			fmt.Print(formatCollapsedNotice(collapsed))
 			// Ack after output so message is delivered before being marked acked.
+			// Ack the FULL unread set (visible + collapsed) — unchanged from
+			// before: acking is what lets a message drop out of "visible" on
+			// the NEXT cycle (see partitionInjectMessages).
 			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
 			}
@@ -121,6 +128,47 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("No new mail")
 	return NewSilentExit(1)
+}
+
+// partitionInjectMessages splits unread messages into those that must be
+// shown in full this cycle ("visible") and a count of those that were
+// already injected on a prior cycle and can be collapsed to a single
+// counter line ("collapsed").
+//
+// DeliveryState is the injection cursor: AcknowledgeDeliveries flips it
+// pending -> acked the first time a message is shown (see runMailCheck
+// below), so an unread message with DeliveryState == acked has already been
+// injected in full on a previous cycle. Legacy mailboxes never set
+// DeliveryState (it stays ""), so their messages always compare != acked
+// and show in full every cycle — zero regression for them.
+//
+// Urgent and high priority messages are carved out of the collapse: they
+// re-inject in full every cycle until read, preserving the existing
+// HELP/escalation nagging behavior regardless of ack state.
+func partitionInjectMessages(messages []*mail.Message) (visible []*mail.Message, collapsed int) {
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if msg.DeliveryState != mail.DeliveryStateAcked || msg.Priority == mail.PriorityUrgent || msg.Priority == mail.PriorityHigh {
+			visible = append(visible, msg)
+			continue
+		}
+		collapsed++
+	}
+	return visible, collapsed
+}
+
+// formatCollapsedNotice renders a single-line notice for unread messages
+// that were already injected on a prior cycle and don't need to be repeated
+// in full. Wrapped in its own system-reminder block so it renders whether
+// or not any messages were shown in full this cycle. Returns "" when there's
+// nothing to collapse.
+func formatCollapsedNotice(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("<system-reminder>\n(Plus %d earlier unread — 'gt mail inbox')\n</system-reminder>\n", n)
 }
 
 // formatInjectOutput builds the system-reminder text for inject mode.
