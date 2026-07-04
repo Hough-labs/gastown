@@ -125,13 +125,13 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
 	rigPath := filepath.Join(townRoot, "gastown")
 	witnessDir := filepath.Join(rigPath, "witness")
 
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
 		t.Fatalf("mkdir mayor: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
 		t.Fatalf("write town.json: %v", err)
 	}
-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
 		t.Fatalf("mkdir witness dir: %v", err)
 	}
 
@@ -199,13 +199,13 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
 	rigPath := filepath.Join(townRoot, "gastown")
 	witnessDir := filepath.Join(rigPath, "witness")
 
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
 		t.Fatalf("mkdir mayor: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
 		t.Fatalf("write town.json: %v", err)
 	}
-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
 		t.Fatalf("mkdir witness dir: %v", err)
 	}
 
@@ -275,13 +275,13 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 	rigPath := filepath.Join(townRoot, "gastown")
 	crewDir := filepath.Join(rigPath, "crew", "bear")
 
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
 		t.Fatalf("mkdir mayor: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
 		t.Fatalf("write town.json: %v", err)
 	}
-	if err := os.MkdirAll(crewDir, 0755); err != nil {
+	if err := os.MkdirAll(crewDir, 0o755); err != nil {
 		t.Fatalf("mkdir crew dir: %v", err)
 	}
 
@@ -343,6 +343,44 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 	})
 }
 
+// TestCycleRestartOpts covers gfork-47p.2's F2: `gt handoff --cycle` must
+// fresh-start patrol roles (refinery, witness, deacon) instead of reloading
+// their prior conversation via --continue, while crew/polecats keep
+// --continue. sessionToGTRole returns the COMPOUND GT_ROLE form
+// ("<rig>/witness"), not the bare name isPatrolRole expects — this test
+// pins that ExtractSimpleRole bridges it correctly (the "GT_ROLE is
+// compound" pitfall: a naive isPatrolRole(sessionToGTRole(...)) would never
+// match a rig-scoped role).
+func TestCycleRestartOpts(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	tests := []struct {
+		name            string
+		session         string
+		wantContinue    bool
+		wantDescription string
+	}{
+		{"witness: patrol role fresh-starts", "gt-witness", false, "rig-scoped compound GT_ROLE must still resolve to patrol"},
+		{"refinery: patrol role fresh-starts", "gt-refinery", false, "rig-scoped compound GT_ROLE must still resolve to patrol"},
+		{"deacon: patrol role fresh-starts", "hq-deacon", false, "town-level simple GT_ROLE"},
+		{"crew: keeps --continue", "gt-crew-bear", true, "non-patrol role preserves context"},
+		{"polecat: keeps --continue", "gt-toast", true, "non-patrol role preserves context"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := cycleRestartOpts(tt.session)
+			if opts.ContinueSession != tt.wantContinue {
+				t.Errorf("cycleRestartOpts(%q).ContinueSession = %v, want %v (%s)",
+					tt.session, opts.ContinueSession, tt.wantContinue, tt.wantDescription)
+			}
+			if opts.ContinuePrompt == "" {
+				t.Error("expected a non-empty ContinuePrompt regardless of ContinueSession")
+			}
+		})
+	}
+}
+
 func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
 	// Save original env vars and restore after test
 	origTownRoot := os.Getenv("GT_TOWN_ROOT")
@@ -355,11 +393,11 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
 	// Create a temp directory that looks like a valid town
 	tmpTown := t.TempDir()
 	mayorDir := filepath.Join(tmpTown, "mayor")
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
 		t.Fatalf("creating mayor dir: %v", err)
 	}
 	townJSON := filepath.Join(mayorDir, "town.json")
-	if err := os.WriteFile(townJSON, []byte(`{"name": "test-town"}`), 0644); err != nil {
+	if err := os.WriteFile(townJSON, []byte(`{"name": "test-town"}`), 0o644); err != nil {
 		t.Fatalf("creating town.json: %v", err)
 	}
 
@@ -403,8 +441,8 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
 		// Create another temp town for GT_ROOT
 		anotherTown := t.TempDir()
 		anotherMayor := filepath.Join(anotherTown, "mayor")
-		os.MkdirAll(anotherMayor, 0755)
-		os.WriteFile(filepath.Join(anotherMayor, "town.json"), []byte(`{"name": "other-town"}`), 0644)
+		os.MkdirAll(anotherMayor, 0o755)
+		os.WriteFile(filepath.Join(anotherMayor, "town.json"), []byte(`{"name": "other-town"}`), 0o644)
 
 		// Set both env vars
 		os.Setenv("GT_TOWN_ROOT", tmpTown)
@@ -441,7 +479,7 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
 		// Create a temp town with only mayor/ directory (no town.json)
 		secondaryTown := t.TempDir()
 		mayorOnlyDir := filepath.Join(secondaryTown, workspace.SecondaryMarker)
-		os.MkdirAll(mayorOnlyDir, 0755)
+		os.MkdirAll(mayorOnlyDir, 0o755)
 
 		os.Setenv("GT_TOWN_ROOT", secondaryTown)
 		os.Setenv("GT_ROOT", "")
@@ -546,11 +584,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 			gtLog := filepath.Join(t.TempDir(), "gt.log")
 			_ = writeBDStub(t, binDir, "#!/bin/sh\nexit 0\n", "@echo off\r\nexit /b 0\r\n")
 			gtStub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + gtLog + "\"\nprintf 'stub gt %s\\n' \"$*\"\nexit 0\n"
-			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0755); err != nil {
+			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0o755); err != nil {
 				t.Fatalf("write gt stub: %v", err)
 			}
 			gtCmdStub := "@echo off\r\necho %* >> \"" + gtLog + "\"\r\necho stub gt %*\r\nexit /b 0\r\n"
-			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0o644); err != nil {
 				t.Fatalf("write gt.cmd stub: %v", err)
 			}
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -627,7 +665,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 
 	t.Run("warns on untracked file", func(t *testing.T) {
 		dir := makeTestGitRepo(t)
-		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0644)
+		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0o644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
 		output := captureStderr(t, func() {
@@ -645,11 +683,11 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		dir := makeTestGitRepo(t)
 		// Create and commit a file
 		fpath := filepath.Join(dir, "tracked.txt")
-		os.WriteFile(fpath, []byte("original"), 0644)
+		os.WriteFile(fpath, []byte("original"), 0o644)
 		exec.Command("git", "-C", dir, "add", ".").Run()
 		exec.Command("git", "-C", dir, "commit", "-m", "add file").Run()
 		// Now modify it
-		os.WriteFile(fpath, []byte("modified"), 0644)
+		os.WriteFile(fpath, []byte("modified"), 0o644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
 		output := captureStderr(t, func() {
@@ -666,8 +704,8 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 	t.Run("no warning for .beads-only changes", func(t *testing.T) {
 		dir := makeTestGitRepo(t)
 		// Only .beads/ untracked files — should be clean (excluded)
-		os.MkdirAll(filepath.Join(dir, ".beads"), 0755)
-		os.WriteFile(filepath.Join(dir, ".beads", "somefile.db"), []byte("db"), 0644)
+		os.MkdirAll(filepath.Join(dir, ".beads"), 0o755)
+		os.WriteFile(filepath.Join(dir, ".beads", "somefile.db"), []byte("db"), 0o644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
 		output := captureStderr(t, func() {
@@ -690,7 +728,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 
 	t.Run("no-git-check flag suppresses warning", func(t *testing.T) {
 		dir := makeTestGitRepo(t)
-		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0644)
+		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0o644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
 		// Simulate --no-git-check by setting the flag
@@ -714,8 +752,8 @@ func TestHandoffProcessNames(t *testing.T) {
 
 		tmpTown := t.TempDir()
 		mayorDir := filepath.Join(tmpTown, "mayor")
-		os.MkdirAll(mayorDir, 0755)
-		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+		os.MkdirAll(mayorDir, 0o755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0o644)
 
 		t.Setenv("GT_ROOT", tmpTown)
 		t.Setenv("GT_AGENT", "claude")
@@ -739,8 +777,8 @@ func TestHandoffProcessNames(t *testing.T) {
 
 		tmpTown := t.TempDir()
 		mayorDir := filepath.Join(tmpTown, "mayor")
-		os.MkdirAll(mayorDir, 0755)
-		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+		os.MkdirAll(mayorDir, 0o755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0o644)
 
 		t.Setenv("GT_ROOT", tmpTown)
 		t.Setenv("GT_AGENT", "claude")
@@ -782,7 +820,7 @@ func TestCollectGitState(t *testing.T) {
 		}
 
 		// Create a file and commit
-		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("hello"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("hello"), 0o644); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		for _, args := range [][]string{
@@ -797,7 +835,7 @@ func TestCollectGitState(t *testing.T) {
 		}
 
 		// Modify a file to create uncommitted changes
-		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("modified"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("modified"), 0o644); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 
@@ -876,9 +914,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 
 		// Create a last_handoff_ts file with old mtime
 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
-		os.MkdirAll(runtimeDir, 0755)
+		os.MkdirAll(runtimeDir, 0o755)
 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
-		os.WriteFile(tsPath, []byte("1000000000"), 0644)
+		os.WriteFile(tsPath, []byte("1000000000"), 0o644)
 		// Set mtime to well in the past
 		oldTime := time.Now().Add(-10 * time.Minute)
 		os.Chtimes(tsPath, oldTime, oldTime)
@@ -900,9 +938,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 
 		// Create a last_handoff_ts file with very recent mtime
 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
-		os.MkdirAll(runtimeDir, 0755)
+		os.MkdirAll(runtimeDir, 0o755)
 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
-		os.WriteFile(tsPath, []byte("now"), 0644)
+		os.WriteFile(tsPath, []byte("now"), 0o644)
 		// Set mtime to (MinHandoffCooldown - 1s) ago so remaining is ~1s
 		recentTime := time.Now().Add(-(constants.MinHandoffCooldown - 1*time.Second))
 		os.Chtimes(tsPath, recentTime, recentTime)
@@ -927,9 +965,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 
 		// Create a recent handoff file that would normally trigger cooldown
 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
-		os.MkdirAll(runtimeDir, 0755)
+		os.MkdirAll(runtimeDir, 0o755)
 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
-		os.WriteFile(tsPath, []byte("now"), 0644)
+		os.WriteFile(tsPath, []byte("now"), 0o644)
 
 		start := time.Now()
 		enforceHandoffCooldown()
@@ -947,9 +985,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 
 		// Create a recent handoff file that would normally trigger cooldown
 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
-		os.MkdirAll(runtimeDir, 0755)
+		os.MkdirAll(runtimeDir, 0o755)
 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
-		os.WriteFile(tsPath, []byte("now"), 0644)
+		os.WriteFile(tsPath, []byte("now"), 0o644)
 
 		start := time.Now()
 		enforceHandoffCooldown()

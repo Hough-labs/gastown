@@ -90,6 +90,14 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	bootLastSpawned time.Time
 
+	// contextNudgeLast tracks the last time each persistent agent identity
+	// (e.g. "deacon", "<rig>-witness") was nudged at the YELLOW context-
+	// pressure tier, enforcing ContextNudgeCooldown so a repeatedly-ignored
+	// nudge doesn't spam the pane. Lazily initialized on first write, same
+	// pattern as syncFailures. Only accessed from heartbeat loop goroutine -
+	// no sync needed.
+	contextNudgeLast map[string]time.Time
+
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
 
@@ -163,12 +171,14 @@ func daemonPathCandidates(home, exePath string) []string {
 		candidates = append(candidates, filepath.Dir(exePath))
 	}
 	if home != "" {
-		candidates = append(candidates,
+		candidates = append(
+			candidates,
 			filepath.Join(home, ".local/bin"),
 			filepath.Join(home, "bin"),
 		)
 	}
-	return append(candidates,
+	return append(
+		candidates,
 		"/opt/homebrew/bin",
 		"/usr/local/bin",
 	)
@@ -218,7 +228,7 @@ var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
 func New(config *Config) (*Daemon, error) {
 	// Ensure daemon directory exists
 	daemonDir := filepath.Dir(config.LogFile)
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
 
@@ -953,6 +963,11 @@ func (d *Daemon) heartbeat(state *State) {
 	// Kill sessions that have been idle longer than the configured threshold.
 	d.reapIdlePolecats()
 
+	// 12c. Context-lifecycle watchdog: auto-cycle persistent agents (witness,
+	// refinery, deacon) whose Claude Code session context has crossed the
+	// YELLOW threshold, before they hit RED and wedge idle-at-prompt (gfork-47p.2).
+	d.checkContextPressure()
+
 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
 	// These are Task tool subagents that didn't clean up after completion.
 	// This is a safety net - Deacon patrol also does this more frequently.
@@ -1063,7 +1078,8 @@ func (d *Daemon) checkAllRigsDolt() error {
 	if backend := readBeadsBackend(townBeadsDir); backend != "" && backend != "dolt" {
 		problems = append(problems, fmt.Sprintf(
 			"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-			"town-root", backend, d.config.TownRoot))
+			"town-root", backend, d.config.TownRoot,
+		))
 	}
 
 	// Check each registered rig
@@ -1073,7 +1089,8 @@ func (d *Daemon) checkAllRigsDolt() error {
 			rigPath := filepath.Join(d.config.TownRoot, rigName)
 			problems = append(problems, fmt.Sprintf(
 				"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-				rigName, backend, rigPath))
+				rigName, backend, rigPath,
+			))
 		}
 	}
 
