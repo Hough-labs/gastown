@@ -193,3 +193,124 @@ func TestFormatInjectOutput(t *testing.T) {
 		})
 	}
 }
+
+// TestPartitionInjectMessages covers the Lever B inject-once cursor
+// (gfork-47p.4): unread messages already injected on a prior cycle (acked,
+// normal/low priority) collapse to a counter instead of re-injecting in
+// full every turn.
+func TestPartitionInjectMessages(t *testing.T) {
+	msg := func(id string, priority mail.Priority, deliveryState string) *mail.Message {
+		return &mail.Message{
+			ID:            id,
+			Priority:      priority,
+			DeliveryState: deliveryState,
+		}
+	}
+
+	tests := []struct {
+		name          string
+		messages      []*mail.Message
+		wantVisible   []string // IDs expected in the visible slice, in order
+		wantCollapsed int
+	}{
+		{
+			name: "never-injected (pending) always visible",
+			messages: []*mail.Message{
+				msg("m1", mail.PriorityNormal, mail.DeliveryStatePending),
+			},
+			wantVisible:   []string{"m1"},
+			wantCollapsed: 0,
+		},
+		{
+			name: "legacy mailbox (empty DeliveryState) always visible - zero regression",
+			messages: []*mail.Message{
+				msg("m2", mail.PriorityNormal, ""),
+				msg("m3", mail.PriorityLow, ""),
+			},
+			wantVisible:   []string{"m2", "m3"},
+			wantCollapsed: 0,
+		},
+		{
+			name: "acked + normal priority collapses to counter",
+			messages: []*mail.Message{
+				msg("m4", mail.PriorityNormal, mail.DeliveryStateAcked),
+			},
+			wantVisible:   nil,
+			wantCollapsed: 1,
+		},
+		{
+			name: "acked + low priority collapses to counter",
+			messages: []*mail.Message{
+				msg("m5", mail.PriorityLow, mail.DeliveryStateAcked),
+			},
+			wantVisible:   nil,
+			wantCollapsed: 1,
+		},
+		{
+			name: "acked + urgent stays visible (escalation carve-out)",
+			messages: []*mail.Message{
+				msg("m6", mail.PriorityUrgent, mail.DeliveryStateAcked),
+			},
+			wantVisible:   []string{"m6"},
+			wantCollapsed: 0,
+		},
+		{
+			name: "acked + high stays visible (escalation carve-out)",
+			messages: []*mail.Message{
+				msg("m7", mail.PriorityHigh, mail.DeliveryStateAcked),
+			},
+			wantVisible:   []string{"m7"},
+			wantCollapsed: 0,
+		},
+		{
+			name: "mixed cycle: unacked + acked-urgent visible, acked-normal collapsed",
+			messages: []*mail.Message{
+				msg("m8", mail.PriorityNormal, mail.DeliveryStatePending),
+				msg("m9", mail.PriorityUrgent, mail.DeliveryStateAcked),
+				msg("m10", mail.PriorityNormal, mail.DeliveryStateAcked),
+				msg("m11", mail.PriorityLow, mail.DeliveryStateAcked),
+			},
+			wantVisible:   []string{"m8", "m9"},
+			wantCollapsed: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			visible, collapsed := partitionInjectMessages(tt.messages)
+
+			if collapsed != tt.wantCollapsed {
+				t.Errorf("collapsed = %d, want %d", collapsed, tt.wantCollapsed)
+			}
+
+			var gotIDs []string
+			for _, m := range visible {
+				gotIDs = append(gotIDs, m.ID)
+			}
+			if len(gotIDs) != len(tt.wantVisible) {
+				t.Fatalf("visible IDs = %v, want %v", gotIDs, tt.wantVisible)
+			}
+			for i, id := range tt.wantVisible {
+				if gotIDs[i] != id {
+					t.Errorf("visible[%d] = %q, want %q", i, gotIDs[i], id)
+				}
+			}
+		})
+	}
+}
+
+// TestFormatCollapsedNotice covers the single-line collapse notice appended
+// after the tiered inject output (or standalone, when every unread message
+// is already-injected).
+func TestFormatCollapsedNotice(t *testing.T) {
+	if got := formatCollapsedNotice(0); got != "" {
+		t.Errorf("formatCollapsedNotice(0) = %q, want empty", got)
+	}
+
+	got := formatCollapsedNotice(3)
+	for _, want := range []string{"<system-reminder>", "Plus 3 earlier unread", "gt mail inbox", "</system-reminder>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatCollapsedNotice(3) should contain %q\n\nGot:\n%s", want, got)
+		}
+	}
+}

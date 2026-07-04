@@ -27,6 +27,15 @@ import (
 // outputPrimeContext outputs the role-specific context using templates or fallback.
 // Returns the rendered template content (empty string when using fallback path).
 func outputPrimeContext(ctx RoleContext) (string, error) {
+	// Steady-state patrol respawn (gfork-47p.4): swap the ~17KB role
+	// template for a ~5-line identity block. Deacon/witness only — refinery
+	// keeps the full template even under primeLiteMode (carve-out; see the
+	// primeLiteMode doc comment in prime.go).
+	if primeLiteMode && (ctx.Role == RoleDeacon || ctx.Role == RoleWitness) {
+		outputPrimeContextLite(ctx)
+		return "", nil
+	}
+
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
@@ -108,6 +117,37 @@ func roleRigContext(ctx RoleContext) (defaultBranch string, isForkRig bool, upst
 		return defaultBranch, true, util.RedactURL(rigCfg.UpstreamURL)
 	}
 	return defaultBranch, false, ""
+}
+
+// outputPrimeContextLite emits a minimal identity block for steady-state
+// patrol respawns instead of the full role template. Only reached for
+// deacon/witness (see outputPrimeContext) — the successor is a fresh session
+// re-entering the SAME patrol loop it just cycled out of, so the full
+// onboarding template (rules, tool references, workflow prose) it already
+// internalized this session is redundant to re-read every cycle. Full role
+// context and full step text both stay one command away.
+func outputPrimeContextLite(ctx RoleContext) {
+	roleLabel := "Patrol Agent"
+	formulaName := ""
+	switch ctx.Role {
+	case RoleDeacon:
+		roleLabel = "Deacon"
+		formulaName = constants.MolDeaconPatrol
+	case RoleWitness:
+		roleLabel = "Witness"
+		formulaName = constants.MolWitnessPatrol
+	}
+
+	fmt.Println()
+	fmt.Printf("## %s — steady-state patrol cycle\n\n", roleLabel)
+	fmt.Printf("You are the **%s**", roleLabel)
+	if ctx.Rig != "" {
+		fmt.Printf(" for rig `%s`", ctx.Rig)
+	}
+	fmt.Println(".")
+	fmt.Printf("Full role context: run `%s prime`. Full step text: `%s formula show %s`.\n",
+		cli.Name(), cli.Name(), formulaName)
+	fmt.Println()
 }
 
 // outputRoleDirectives loads and emits operator-provided role directives.
@@ -488,9 +528,49 @@ func outputHandoffContent(ctx RoleContext) {
 	fmt.Println(style.Dim.Render("(Clear with: gt rig reset --handoff)"))
 }
 
+// outputStartupDirectiveLite prints a minimal startup directive for
+// steady-state patrol respawns (deacon/witness only — see primeLiteMode in
+// prime.go). Returns true if it handled the role, in which case the caller
+// must not fall through to the full directive below; false if the role
+// isn't covered by the lite tier (e.g. refinery — carved out) so the caller
+// should render the full directive as usual.
+//
+// The parked/docked (witness) and paused (deacon) gates are preserved
+// exactly as in the full directive — those are correctness checks, not
+// verbosity, and must not be skipped just because this is a lite prime.
+func outputStartupDirectiveLite(ctx RoleContext) bool {
+	switch ctx.Role {
+	case RoleWitness:
+		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return true
+		}
+	case RoleDeacon:
+		if paused, _, _ := deacon.IsPaused(ctx.TownRoot); paused {
+			// Pause message was already shown; stay silent, same as full directive.
+			return true
+		}
+	default:
+		return false
+	}
+
+	fmt.Println()
+	fmt.Println("---")
+	fmt.Println()
+	fmt.Println("Begin patrol at step 1.")
+	return true
+}
+
 // outputStartupDirective outputs role-specific instructions for the agent.
 // This tells agents like Mayor to announce themselves on startup.
 func outputStartupDirective(ctx RoleContext) {
+	if primeLiteMode && outputStartupDirectiveLite(ctx) {
+		return
+	}
+
 	switch ctx.Role {
 	case RoleMayor:
 		fmt.Println()
