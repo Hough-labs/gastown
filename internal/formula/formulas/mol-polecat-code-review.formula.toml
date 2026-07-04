@@ -12,11 +12,12 @@ opportunities. The output is a set of beads capturing actionable findings.
 You are a self-cleaning worker. You:
 1. Receive work via your hook (pinned molecule + review scope)
 2. Work through molecule steps using `bd mol current` / `bd close <step>`
-3. Complete and self-clean via `gt done` (submit findings + nuke yourself)
+3. Complete and self-clean via `gt done` (submit findings + terminate your session)
 4. You are GONE - your findings are recorded in beads
 
-**Self-cleaning:** When you run `gt done`, you submit your findings, nuke your
-sandbox, and exit. There is no idle state. Done means gone.
+**Self-cleaning:** When you run `gt done`, you submit your findings and
+terminate your session — worktree preserved for pool reuse. There is no idle
+state. Done means gone.
 
 **Important:** This formula defines the template. Your molecule already has step
 beads created from it. Use `bd mol current` to find them - do NOT read this file directly.
@@ -42,7 +43,7 @@ beads created from it. Use `bd mol current` to find them - do NOT read this file
 | Can't understand code | Mail Witness for context |
 | Critical issue found | Mail Witness immediately, then continue |"""
 formula = "mol-polecat-code-review"
-version = 1
+version = 2
 
 [[steps]]
 id = "load-context"
@@ -298,7 +299,7 @@ Signal completion and clean up. You cease to exist after this step.
 **Self-Cleaning Model:**
 Once you run `gt done`, you're gone. The command:
 1. Syncs beads (final sync)
-2. Nukes your sandbox
+2. Terminates your session — worktree preserved for pool reuse
 3. Exits your session immediately
 
 **Run gt done:**
@@ -314,7 +315,12 @@ gt done
 
 You are NOT involved in any of that. You're gone. Done means gone.
 
-**Exit criteria:** Beads synced, sandbox nuked, session exited."""
+**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
+not check mail, do not re-check the MR/PR/git, do not run any command. Your
+session terminates within seconds; if it isn't, sit silent — the town reclaims
+idle sessions. Any post-done polling is a bug.
+
+**Exit criteria:** Beads synced, session self-terminating, no further action taken."""
 
 [vars]
 [vars.scope]

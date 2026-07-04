@@ -13,11 +13,12 @@ crash after any step and resume from the last completed step.
 You are a self-cleaning worker. You:
 1. Receive work via your hook (formula checklist + issue)
 2. Work through formula steps in order (shown inline at prime time)
-3. Complete and self-clean via `gt done` (submit + nuke yourself)
+3. Complete and self-clean via `gt done` (submit + terminate your session)
 4. You are GONE - Refinery merges from MQ
 
 **Self-cleaning:** When you run `gt done`, you push your work, submit to MQ,
-nuke your sandbox, and exit. There is no idle state. Done means gone.
+and terminate your session — worktree preserved for pool reuse. There is no
+idle state. Done means gone.
 
 **Important:** This formula defines the workflow template. Steps are shown inline
 when you run `gt prime` — there are no separate step beads to close. Work through
@@ -570,7 +571,12 @@ Check your base_branch variable:
 
 You are GONE after `gt done`. Done means gone.
 
-**Exit criteria:** Work submitted (or PR left for review), sandbox nuked, session exited."""
+**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
+not check mail, do not re-check the MR/PR/git, do not run any command. Your
+session terminates within seconds; if it isn't, sit silent — the town reclaims
+idle sessions. Any post-done polling is a bug.
+
+**Exit criteria:** Work submitted (or PR left for review), session self-terminating, no further action taken."""
 
 [vars]
 [vars.issue]
