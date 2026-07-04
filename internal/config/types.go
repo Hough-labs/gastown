@@ -372,6 +372,32 @@ type DaemonThresholds struct {
 	// PressureMaxSessions is the maximum number of concurrent agent tmux
 	// sessions before new non-infrastructure spawns are deferred. Disabled by default (0 = unlimited).
 	PressureMaxSessions *int `json:"pressure_max_sessions,omitempty"`
+
+	// ContextYellowTokens is the context-token count at which the context
+	// watchdog nudges a persistent agent to self-cycle at its next loop
+	// boundary (default 130,000). Overridable per-role via ContextTokensByRole.
+	ContextYellowTokens *int `json:"context_yellow_tokens,omitempty"`
+
+	// ContextRedTokens is the context-token count at which the context
+	// watchdog force-cycles a persistent agent's session, provided it is idle
+	// (default 170,000). Clamped to be strictly greater than the resolved
+	// YELLOW threshold.
+	ContextRedTokens *int `json:"context_red_tokens,omitempty"`
+
+	// ContextTokensByRole overrides ContextYellowTokens per role. Witness runs
+	// on Opus and fills its context faster than deacon/refinery, so it
+	// typically needs a lower threshold. Example: {"witness": 100000}.
+	ContextTokensByRole map[string]int `json:"context_tokens_by_role,omitempty"`
+
+	// ContextCycleRoles is the set of persistent-agent roles the context
+	// watchdog monitors (default ["witness", "refinery", "deacon"]). Polecats
+	// are never included — their lifecycle belongs to reapIdlePolecats /
+	// self-terminate, not this recycle path.
+	ContextCycleRoles []string `json:"context_cycle_roles,omitempty"`
+
+	// ContextNudgeCooldown is the minimum interval between YELLOW-tier
+	// context-pressure nudges for the same agent (default "15m").
+	ContextNudgeCooldown string `json:"context_nudge_cooldown,omitempty"`
 }
 
 // DeaconThresholds configures deacon health-check and dispatch thresholds.
