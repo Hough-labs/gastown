@@ -1,0 +1,95 @@
+From 33d5a307c528d171e2aa21d9e8f5b56704b49953 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 12 Apr 2026 14:17:16 -0400
+Subject: [PATCH 09/26] build: install to native ~/go/bin instead of mise GOBIN
+
+INSTALL_DIR was resolving to go env GOBIN which pointed at the mise
+Go shim directory. Agents prefer native tooling, so hardcode to
+~/go/bin. Also extend stale-binary cleanup in install/safe-install
+to sweep mise Go version paths on every build.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+(cherry picked from commit c562b86b76424f1e0fe2e8f5cbc472a790579b00)
+---
+ .githooks/pre-push |  4 ++--
+ Makefile           | 24 +++++++++++++++++-------
+ 2 files changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index f88eb77d..1214db61 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -108,8 +108,8 @@ while read local_ref local_sha remote_ref remote_sha; do
+   fi
+ done
+ 
+-# --- Build and install to mise GOBIN ---
+-echo "gastown: rebuilding and installing to mise..."
++# --- Build and install to ~/go/bin ---
++echo "gastown: rebuilding and installing to ~/go/bin..."
+ make install
+ 
+ exit 0
+diff --git a/Makefile b/Makefile
+index f5250b9d..00db14e9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,10 +3,7 @@
+ BINARY := gt
+ BINARY_DESKTOP := gt-desktop
+ BUILD_DIR := .
+-INSTALL_DIR := $(shell go env GOBIN)
+-ifeq ($(INSTALL_DIR),)
+ INSTALL_DIR := $(HOME)/go/bin
+-endif
+ E2E_IMAGE ?= gastown-test
+ E2E_BUILD_FLAGS ?=
+ E2E_RUN_FLAGS ?= --rm
+@@ -107,13 +104,20 @@ install: check-up-to-date build
+ 	@mkdir -p $(INSTALL_DIR)
+ 	@rm -f $(INSTALL_DIR)/$(BINARY)
+ 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+-	@# Nuke any stale binaries from previous install locations
+-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
++	@# Nuke any stale binaries from previous install locations (including mise Go paths)
++	@for bad in $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
+ 		if [ -f "$$bad" ] && [ "$$bad" != "$(INSTALL_DIR)/$(BINARY)" ]; then \
+ 			echo "Removing stale $$bad"; \
+ 			rm -f "$$bad"; \
+ 		fi; \
+ 	done
++	@# Remove from all mise Go version shims
++	@for bad in $(HOME)/.local/share/mise/installs/go/*/bin/$(BINARY); do \
++		if [ -f "$$bad" ]; then \
++			echo "Removing stale mise binary $$bad"; \
++			rm -f "$$bad"; \
++		fi; \
++	done
+ 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
+ 	@$(MAKE) --no-print-directory check-install-path
+ 	@# Restart daemon so it picks up the new binary.
+@@ -139,13 +143,19 @@ safe-install: check-up-to-date check-forward-only build
+ 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
+ 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+ 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
+-	@# Nuke any stale binaries from previous install locations
+-	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
++	@# Nuke any stale binaries from previous install locations (including mise Go paths)
++	@for bad in $(HOME)/bin/$(BINARY) $(HOME)/.local/bin/$(BINARY); do \
+ 		if [ -f "$$bad" ] && [ "$$bad" != "$(INSTALL_DIR)/$(BINARY)" ]; then \
+ 			echo "Removing stale $$bad"; \
+ 			rm -f "$$bad"; \
+ 		fi; \
+ 	done
++	@for bad in $(HOME)/.local/share/mise/installs/go/*/bin/$(BINARY); do \
++		if [ -f "$$bad" ]; then \
++			echo "Removing stale mise binary $$bad"; \
++			rm -f "$$bad"; \
++		fi; \
++	done
+ 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
+ 	@$(MAKE) --no-print-directory check-install-path
+ 	@echo "Sessions will pick up new binary on next cycle."
+-- 
+2.50.1 (Apple Git-155)
+

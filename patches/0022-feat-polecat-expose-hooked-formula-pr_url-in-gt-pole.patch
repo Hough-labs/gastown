@@ -1,0 +1,70 @@
+From 619935666853873ce327c7b02375bbb5846036bc Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 4 Jun 2026 17:07:10 -0400
+Subject: [PATCH 22/26] feat(polecat): expose hooked formula + pr_url in `gt
+ polecat list --json` (hq-6wd2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A dispatch wrapper doing per-PR live-reviewer dedup had to scrape `bd show` to
+learn which PR a hooked review polecat was working — `gt polecat list --json`
+exposed neither the hooked formula nor its vars.
+
+Add `formula` (the work bead's attached_formula, e.g. mol-polecat-review-pr)
+and `pr_url` (its formula_vars pr_url) to PolecatListItem, populated best-effort
+from the hooked bead via ParseAttachmentFields + extractFormulaVar. Both are
+omitempty, so when there's no pr_url the field is absent rather than empty.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/polecat.go | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/internal/cmd/polecat.go b/internal/cmd/polecat.go
+index 9415ebde..d37ee67e 100644
+--- a/internal/cmd/polecat.go
++++ b/internal/cmd/polecat.go
+@@ -402,6 +402,11 @@ type PolecatListItem struct {
+ 	SessionRunning       bool          `json:"session_running"`
+ 	Zombie               bool          `json:"zombie,omitempty"`
+ 	SessionName          string        `json:"session_name,omitempty"`
++	// Formula is the hooked work bead's attached formula (e.g. mol-polecat-review-pr).
++	// PRURL is the formula's pr_url var when set. Both are omitted when empty so a
++	// dispatch wrapper can dedup live reviewers per-PR without scraping bd show. (hq-6wd2)
++	Formula string `json:"formula,omitempty"`
++	PRURL   string `json:"pr_url,omitempty"`
+ }
+ 
+ // effectivePolecatState returns the observable state used by polecat list output.
+@@ -512,6 +517,18 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
+ 				Issue:          p.Issue,
+ 				SessionRunning: running,
+ 			})
++			// Surface the hooked work bead's formula + pr_url so --json consumers
++			// can dedup live reviewers per-PR. Best-effort; empty when absent. (hq-6wd2)
++			formula := ""
++			prURL := ""
++			if p.Issue != "" {
++				if issue, showErr := bd.Show(p.Issue); showErr == nil {
++					if af := beads.ParseAttachmentFields(issue); af != nil {
++						formula = af.AttachedFormula
++						prURL = extractFormulaVar(af.FormulaVars, "pr_url")
++					}
++				}
++			}
+ 			disposition := mgr.WorkstateDispositionForPolecat(p.Name, state, p.Issue)
+ 			allPolecats = append(allPolecats, PolecatListItem{
+ 				Rig:                  r.Name,
+@@ -531,6 +548,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
+ 				CountsTowardCapacity: disposition.CountsTowardCapacity,
+ 				ReuseStatus:          disposition.ReuseStatus,
+ 				SessionRunning:       running,
++				Formula:              formula,
++				PRURL:                prURL,
+ 			})
+ 			knownNames[p.Name] = true
+ 		}
+-- 
+2.50.1 (Apple Git-155)
+

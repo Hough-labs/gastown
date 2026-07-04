@@ -1,0 +1,145 @@
+From e9af1506b2df450dad4648e4e88cd23d77dd36f1 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 12 May 2026 12:51:34 -0400
+Subject: [PATCH 15/26] fix(hooks): skip events/ when walking town root for rig
+ discovery
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`gt hooks sync` walks town root for rigs by checking each subdir against
+isRig() — which looks for crew/, witness/, polecats/, or refinery/
+children. The events/ directory at town root is the witness/refinery
+event-stream channel (stores .event files emitted by molecules and
+agents), not a rig, but it happens to contain `witness/` and `refinery/`
+subdirs because those are the channel names. isRig(events) returned
+true, so DiscoverTargets and DiscoverRoleLocations emitted phantom
+Claude settings.json targets at events/witness/.claude/settings.json
+and events/refinery/.claude/settings.json on every sync.
+
+Symptom: `gt hooks sync` proposes to create two .claude/settings.json
+files inside the event-stream directory tree, which never had agents
+running there.
+
+Fix: factor the mayor/deacon/.beads exclude list into a shared
+isNonRigTownDir() helper, and add "events" to it. This matches the
+existing pattern for the other well-known non-rig town subdirs (mayor
+and deacon are added as explicit town-level targets elsewhere; .beads
+is the issue tracker DB).
+
+Tests:
+- TestDiscoverTargets_SkipsEventsDir
+- TestDiscoverRoleLocations_SkipsEventsDir
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+(cherry picked from commit ec058446b68ef406ec535c914b533db69fa9d323)
+---
+ internal/hooks/config.go      | 21 ++++++++++++----
+ internal/hooks/config_test.go | 45 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/internal/hooks/config.go b/internal/hooks/config.go
+index b3fcceb6..2e656a35 100644
+--- a/internal/hooks/config.go
++++ b/internal/hooks/config.go
+@@ -527,8 +527,8 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
+ 	}
+ 
+ 	for _, entry := range entries {
+-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+-			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
++		if !entry.IsDir() || isNonRigTownDir(entry.Name()) ||
++			strings.HasPrefix(entry.Name(), ".") {
+ 			continue
+ 		}
+ 
+@@ -621,8 +621,8 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
+ 	}
+ 
+ 	for _, entry := range entries {
+-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+-			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
++		if !entry.IsDir() || isNonRigTownDir(entry.Name()) ||
++			strings.HasPrefix(entry.Name(), ".") {
+ 			continue
+ 		}
+ 
+@@ -719,6 +719,19 @@ func isRig(path string) bool {
+ 	return false
+ }
+ 
++// isNonRigTownDir returns true for well-known town-root subdirectories that
++// must never be treated as rigs by the discovery walkers. Town-level role dirs
++// (mayor, deacon) are added explicitly elsewhere; events/ is the witness/
++// refinery event-stream channel and has subdirs named "witness" and "refinery"
++// that would otherwise trip isRig().
++func isNonRigTownDir(name string) bool {
++	switch name {
++	case "mayor", "deacon", "events", ".beads":
++		return true
++	}
++	return false
++}
++
+ // EventTypes returns the known hook event type names in display order.
+ var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit", "WorktreeCreate", "WorktreeRemove"}
+ 
+diff --git a/internal/hooks/config_test.go b/internal/hooks/config_test.go
+index 21cc1699..aa76a12d 100644
+--- a/internal/hooks/config_test.go
++++ b/internal/hooks/config_test.go
+@@ -1068,6 +1068,51 @@ func TestDiscoverRoleLocations_SkipsNonRigs(t *testing.T) {
+ 	}
+ }
+ 
++// events/ is the witness/refinery event-stream channel directory at town root,
++// not a rig. It contains subdirectories named "witness" and "refinery" which
++// store .event files. Without an explicit skip, isRig() trips on those subdir
++// names and the discovery walkers emit phantom Claude settings.json targets.
++func TestDiscoverTargets_SkipsEventsDir(t *testing.T) {
++	tmpDir := t.TempDir()
++
++	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
++	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
++	os.MkdirAll(filepath.Join(tmpDir, "realrig", "witness"), 0755)
++	// events/ shadows the rig-marker subdir names but is not itself a rig.
++	os.MkdirAll(filepath.Join(tmpDir, "events", "witness"), 0755)
++	os.MkdirAll(filepath.Join(tmpDir, "events", "refinery"), 0755)
++
++	targets, err := DiscoverTargets(tmpDir)
++	if err != nil {
++		t.Fatalf("DiscoverTargets failed: %v", err)
++	}
++
++	for _, tgt := range targets {
++		if tgt.Rig == "events" {
++			t.Errorf("events/ should not be discovered as a rig, got target: %s", tgt.DisplayKey())
++		}
++	}
++}
++
++func TestDiscoverRoleLocations_SkipsEventsDir(t *testing.T) {
++	tmpDir := t.TempDir()
++
++	os.MkdirAll(filepath.Join(tmpDir, "realrig", "witness"), 0755)
++	os.MkdirAll(filepath.Join(tmpDir, "events", "witness"), 0755)
++	os.MkdirAll(filepath.Join(tmpDir, "events", "refinery"), 0755)
++
++	locations, err := DiscoverRoleLocations(tmpDir)
++	if err != nil {
++		t.Fatalf("DiscoverRoleLocations failed: %v", err)
++	}
++
++	for _, loc := range locations {
++		if loc.Rig == "events" {
++			t.Errorf("events/ should not be discovered as a rig, got location: rig=%q role=%q", loc.Rig, loc.Role)
++		}
++	}
++}
++
+ func TestDiscoverWorktrees(t *testing.T) {
+ 	tmpDir := t.TempDir()
+ 
+-- 
+2.50.1 (Apple Git-155)
+
