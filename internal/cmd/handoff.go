@@ -331,9 +331,9 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	// This tells the new session "you're post-handoff, don't re-run /handoff"
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
-		_ = os.MkdirAll(runtimeDir, 0755)
+		_ = os.MkdirAll(runtimeDir, 0o755)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		_ = os.WriteFile(markerPath, []byte(currentSession), 0644)
+		_ = os.WriteFile(markerPath, []byte(currentSession), 0o644)
 	}
 
 	// Record handoff time for cooldown enforcement (gt-058d).
@@ -413,7 +413,7 @@ func runHandoffAuto() error {
 	// Write handoff marker so post-compact prime knows it's post-handoff
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
-		_ = os.MkdirAll(runtimeDir, 0755)
+		_ = os.MkdirAll(runtimeDir, 0o755)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
 		sessionName := "auto-handoff"
 		if tmux.IsInsideTmux() {
@@ -421,7 +421,7 @@ func runHandoffAuto() error {
 				sessionName = name
 			}
 		}
-		_ = os.WriteFile(markerPath, []byte(sessionName), 0644)
+		_ = os.WriteFile(markerPath, []byte(sessionName), 0o644)
 	}
 
 	// Log handoff event
@@ -532,13 +532,13 @@ func runHandoffCycle() error {
 	// directive instead of full re-initialization. (GH#1965)
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
-		_ = os.MkdirAll(runtimeDir, 0755)
+		_ = os.MkdirAll(runtimeDir, 0o755)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
 		markerContent := currentSession
 		if handoffReason != "" {
 			markerContent += "\n" + handoffReason
 		}
-		_ = os.WriteFile(markerPath, []byte(markerContent), 0644)
+		_ = os.WriteFile(markerPath, []byte(markerContent), 0o644)
 	}
 
 	// Record handoff time for cooldown enforcement (gt-058d).
@@ -554,12 +554,15 @@ func runHandoffCycle() error {
 		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(subject, true))
 	}
 
-	// Build restart command with --continue so the new session resumes
-	// the previous conversation (preserves context across compaction cycles).
-	restartCmd, err := buildRestartCommandWithOpts(currentSession, buildRestartCommandOpts{
-		ContinueSession: true,
-		ContinuePrompt:  "Context compacted. Continue your previous task.",
-	})
+	// Build restart command. Crew/polecats get --continue so the new session
+	// resumes the previous conversation (preserves context across compaction
+	// cycles). Patrol roles (refinery, witness, deacon) fresh-start instead:
+	// each patrol cycle is independent, so --continue would just reload the
+	// same fat conversation that crossed the context-cycle threshold in the
+	// first place (gfork-47p.2). buildRestartCommandWithOpts already falls
+	// back to the patrol-loop beacon when ContinueSession is false and the
+	// role is a patrol role.
+	restartCmd, err := buildRestartCommandWithOpts(currentSession, cycleRestartOpts(currentSession))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "handoff --cycle: could not build restart command: %v\n", err)
 		return err
@@ -1726,9 +1729,9 @@ func recordHandoffTime() {
 	}
 
 	runtimeDir := filepath.Join(cwd, constants.DirRuntime)
-	_ = os.MkdirAll(runtimeDir, 0755)
+	_ = os.MkdirAll(runtimeDir, 0o755)
 	tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
-	_ = os.WriteFile(tsPath, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
+	_ = os.WriteFile(tsPath, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0o644)
 }
 
 // isPatrolRole returns true if the role runs a patrol loop (refinery, witness, deacon).
@@ -1740,4 +1743,22 @@ func isPatrolRole(role string) bool {
 		return true
 	}
 	return false
+}
+
+// cycleRestartOpts computes the buildRestartCommandOpts for `gt handoff
+// --cycle` respawning currentSession. Patrol roles fresh-start (no
+// --continue) so each cycle is independent instead of reloading the same
+// fat conversation that triggered the cycle; crew/polecats keep --continue
+// to preserve task context across compaction. (gfork-47p.2)
+//
+// sessionToGTRole returns the compound GT_ROLE form ("<rig>/witness"), not
+// the bare role name isPatrolRole expects — ExtractSimpleRole bridges that,
+// same as buildRestartCommandWithOpts does internally for its own beacon
+// choice.
+func cycleRestartOpts(currentSession string) buildRestartCommandOpts {
+	simpleRole := config.ExtractSimpleRole(sessionToGTRole(currentSession))
+	return buildRestartCommandOpts{
+		ContinueSession: !isPatrolRole(simpleRole),
+		ContinuePrompt:  "Context compacted. Continue your previous task.",
+	}
 }

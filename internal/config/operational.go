@@ -3,6 +3,8 @@ package config
 import (
 	"path/filepath"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // Compiled-in defaults for operational thresholds.
@@ -35,20 +37,20 @@ const (
 
 // Daemon defaults.
 const (
-	DefaultMassDeathWindow                 = 30 * time.Second
-	DefaultMassDeathThreshold              = 3
-	DefaultDogIdleSessionTimeout           = 1 * time.Hour
-	DefaultPolecatIdleSessionTimeout       = 15 * time.Minute
-	DefaultDogIdleRemoveTimeout            = 4 * time.Hour
-	DefaultStaleWorkingTimeout             = 2 * time.Hour
-	DefaultMaxDogPoolSize                  = 4
-	DefaultMaxLifecycleMessageAge          = 6 * time.Hour
-	DefaultSyncFailureEscalationThreshold  = 3
-	DefaultDoctorMolCooldown               = 5 * time.Minute
-	DefaultRecoveryHeartbeatInterval       = 3 * time.Minute
-	DefaultBootSpawnCooldown               = 2 * time.Minute
-	DefaultBootIdleSuppression             = 15 * time.Minute
-	DefaultDeaconGracePeriod               = 5 * time.Minute
+	DefaultMassDeathWindow                = 30 * time.Second
+	DefaultMassDeathThreshold             = 3
+	DefaultDogIdleSessionTimeout          = 1 * time.Hour
+	DefaultPolecatIdleSessionTimeout      = 15 * time.Minute
+	DefaultDogIdleRemoveTimeout           = 4 * time.Hour
+	DefaultStaleWorkingTimeout            = 2 * time.Hour
+	DefaultMaxDogPoolSize                 = 4
+	DefaultMaxLifecycleMessageAge         = 6 * time.Hour
+	DefaultSyncFailureEscalationThreshold = 3
+	DefaultDoctorMolCooldown              = 5 * time.Minute
+	DefaultRecoveryHeartbeatInterval      = 3 * time.Minute
+	DefaultBootSpawnCooldown              = 2 * time.Minute
+	DefaultBootIdleSuppression            = 15 * time.Minute
+	DefaultDeaconGracePeriod              = 5 * time.Minute
 
 	// Pressure check defaults — fully opt-in. All zero = disabled.
 	// Configure in settings/config.json under operational.daemon to enable.
@@ -56,25 +58,44 @@ const (
 	DefaultPressureCPUThreshold   = 0.0
 	DefaultPressureMemThresholdGB = 0.0
 	DefaultPressureMaxSessions    = 0
+
+	// Context-lifecycle watchdog defaults (gfork-47p.2). YELLOW nudges a
+	// persistent agent to self-cycle at its next loop boundary; RED
+	// force-cycles it (idle-gated). Values are compiled-in defaults; the
+	// resolved thresholds are always clamped so RED > YELLOW (see
+	// ContextThresholdsForRoleV).
+	DefaultContextYellowTokens = 130_000
+	DefaultContextRedTokens    = 170_000
+	// contextYellowTokensFloor guards against a misconfigured near-zero
+	// YELLOW threshold triggering a nudge storm.
+	contextYellowTokensFloor    = 50_000
+	DefaultContextNudgeCooldown = 15 * time.Minute
 )
+
+// DefaultContextCycleRoles is the default set of persistent-agent roles the
+// context watchdog monitors. A var (not const) because it's a slice; treat
+// as read-only. Polecats are deliberately never included — their lifecycle
+// belongs to reapIdlePolecats / self-terminate (gfork-47p.1), not this
+// recycle path.
+var DefaultContextCycleRoles = []string{constants.RoleWitness, constants.RoleRefinery, constants.RoleDeacon}
 
 // Deacon defaults.
 const (
-	DefaultDeaconPingTimeout               = 30 * time.Second
-	DefaultDeaconConsecutiveFailures       = 3
-	DefaultDeaconCooldown                  = 5 * time.Minute
-	DefaultDeaconHeartbeatStaleThreshold   = 5 * time.Minute
-	DefaultDeaconHeartbeatVeryStale        = 20 * time.Minute
-	DefaultMaxRedispatches                 = 3
-	DefaultRedispatchCooldown              = 5 * time.Minute
-	DefaultMaxFeedsPerCycle                = 3
-	DefaultFeedCooldown                    = 10 * time.Minute
+	DefaultDeaconPingTimeout             = 30 * time.Second
+	DefaultDeaconConsecutiveFailures     = 3
+	DefaultDeaconCooldown                = 5 * time.Minute
+	DefaultDeaconHeartbeatStaleThreshold = 5 * time.Minute
+	DefaultDeaconHeartbeatVeryStale      = 20 * time.Minute
+	DefaultMaxRedispatches               = 3
+	DefaultRedispatchCooldown            = 5 * time.Minute
+	DefaultMaxFeedsPerCycle              = 3
+	DefaultFeedCooldown                  = 10 * time.Minute
 )
 
 // Polecat defaults.
 const (
-	DefaultPolecatHeartbeatStale = 3 * time.Minute
-	DefaultPolecatDoltMaxRetries = 10
+	DefaultPolecatHeartbeatStale  = 3 * time.Minute
+	DefaultPolecatDoltMaxRetries  = 10
 	DefaultPolecatDoltBaseBackoff = 500 * time.Millisecond
 	DefaultPolecatDoltBackoffMax  = 30 * time.Second
 	DefaultPolecatPendingMaxAge   = 5 * time.Minute
@@ -110,9 +131,9 @@ const (
 	DefaultWitnessStartupStallThreshold  = 90 * time.Second
 	DefaultWitnessStartupActivityGrace   = 60 * time.Second
 	DefaultWitnessMaxBeadRespawns        = 3
-	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
-	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
-	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
+	DefaultWitnessDoneIntentStuckTimeout = 60 * time.Second
+	DefaultWitnessDoneIntentRecentGrace  = 30 * time.Second
+	DefaultWitnessHeartbeatStartupGrace  = 5 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -425,6 +446,53 @@ func (d *DaemonThresholds) PressureMaxSessionsV() int {
 		return *d.PressureMaxSessions
 	}
 	return DefaultPressureMaxSessions
+}
+
+// ContextThresholdsForRoleV returns the effective (yellow, red) context-token
+// thresholds for role. Applies role's ContextTokensByRole override (if any)
+// to YELLOW, floors YELLOW at contextYellowTokensFloor, and clamps RED to be
+// strictly greater than the resolved YELLOW — a misconfigured RED <= YELLOW
+// would leave the RED tier unreachable, or fire before YELLOW ever nudges.
+func (d *DaemonThresholds) ContextThresholdsForRoleV(role string) (yellow, red int) {
+	yellow = DefaultContextYellowTokens
+	if d != nil && d.ContextYellowTokens != nil {
+		yellow = *d.ContextYellowTokens
+	}
+	if d != nil {
+		if v, ok := d.ContextTokensByRole[role]; ok && v > 0 {
+			yellow = v
+		}
+	}
+	if yellow < contextYellowTokensFloor {
+		yellow = contextYellowTokensFloor
+	}
+
+	red = DefaultContextRedTokens
+	if d != nil && d.ContextRedTokens != nil {
+		red = *d.ContextRedTokens
+	}
+	if red <= yellow {
+		red = yellow + contextYellowTokensFloor
+	}
+	return yellow, red
+}
+
+// ContextCycleRolesV returns the configured or default set of roles the
+// context watchdog monitors.
+func (d *DaemonThresholds) ContextCycleRolesV() []string {
+	if d != nil && len(d.ContextCycleRoles) > 0 {
+		return d.ContextCycleRoles
+	}
+	return DefaultContextCycleRoles
+}
+
+// ContextNudgeCooldownD returns the configured or default minimum interval
+// between YELLOW-tier context-pressure nudges for the same agent.
+func (d *DaemonThresholds) ContextNudgeCooldownD() time.Duration {
+	if d != nil {
+		return ParseDurationOrDefault(d.ContextNudgeCooldown, DefaultContextNudgeCooldown)
+	}
+	return DefaultContextNudgeCooldown
 }
 
 // --- Deacon accessors ---
