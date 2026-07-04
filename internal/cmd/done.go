@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -18,11 +19,10 @@ import (
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
-	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/templates"
-	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -1470,16 +1470,29 @@ notifyWitness:
 	// instead of transitioning to IDLE. This gives fresh context windows
 	// per task, reduces token waste, and eliminates stale state bugs.
 	// Must be the LAST thing gt done does — everything above must complete first.
+	//
+	// Gated on !pushFailed && !mrFailed: a failed submission keeps the session
+	// alive so the witness/human can recover the work instead of it vanishing
+	// mid-failure.
+	//
+	// Spawned as a DETACHED subprocess, not a goroutine: a goroutine sleeping
+	// past gt done's return would be killed along with the process before it
+	// ever fires. The subprocess reparents to PID 1 on exit and survives.
 	if isPolecat {
 		daemonCfg := config.LoadOperationalConfig(townRoot).GetDaemonConfig()
-		if daemonCfg.PolecatSelfTerminate != nil && *daemonCfg.PolecatSelfTerminate {
-			fmt.Printf("%s Self-terminating session (polecat_self_terminate=true)\n", style.Bold.Render("✓"))
-			sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-			go func() {
-				time.Sleep(3 * time.Second)
-				t := tmux.NewTmux()
-				_ = t.KillSessionWithProcesses(sessionName)
-			}()
+		if daemonCfg.PolecatSelfTerminate != nil && *daemonCfg.PolecatSelfTerminate && !pushFailed && !mrFailed && runtime.GOOS != "windows" {
+			gtBin, exeErr := os.Executable()
+			if exeErr != nil {
+				style.PrintWarning("could not resolve gt binary for self-terminate: %v (idle reaper will collect)", exeErr)
+			} else {
+				fmt.Printf("%s Self-terminating session (polecat_self_terminate=true)\n", style.Bold.Render("✓"))
+				killCmd := exec.Command("/bin/sh", "-c", `sleep 3; exec "$GT_BIN" session stop --force "$GT_TARGET"`)
+				killCmd.Env = append(os.Environ(), "GT_BIN="+gtBin, "GT_TARGET="+rigName+"/"+polecatName)
+				util.SetDetachedProcessGroup(killCmd)
+				if startErr := killCmd.Start(); startErr != nil {
+					style.PrintWarning("could not schedule self-terminate: %v (idle reaper will collect)", startErr)
+				}
+			}
 		}
 	}
 
