@@ -193,7 +193,7 @@ check-version-tag:
 # Upstream baseline this fork tracks. We pin to a release TAG (not upstream/main)
 # because main diverges from release tags. Bump this on every upstream upgrade
 # (and the matching ref in .githooks/pre-push), then rebase patches onto it.
-UPSTREAM_BASE := v1.2.0
+UPSTREAM_BASE := v1.2.1
 
 # Export current local commits (UPSTREAM_BASE..HEAD divergence) to patches/.
 # Run this after adding or editing a local patch commit.
