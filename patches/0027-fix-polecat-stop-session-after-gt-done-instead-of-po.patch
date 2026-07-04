@@ -1,7 +1,7 @@
 From e29ab29dc1aff64ef16cf062cd7db1347b9ad6bb Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 13:39:23 -0400
-Subject: [PATCH 27/28] fix(polecat): stop session after gt done instead of
+Subject: [PATCH 27/29] fix(polecat): stop session after gt done instead of
  poll-looping the MR
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

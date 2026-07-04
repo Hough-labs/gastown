@@ -1,7 +1,7 @@
 From 336cc54529cbdb28c691ed6873ef1ca82bebb355 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 12 Apr 2026 14:13:12 -0400
-Subject: [PATCH 08/28] fix(session): activate agent logging on
+Subject: [PATCH 08/29] fix(session): activate agent logging on
  GT_LOG_AGENT_OUTPUT alone
 
 Remove the GT_OTEL_LOGS_URL guard from ActivateAgentLogging. The

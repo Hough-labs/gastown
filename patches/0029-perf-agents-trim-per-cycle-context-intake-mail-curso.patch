@@ -1,0 +1,1203 @@
+From c8b0c74873049ab3fde8c5ac410acebd5d7a2a14 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 4 Jul 2026 14:43:27 -0400
+Subject: [PATCH 29/29] =?UTF-8?q?perf(agents):=20trim=20per-cycle=20contex?=
+ =?UTF-8?q?t=20intake=20=E2=80=94=20mail=20cursor=20+=20mid-weight=20patro?=
+ =?UTF-8?q?l=20prime=20+=20nudge=20de-dup?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gfork-47p.4 (P1): reduce per-loop context accretion for persistent agents (headroom on top of .2's recycle). Three levers: (B) mail_check.go inject-once cursor — acked-unread normal/low mail collapses to a counter line instead of re-injecting full every prompt boundary, urgent/high always re-inject until read, legacy mailboxes (empty DeliveryState) unchanged (zero regression). (A) handoff.go/prime.go/prime_output.go — a patrol-cycle handoff marker triggers a mid-weight lite prime for deacon/witness (~5-line identity + 'gt prime'/'gt formula show' pointers instead of the ~17KB role template), keeping directives/CONTEXT.md/memory/patrol-status + truncated checklist; refinery is carved out (keeps the full formula — its truncation is the deferred gfork-47p.4.1); witness parked/docked and deacon paused correctness gates preserved verbatim. (C) nudge/queue.go — de-dup identical (Sender,Message,Kind) nudges on drain with an (xN) suffix.
+
+Validated this session: gofumpt/vet/build green; internal/cmd + internal/nudge test-race green (Lever-B escalation carve-out + refinery carve-out both covered by tests; prime_molecule.go byte-untouched). E2E soak pending (lead gate: gt prime|wc -c deacon full-vs-lite byte-check + live deacon cycle).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/handoff.go                |  29 +++-
+ internal/cmd/handoff_test.go           |  32 ++++
+ internal/cmd/mail_check.go             |  50 +++++-
+ internal/cmd/mail_check_inject_test.go | 121 ++++++++++++++
+ internal/cmd/prime.go                  |  54 ++++++-
+ internal/cmd/prime_output.go           |  80 +++++++++
+ internal/cmd/prime_output_test.go      | 215 +++++++++++++++++++++++--
+ internal/cmd/prime_test.go             |  72 ++++++---
+ internal/nudge/queue.go                |  43 ++++-
+ internal/nudge/queue_test.go           |  94 ++++++++++-
+ 10 files changed, 740 insertions(+), 50 deletions(-)
+
+diff --git a/internal/cmd/handoff.go b/internal/cmd/handoff.go
+index 13b219be..0ca9cd4a 100644
+--- a/internal/cmd/handoff.go
++++ b/internal/cmd/handoff.go
+@@ -329,11 +329,20 @@ func runHandoff(cmd *cobra.Command, args []string) error {
+ 	// Write handoff marker for successor detection (prevents handoff loop bug).
+ 	// The marker is cleared by gt prime after it outputs the warning.
+ 	// This tells the new session "you're post-handoff, don't re-run /handoff"
++	// Format: "session_id\nreason" — same convention as runHandoffCycle (GH#1965).
++	// Patrol roles auto-derive a "patrol-cycle" reason when no explicit
++	// --reason is given, so the successor's next `gt prime` can offer the
++	// lighter steady-state payload instead of full re-initialization
++	// (gfork-47p.4).
+ 	if cwd, err := os.Getwd(); err == nil {
+ 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+ 		_ = os.MkdirAll(runtimeDir, 0o755)
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		_ = os.WriteFile(markerPath, []byte(currentSession), 0o644)
++		markerContent := currentSession
++		if reason := patrolCycleReason(handoffReason, sessionToGTRole(currentSession)); reason != "" {
++			markerContent += "\n" + reason
++		}
++		_ = os.WriteFile(markerPath, []byte(markerContent), 0o644)
+ 	}
+ 
+ 	// Record handoff time for cooldown enforcement (gt-058d).
+@@ -1740,6 +1749,24 @@ func isPatrolRole(role string) bool {
+ 	return false
+ }
+ 
++// patrolCycleReason returns the handoff marker reason to write for a normal
++// (non --cycle) handoff. An explicit --reason always wins. Otherwise, patrol
++// roles (deacon/witness/refinery) auto-derive "patrol-cycle" so the
++// successor's next `gt prime` can offer a lighter steady-state payload
++// instead of a full re-initialization every cycle (gfork-47p.4). Non-patrol
++// roles get no reason, same as before this change. gtRole is the compound
++// GT_ROLE form (e.g. "rig/witness") as returned by sessionToGTRole —
++// ExtractSimpleRole bridges that to the bare role name isPatrolRole expects.
++func patrolCycleReason(explicitReason, gtRole string) string {
++	if explicitReason != "" {
++		return explicitReason
++	}
++	if isPatrolRole(config.ExtractSimpleRole(gtRole)) {
++		return "patrol-cycle"
++	}
++	return ""
++}
++
+ // cycleRestartOpts computes the buildRestartCommandOpts for `gt handoff
+ // --cycle` respawning currentSession. Patrol roles fresh-start (no
+ // --continue) so each cycle is independent instead of reloading the same
+diff --git a/internal/cmd/handoff_test.go b/internal/cmd/handoff_test.go
+index 2b20ff53..c4a65920 100644
+--- a/internal/cmd/handoff_test.go
++++ b/internal/cmd/handoff_test.go
+@@ -998,3 +998,35 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// TestPatrolCycleReason covers the Lever A marker-reason auto-derive
++// (gfork-47p.4): a normal `gt handoff` from a patrol role writes a
++// "patrol-cycle" reason so the successor's next `gt prime` can offer the
++// lighter steady-state payload, without requiring any formula change.
++func TestPatrolCycleReason(t *testing.T) {
++	tests := []struct {
++		name           string
++		explicitReason string
++		gtRole         string
++		want           string
++	}{
++		{"explicit reason always wins", "compaction", "gastown/witness", "compaction"},
++		{"explicit reason wins even for non-patrol role", "idle", "gastown/crew/max", "idle"},
++		{"witness auto-derives patrol-cycle", "", "gastown/witness", "patrol-cycle"},
++		{"refinery auto-derives patrol-cycle", "", "gastown/refinery", "patrol-cycle"},
++		{"deacon (town-level, simple GT_ROLE) auto-derives patrol-cycle", "", "deacon", "patrol-cycle"},
++		{"crew gets no reason", "", "gastown/crew/max", ""},
++		{"polecat gets no reason", "", "gastown/polecats/toast", ""},
++		{"mayor gets no reason", "", "mayor", ""},
++		{"empty gtRole (unparseable session) gets no reason", "", "", ""},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := patrolCycleReason(tt.explicitReason, tt.gtRole); got != tt.want {
++				t.Errorf("patrolCycleReason(%q, %q) = %q, want %q",
++					tt.explicitReason, tt.gtRole, got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/internal/cmd/mail_check.go b/internal/cmd/mail_check.go
+index 638828fd..ea9b335d 100644
+--- a/internal/cmd/mail_check.go
++++ b/internal/cmd/mail_check.go
+@@ -92,8 +92,15 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
+ 
+ 		if unread > 0 {
+ 			messages = filterUnreadMessages(messages)
+-			fmt.Print(formatInjectOutput(messages))
++			visible, collapsed := partitionInjectMessages(messages)
++			if len(visible) > 0 {
++				fmt.Print(formatInjectOutput(visible))
++			}
++			fmt.Print(formatCollapsedNotice(collapsed))
+ 			// Ack after output so message is delivered before being marked acked.
++			// Ack the FULL unread set (visible + collapsed) — unchanged from
++			// before: acking is what lets a message drop out of "visible" on
++			// the NEXT cycle (see partitionInjectMessages).
+ 			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
+ 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+ 			}
+@@ -123,6 +130,47 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
+ 	return NewSilentExit(1)
+ }
+ 
++// partitionInjectMessages splits unread messages into those that must be
++// shown in full this cycle ("visible") and a count of those that were
++// already injected on a prior cycle and can be collapsed to a single
++// counter line ("collapsed").
++//
++// DeliveryState is the injection cursor: AcknowledgeDeliveries flips it
++// pending -> acked the first time a message is shown (see runMailCheck
++// below), so an unread message with DeliveryState == acked has already been
++// injected in full on a previous cycle. Legacy mailboxes never set
++// DeliveryState (it stays ""), so their messages always compare != acked
++// and show in full every cycle — zero regression for them.
++//
++// Urgent and high priority messages are carved out of the collapse: they
++// re-inject in full every cycle until read, preserving the existing
++// HELP/escalation nagging behavior regardless of ack state.
++func partitionInjectMessages(messages []*mail.Message) (visible []*mail.Message, collapsed int) {
++	for _, msg := range messages {
++		if msg == nil {
++			continue
++		}
++		if msg.DeliveryState != mail.DeliveryStateAcked || msg.Priority == mail.PriorityUrgent || msg.Priority == mail.PriorityHigh {
++			visible = append(visible, msg)
++			continue
++		}
++		collapsed++
++	}
++	return visible, collapsed
++}
++
++// formatCollapsedNotice renders a single-line notice for unread messages
++// that were already injected on a prior cycle and don't need to be repeated
++// in full. Wrapped in its own system-reminder block so it renders whether
++// or not any messages were shown in full this cycle. Returns "" when there's
++// nothing to collapse.
++func formatCollapsedNotice(n int) string {
++	if n == 0 {
++		return ""
++	}
++	return fmt.Sprintf("<system-reminder>\n(Plus %d earlier unread — 'gt mail inbox')\n</system-reminder>\n", n)
++}
++
+ // formatInjectOutput builds the system-reminder text for inject mode.
+ // It separates messages into three tiers (urgent, high, normal/low) and
+ // formats them with priority-appropriate framing for the agent.
+diff --git a/internal/cmd/mail_check_inject_test.go b/internal/cmd/mail_check_inject_test.go
+index c9b5bb09..86884c94 100644
+--- a/internal/cmd/mail_check_inject_test.go
++++ b/internal/cmd/mail_check_inject_test.go
+@@ -193,3 +193,124 @@ func TestFormatInjectOutput(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestPartitionInjectMessages covers the Lever B inject-once cursor
++// (gfork-47p.4): unread messages already injected on a prior cycle (acked,
++// normal/low priority) collapse to a counter instead of re-injecting in
++// full every turn.
++func TestPartitionInjectMessages(t *testing.T) {
++	msg := func(id string, priority mail.Priority, deliveryState string) *mail.Message {
++		return &mail.Message{
++			ID:            id,
++			Priority:      priority,
++			DeliveryState: deliveryState,
++		}
++	}
++
++	tests := []struct {
++		name          string
++		messages      []*mail.Message
++		wantVisible   []string // IDs expected in the visible slice, in order
++		wantCollapsed int
++	}{
++		{
++			name: "never-injected (pending) always visible",
++			messages: []*mail.Message{
++				msg("m1", mail.PriorityNormal, mail.DeliveryStatePending),
++			},
++			wantVisible:   []string{"m1"},
++			wantCollapsed: 0,
++		},
++		{
++			name: "legacy mailbox (empty DeliveryState) always visible - zero regression",
++			messages: []*mail.Message{
++				msg("m2", mail.PriorityNormal, ""),
++				msg("m3", mail.PriorityLow, ""),
++			},
++			wantVisible:   []string{"m2", "m3"},
++			wantCollapsed: 0,
++		},
++		{
++			name: "acked + normal priority collapses to counter",
++			messages: []*mail.Message{
++				msg("m4", mail.PriorityNormal, mail.DeliveryStateAcked),
++			},
++			wantVisible:   nil,
++			wantCollapsed: 1,
++		},
++		{
++			name: "acked + low priority collapses to counter",
++			messages: []*mail.Message{
++				msg("m5", mail.PriorityLow, mail.DeliveryStateAcked),
++			},
++			wantVisible:   nil,
++			wantCollapsed: 1,
++		},
++		{
++			name: "acked + urgent stays visible (escalation carve-out)",
++			messages: []*mail.Message{
++				msg("m6", mail.PriorityUrgent, mail.DeliveryStateAcked),
++			},
++			wantVisible:   []string{"m6"},
++			wantCollapsed: 0,
++		},
++		{
++			name: "acked + high stays visible (escalation carve-out)",
++			messages: []*mail.Message{
++				msg("m7", mail.PriorityHigh, mail.DeliveryStateAcked),
++			},
++			wantVisible:   []string{"m7"},
++			wantCollapsed: 0,
++		},
++		{
++			name: "mixed cycle: unacked + acked-urgent visible, acked-normal collapsed",
++			messages: []*mail.Message{
++				msg("m8", mail.PriorityNormal, mail.DeliveryStatePending),
++				msg("m9", mail.PriorityUrgent, mail.DeliveryStateAcked),
++				msg("m10", mail.PriorityNormal, mail.DeliveryStateAcked),
++				msg("m11", mail.PriorityLow, mail.DeliveryStateAcked),
++			},
++			wantVisible:   []string{"m8", "m9"},
++			wantCollapsed: 2,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			visible, collapsed := partitionInjectMessages(tt.messages)
++
++			if collapsed != tt.wantCollapsed {
++				t.Errorf("collapsed = %d, want %d", collapsed, tt.wantCollapsed)
++			}
++
++			var gotIDs []string
++			for _, m := range visible {
++				gotIDs = append(gotIDs, m.ID)
++			}
++			if len(gotIDs) != len(tt.wantVisible) {
++				t.Fatalf("visible IDs = %v, want %v", gotIDs, tt.wantVisible)
++			}
++			for i, id := range tt.wantVisible {
++				if gotIDs[i] != id {
++					t.Errorf("visible[%d] = %q, want %q", i, gotIDs[i], id)
++				}
++			}
++		})
++	}
++}
++
++// TestFormatCollapsedNotice covers the single-line collapse notice appended
++// after the tiered inject output (or standalone, when every unread message
++// is already-injected).
++func TestFormatCollapsedNotice(t *testing.T) {
++	if got := formatCollapsedNotice(0); got != "" {
++		t.Errorf("formatCollapsedNotice(0) = %q, want empty", got)
++	}
++
++	got := formatCollapsedNotice(3)
++	for _, want := range []string{"<system-reminder>", "Plus 3 earlier unread", "gt mail inbox", "</system-reminder>"} {
++		if !strings.Contains(got, want) {
++			t.Errorf("formatCollapsedNotice(3) should contain %q\n\nGot:\n%s", want, got)
++		}
++	}
++}
+diff --git a/internal/cmd/prime.go b/internal/cmd/prime.go
+index 9fb9f3b3..da1e22ad 100644
+--- a/internal/cmd/prime.go
++++ b/internal/cmd/prime.go
+@@ -27,17 +27,21 @@ import (
+ 	worktreeintegrity "github.com/steveyegge/gastown/internal/worktree"
+ )
+ 
+-var primeHookMode bool
+-var primeDryRun bool
+-var primeState bool
+-var primeStateJSON bool
+-var primeExplain bool
+-var primeStructuredSessionStartOutput bool
++var (
++	primeHookMode                     bool
++	primeDryRun                       bool
++	primeState                        bool
++	primeStateJSON                    bool
++	primeExplain                      bool
++	primeStructuredSessionStartOutput bool
++)
+ 
+ // Prime's external injections are best-effort; role context should still
+ // return when bd/mail is slow or wedged.
+-var primeExternalToolTimeout = 5 * time.Second
+-var primeExternalToolWaitDelay = time.Second
++var (
++	primeExternalToolTimeout   = 5 * time.Second
++	primeExternalToolWaitDelay = time.Second
++)
+ 
+ // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
+ // when running in hook mode. Used to provide lighter output on compaction/resume.
+@@ -47,6 +51,19 @@ var primeHookSource string
+ // Set by checkHandoffMarker when a marker with a reason field is found.
+ var primeHandoffReason string
+ 
++// primeLiteMode is set when this prime is a steady-state patrol respawn
++// (primeHandoffReason == "patrol-cycle", written by runHandoff for deacon/
++// witness/refinery — see patrolCycleReason in handoff.go). Unlike
++// isCompactResume, the normal prime path still runs in full (setup, work
++// discovery, patrol context) — only the role-template payload and startup
++// directive are swapped for a lighter tier, and ONLY for deacon/witness
++// (outputPrimeContext, outputStartupDirective). Refinery is deliberately
++// carved out: showFormulaStepsFull's step details are its primary
++// instructions, so a refinery mid-queue respawn always gets the full
++// formula regardless of this flag (gfork-47p.4; full trim deferred to
++// gfork-47p.4.1).
++var primeLiteMode bool
++
+ // Role represents a detected agent role.
+ type Role string
+ 
+@@ -179,6 +196,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
+ 		return nil
+ 	}
+ 
++	// Steady-state patrol respawn: continue the NORMAL prime path (setup,
++	// work discovery, patrol context all still run) but flag the lighter
++	// role-template/startup-directive tier for deacon/witness (gfork-47p.4).
++	// The successor's context is genuinely empty here — unlike compact/resume
++	// above, it did NOT keep the prior conversation, so runPrimeCompactResume's
++	// "Continue your current task" would be meaningless.
++	if shouldUsePrimeLiteMode(primeHandoffReason) {
++		primeLiteMode = true
++	}
++
+ 	if err := setupPrimeSession(ctx, roleInfo); err != nil {
+ 		return err
+ 	}
+@@ -401,6 +428,17 @@ func isCompactResume() bool {
+ 	return primeHookSource == "compact" || primeHookSource == "resume" || primeHandoffReason == "compaction"
+ }
+ 
++// shouldUsePrimeLiteMode returns whether primeLiteMode should be set, given
++// the parsed handoff-marker reason. Only "patrol-cycle" (auto-derived by
++// patrolCycleReason in handoff.go for a normal patrol-role handoff) triggers
++// it — a marker-less respawn or any other reason takes the normal full-prime
++// path. Distinct from isCompactResume: that gate short-circuits to a
++// separate lighter path entirely, while this one continues the normal prime
++// path and only swaps the role-template/startup-directive tier downstream.
++func shouldUsePrimeLiteMode(handoffReason string) bool {
++	return handoffReason == "patrol-cycle"
++}
++
+ // warnRoleMismatch outputs a prominent warning if GT_ROLE disagrees with cwd detection.
+ func warnRoleMismatch(roleInfo RoleInfo, cwd string) {
+ 	if !roleInfo.Mismatch {
+diff --git a/internal/cmd/prime_output.go b/internal/cmd/prime_output.go
+index 6141f581..35f9e5e8 100644
+--- a/internal/cmd/prime_output.go
++++ b/internal/cmd/prime_output.go
+@@ -25,6 +25,15 @@ import (
+ // outputPrimeContext outputs the role-specific context using templates or fallback.
+ // Returns the rendered template content (empty string when using fallback path).
+ func outputPrimeContext(ctx RoleContext) (string, error) {
++	// Steady-state patrol respawn (gfork-47p.4): swap the ~17KB role
++	// template for a ~5-line identity block. Deacon/witness only — refinery
++	// keeps the full template even under primeLiteMode (carve-out; see the
++	// primeLiteMode doc comment in prime.go).
++	if primeLiteMode && (ctx.Role == RoleDeacon || ctx.Role == RoleWitness) {
++		outputPrimeContextLite(ctx)
++		return "", nil
++	}
++
+ 	// Try to use templates first
+ 	tmpl, err := templates.New()
+ 	if err != nil {
+@@ -94,6 +103,37 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
+ 	return output, nil
+ }
+ 
++// outputPrimeContextLite emits a minimal identity block for steady-state
++// patrol respawns instead of the full role template. Only reached for
++// deacon/witness (see outputPrimeContext) — the successor is a fresh session
++// re-entering the SAME patrol loop it just cycled out of, so the full
++// onboarding template (rules, tool references, workflow prose) it already
++// internalized this session is redundant to re-read every cycle. Full role
++// context and full step text both stay one command away.
++func outputPrimeContextLite(ctx RoleContext) {
++	roleLabel := "Patrol Agent"
++	formulaName := ""
++	switch ctx.Role {
++	case RoleDeacon:
++		roleLabel = "Deacon"
++		formulaName = constants.MolDeaconPatrol
++	case RoleWitness:
++		roleLabel = "Witness"
++		formulaName = constants.MolWitnessPatrol
++	}
++
++	fmt.Println()
++	fmt.Printf("## %s — steady-state patrol cycle\n\n", roleLabel)
++	fmt.Printf("You are the **%s**", roleLabel)
++	if ctx.Rig != "" {
++		fmt.Printf(" for rig `%s`", ctx.Rig)
++	}
++	fmt.Println(".")
++	fmt.Printf("Full role context: run `%s prime`. Full step text: `%s formula show %s`.\n",
++		cli.Name(), cli.Name(), formulaName)
++	fmt.Println()
++}
++
+ // outputRoleDirectives loads and emits operator-provided role directives.
+ // These come from the directive file layout (town-level and/or rig-level)
+ // and override formula defaults where they conflict.
+@@ -465,9 +505,49 @@ func outputHandoffContent(ctx RoleContext) {
+ 	fmt.Println(style.Dim.Render("(Clear with: gt rig reset --handoff)"))
+ }
+ 
++// outputStartupDirectiveLite prints a minimal startup directive for
++// steady-state patrol respawns (deacon/witness only — see primeLiteMode in
++// prime.go). Returns true if it handled the role, in which case the caller
++// must not fall through to the full directive below; false if the role
++// isn't covered by the lite tier (e.g. refinery — carved out) so the caller
++// should render the full directive as usual.
++//
++// The parked/docked (witness) and paused (deacon) gates are preserved
++// exactly as in the full directive — those are correctness checks, not
++// verbosity, and must not be skipped just because this is a lite prime.
++func outputStartupDirectiveLite(ctx RoleContext) bool {
++	switch ctx.Role {
++	case RoleWitness:
++		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
++			fmt.Println()
++			fmt.Println("---")
++			fmt.Println()
++			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
++			return true
++		}
++	case RoleDeacon:
++		if paused, _, _ := deacon.IsPaused(ctx.TownRoot); paused {
++			// Pause message was already shown; stay silent, same as full directive.
++			return true
++		}
++	default:
++		return false
++	}
++
++	fmt.Println()
++	fmt.Println("---")
++	fmt.Println()
++	fmt.Println("Begin patrol at step 1.")
++	return true
++}
++
+ // outputStartupDirective outputs role-specific instructions for the agent.
+ // This tells agents like Mayor to announce themselves on startup.
+ func outputStartupDirective(ctx RoleContext) {
++	if primeLiteMode && outputStartupDirectiveLite(ctx) {
++		return
++	}
++
+ 	switch ctx.Role {
+ 	case RoleMayor:
+ 		fmt.Println()
+diff --git a/internal/cmd/prime_output_test.go b/internal/cmd/prime_output_test.go
+index 117d60d5..01311e8e 100644
+--- a/internal/cmd/prime_output_test.go
++++ b/internal/cmd/prime_output_test.go
+@@ -2,10 +2,15 @@ package cmd
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++
++	"github.com/steveyegge/gastown/internal/constants"
++	"github.com/steveyegge/gastown/internal/deacon"
++	"github.com/steveyegge/gastown/internal/wisp"
+ )
+ 
+ func TestOutputRoleDirectives(t *testing.T) {
+@@ -33,10 +38,10 @@ func TestOutputRoleDirectives(t *testing.T) {
+ 		t.Parallel()
+ 		townRoot := t.TempDir()
+ 		dir := filepath.Join(townRoot, "directives")
+-		if err := os.MkdirAll(dir, 0755); err != nil {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if err := os.WriteFile(filepath.Join(dir, "polecat.md"), []byte("Always be polite."), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(dir, "polecat.md"), []byte("Always be polite."), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 
+@@ -62,10 +67,10 @@ func TestOutputRoleDirectives(t *testing.T) {
+ 		t.Parallel()
+ 		townRoot := t.TempDir()
+ 		dir := filepath.Join(townRoot, "myrig", "directives")
+-		if err := os.MkdirAll(dir, 0755); err != nil {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if err := os.WriteFile(filepath.Join(dir, "witness.md"), []byte("Watch closely."), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(dir, "witness.md"), []byte("Watch closely."), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 
+@@ -92,18 +97,18 @@ func TestOutputRoleDirectives(t *testing.T) {
+ 		townRoot := t.TempDir()
+ 
+ 		townDir := filepath.Join(townRoot, "directives")
+-		if err := os.MkdirAll(townDir, 0755); err != nil {
++		if err := os.MkdirAll(townDir, 0o755); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if err := os.WriteFile(filepath.Join(townDir, "polecat.md"), []byte("Town rule."), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(townDir, "polecat.md"), []byte("Town rule."), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 
+ 		rigDir := filepath.Join(townRoot, "myrig", "directives")
+-		if err := os.MkdirAll(rigDir, 0755); err != nil {
++		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if err := os.WriteFile(filepath.Join(rigDir, "polecat.md"), []byte("Rig rule."), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(rigDir, "polecat.md"), []byte("Rig rule."), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 
+@@ -155,10 +160,10 @@ func TestOutputRoleDirectives(t *testing.T) {
+ 		townRoot := t.TempDir()
+ 
+ 		townDir := filepath.Join(townRoot, "directives")
+-		if err := os.MkdirAll(townDir, 0755); err != nil {
++		if err := os.MkdirAll(townDir, 0o755); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if err := os.WriteFile(filepath.Join(townDir, "mayor.md"), []byte("Mayor directive."), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(townDir, "mayor.md"), []byte("Mayor directive."), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 
+@@ -180,3 +185,193 @@ func TestOutputRoleDirectives(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// TestOutputPrimeContextLite covers the Lever A steady-state patrol prime
++// (gfork-47p.4): under primeLiteMode, deacon/witness get a ~5-line identity
++// block instead of the full role template.
++func TestOutputPrimeContextLite(t *testing.T) {
++	origLite := primeLiteMode
++	defer func() { primeLiteMode = origLite }()
++
++	t.Run("deacon gets lite block with formula pointer", func(t *testing.T) {
++		primeLiteMode = true
++		ctx := RoleContext{Role: RoleDeacon, Rig: ""}
++
++		output := captureStdout(t, func() {
++			formula, err := outputPrimeContext(ctx)
++			if err != nil {
++				t.Fatalf("outputPrimeContext: %v", err)
++			}
++			if formula != "" {
++				t.Errorf("expected empty formula return for lite path, got %q", formula)
++			}
++		})
++
++		if !strings.Contains(output, "Deacon") {
++			t.Errorf("expected identity to mention Deacon, got:\n%s", output)
++		}
++		if !strings.Contains(output, "gt prime") {
++			t.Errorf("expected pointer to full 'gt prime', got:\n%s", output)
++		}
++		if !strings.Contains(output, "gt formula show "+constants.MolDeaconPatrol) {
++			t.Errorf("expected pointer to full step text via formula show, got:\n%s", output)
++		}
++		if len(output) > 500 {
++			t.Errorf("lite prime context should be small (~5 lines), got %d bytes:\n%s", len(output), output)
++		}
++	})
++
++	t.Run("witness gets lite block with formula pointer and rig name", func(t *testing.T) {
++		primeLiteMode = true
++		ctx := RoleContext{Role: RoleWitness, Rig: "gastown"}
++
++		output := captureStdout(t, func() {
++			outputPrimeContext(ctx)
++		})
++
++		if !strings.Contains(output, "Witness") {
++			t.Errorf("expected identity to mention Witness, got:\n%s", output)
++		}
++		if !strings.Contains(output, "gastown") {
++			t.Errorf("expected rig name in identity, got:\n%s", output)
++		}
++		if !strings.Contains(output, "gt formula show "+constants.MolWitnessPatrol) {
++			t.Errorf("expected pointer to full step text via formula show, got:\n%s", output)
++		}
++	})
++
++	t.Run("refinery is carved out — full template even under primeLiteMode", func(t *testing.T) {
++		primeLiteMode = true
++		ctx := RoleContext{Role: RoleRefinery, Rig: "gastown"}
++
++		output := captureStdout(t, func() {
++			outputPrimeContext(ctx)
++		})
++
++		if strings.Contains(output, "steady-state patrol cycle") {
++			t.Errorf("refinery must NOT get the lite prime context under primeLiteMode, got:\n%s", output)
++		}
++	})
++
++	t.Run("no primeLiteMode — deacon gets full template, not the lite block", func(t *testing.T) {
++		primeLiteMode = false
++		ctx := RoleContext{Role: RoleDeacon, Rig: ""}
++
++		output := captureStdout(t, func() {
++			outputPrimeContext(ctx)
++		})
++
++		if strings.Contains(output, "steady-state patrol cycle") {
++			t.Errorf("deacon should get the full template when primeLiteMode is false, got:\n%s", output)
++		}
++	})
++}
++
++// TestOutputStartupDirectiveLite covers the Lever A startup-directive tier
++// under primeLiteMode: deacon/witness collapse to "Begin patrol at step 1.",
++// refinery keeps its full startup protocol (carve-out), and the parked/
++// paused correctness gates are preserved even in the lite tier.
++func TestOutputStartupDirectiveLite(t *testing.T) {
++	origLite := primeLiteMode
++	defer func() { primeLiteMode = origLite }()
++
++	t.Run("witness not parked: collapses to Begin patrol", func(t *testing.T) {
++		primeLiteMode = true
++		townRoot := t.TempDir()
++		ctx := RoleContext{Role: RoleWitness, TownRoot: townRoot, Rig: "gastown"}
++
++		output := captureStdout(t, func() {
++			outputStartupDirective(ctx)
++		})
++
++		if !strings.Contains(output, "Begin patrol at step 1.") {
++			t.Errorf("expected lite startup directive, got:\n%s", output)
++		}
++		if strings.Contains(output, "STARTUP PROTOCOL") {
++			t.Errorf("expected the full STARTUP PROTOCOL block to be suppressed, got:\n%s", output)
++		}
++	})
++
++	t.Run("witness parked: parked message preserved even in lite tier", func(t *testing.T) {
++		primeLiteMode = true
++		townRoot := t.TempDir()
++		rigName := "testrig"
++
++		configDir := filepath.Join(townRoot, wisp.WispConfigDir, wisp.ConfigSubdir)
++		if err := os.MkdirAll(configDir, 0o755); err != nil {
++			t.Fatalf("create wisp config dir: %v", err)
++		}
++		configFile := filepath.Join(configDir, rigName+".json")
++		data, _ := json.Marshal(wisp.ConfigFile{
++			Rig:    rigName,
++			Values: map[string]interface{}{"status": "parked"},
++		})
++		if err := os.WriteFile(configFile, data, 0o644); err != nil {
++			t.Fatalf("write wisp config: %v", err)
++		}
++
++		ctx := RoleContext{Role: RoleWitness, TownRoot: townRoot, Rig: rigName}
++		output := captureStdout(t, func() {
++			outputStartupDirective(ctx)
++		})
++
++		if !strings.Contains(output, "No patrol needed. Exit cleanly.") {
++			t.Errorf("parked-rig gate must be preserved under primeLiteMode, got:\n%s", output)
++		}
++		if strings.Contains(output, "Begin patrol at step 1.") {
++			t.Errorf("parked rig should not also get the patrol-start line, got:\n%s", output)
++		}
++	})
++
++	t.Run("deacon not paused: collapses to Begin patrol", func(t *testing.T) {
++		primeLiteMode = true
++		townRoot := t.TempDir()
++		ctx := RoleContext{Role: RoleDeacon, TownRoot: townRoot}
++
++		output := captureStdout(t, func() {
++			outputStartupDirective(ctx)
++		})
++
++		if !strings.Contains(output, "Begin patrol at step 1.") {
++			t.Errorf("expected lite startup directive, got:\n%s", output)
++		}
++	})
++
++	t.Run("deacon paused: pause gate preserved, no output", func(t *testing.T) {
++		primeLiteMode = true
++		townRoot := t.TempDir()
++		if err := deacon.Pause(townRoot, "test", "human"); err != nil {
++			t.Fatalf("deacon.Pause: %v", err)
++		}
++		ctx := RoleContext{Role: RoleDeacon, TownRoot: townRoot}
++
++		output := captureStdout(t, func() {
++			outputStartupDirective(ctx)
++		})
++
++		if output != "" {
++			t.Errorf("paused deacon should print nothing under primeLiteMode, got:\n%s", output)
++		}
++	})
++
++	t.Run("refinery carve-out: full startup protocol even under primeLiteMode", func(t *testing.T) {
++		primeLiteMode = true
++		townRoot := t.TempDir()
++		ctx := RoleContext{Role: RoleRefinery, TownRoot: townRoot, Rig: "gastown"}
++
++		if handled := outputStartupDirectiveLite(ctx); handled {
++			t.Fatalf("outputStartupDirectiveLite should not handle refinery (carve-out)")
++		}
++
++		output := captureStdout(t, func() {
++			outputStartupDirective(ctx)
++		})
++
++		if !strings.Contains(output, "STARTUP PROTOCOL") || !strings.Contains(output, "Refinery") {
++			t.Errorf("refinery must keep its full startup protocol under primeLiteMode, got:\n%s", output)
++		}
++		if strings.Contains(output, "Begin patrol at step 1.") {
++			t.Errorf("refinery should not get the lite patrol-start line, got:\n%s", output)
++		}
++	})
++}
+diff --git a/internal/cmd/prime_test.go b/internal/cmd/prime_test.go
+index 035bbd1b..1276d995 100644
+--- a/internal/cmd/prime_test.go
++++ b/internal/cmd/prime_test.go
+@@ -49,7 +49,7 @@ func captureStdout(t *testing.T, fn func()) string {
+ func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
+ 	t.Helper()
+ 	beadsDir := filepath.Join(townRoot, ".beads")
+-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
++	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+ 		t.Fatalf("create beads dir: %v", err)
+ 	}
+ 	if err := beads.WriteRoutes(beadsDir, routes); err != nil {
+@@ -206,13 +206,13 @@ func TestCheckHandoffMarkerDryRun(t *testing.T) {
+ 
+ 	// Create .runtime directory and handoff marker
+ 	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 		t.Fatalf("create runtime dir: %v", err)
+ 	}
+ 
+ 	markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+ 	prevSession := "test-session-123"
+-	if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
++	if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
+ 		t.Fatalf("write handoff marker: %v", err)
+ 	}
+ 
+@@ -252,7 +252,7 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
+ 
+ 	// Create .runtime directory but no marker
+ 	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 		t.Fatalf("create runtime dir: %v", err)
+ 	}
+ 
+@@ -296,12 +296,12 @@ func TestDetectSessionState(t *testing.T) {
+ 
+ 		// Create handoff marker
+ 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 			t.Fatalf("create runtime dir: %v", err)
+ 		}
+ 		prevSession := "predecessor-session-abc"
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
++		if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
+ 			t.Fatalf("write handoff marker: %v", err)
+ 		}
+ 
+@@ -501,12 +501,12 @@ func TestOutputState(t *testing.T) {
+ 
+ 		// Create handoff marker
+ 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 			t.Fatalf("create runtime dir: %v", err)
+ 		}
+ 		prevSession := "prev-session-xyz"
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		if err := os.WriteFile(markerPath, []byte(prevSession), 0644); err != nil {
++		if err := os.WriteFile(markerPath, []byte(prevSession), 0o644); err != nil {
+ 			t.Fatalf("write marker: %v", err)
+ 		}
+ 
+@@ -596,7 +596,7 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
+ 
+ 	// Set up minimal workspace structure
+ 	beadsDir := filepath.Join(townRoot, ".beads")
+-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
++	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+ 		t.Fatalf("create beads dir: %v", err)
+ 	}
+ 
+@@ -608,11 +608,11 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
+ 
+ 	// Create handoff marker that should NOT be removed in dry-run
+ 	runtimeDir := filepath.Join(townRoot, constants.DirRuntime)
+-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 		t.Fatalf("create runtime dir: %v", err)
+ 	}
+ 	markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-	if err := os.WriteFile(markerPath, []byte("prev-session"), 0644); err != nil {
++	if err := os.WriteFile(markerPath, []byte("prev-session"), 0o644); err != nil {
+ 		t.Fatalf("write marker: %v", err)
+ 	}
+ 
+@@ -707,6 +707,32 @@ func TestIsCompactResume(t *testing.T) {
+ 	}
+ }
+ 
++// TestShouldUsePrimeLiteMode covers the Lever A gate (gfork-47p.4): only a
++// "patrol-cycle" marker reason triggers the lighter steady-state prime tier.
++// A marker-less respawn (empty reason) or any other reason (e.g.
++// "compaction", already routed through isCompactResume above) takes the
++// normal full-prime path.
++func TestShouldUsePrimeLiteMode(t *testing.T) {
++	cases := []struct {
++		name          string
++		handoffReason string
++		want          bool
++	}{
++		{"patrol-cycle marker triggers lite mode", "patrol-cycle", true},
++		{"no marker (empty reason) stays full", "", false},
++		{"compaction reason stays full (handled by isCompactResume)", "compaction", false},
++		{"unrelated reason stays full", "idle", false},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := shouldUsePrimeLiteMode(tc.handoffReason); got != tc.want {
++				t.Fatalf("shouldUsePrimeLiteMode(%q) = %v, want %v", tc.handoffReason, got, tc.want)
++			}
++		})
++	}
++}
++
+ func TestHookSessionBeaconLines(t *testing.T) {
+ 	origStructured := primeStructuredSessionStartOutput
+ 	defer func() {
+@@ -777,13 +803,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
+ 		workDir := t.TempDir()
+ 
+ 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 			t.Fatalf("create runtime dir: %v", err)
+ 		}
+ 
+ 		// Write marker with session ID and reason
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		if err := os.WriteFile(markerPath, []byte("test-session-456\ncompaction"), 0644); err != nil {
++		if err := os.WriteFile(markerPath, []byte("test-session-456\ncompaction"), 0o644); err != nil {
+ 			t.Fatalf("write marker: %v", err)
+ 		}
+ 
+@@ -808,13 +834,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
+ 		workDir := t.TempDir()
+ 
+ 		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
+-		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+ 			t.Fatalf("create runtime dir: %v", err)
+ 		}
+ 
+ 		// Write marker with session ID only (backward compat)
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		if err := os.WriteFile(markerPath, []byte("test-session-789"), 0644); err != nil {
++		if err := os.WriteFile(markerPath, []byte("test-session-789"), 0o644); err != nil {
+ 			t.Fatalf("write marker: %v", err)
+ 		}
+ 
+@@ -955,10 +981,10 @@ func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
+ 	rigRoot := filepath.Join(townRoot, "testrig")
+ 	witnessDir := filepath.Join(rigRoot, "witness")
+ 	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
++	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir witness dir: %v", err)
+ 	}
+-	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorBeadsDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir mayor beads dir: %v", err)
+ 	}
+ 
+@@ -988,26 +1014,26 @@ func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
+ 	workDir := filepath.Join(rigRoot, "polecats", "worker1", "testrig")
+ 	workBeadsDir := filepath.Join(workDir, ".beads")
+ 
+-	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorBeadsDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir mayor beads dir: %v", err)
+ 	}
+-	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
++	if err := os.MkdirAll(rigBeadsDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir rig beads dir: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0o644); err != nil {
+ 		t.Fatalf("write rig redirect: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0o644); err != nil {
+ 		t.Fatalf("write rig metadata: %v", err)
+ 	}
+-	if err := os.MkdirAll(workBeadsDir, 0755); err != nil {
++	if err := os.MkdirAll(workBeadsDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir work beads dir: %v", err)
+ 	}
+ 
+ 	// Old polecat worktrees can keep this bd-incompatible chain:
+ 	// worktree/.beads -> rig/.beads -> mayor/rig/.beads.
+ 	redirectPath := filepath.Join(workBeadsDir, "redirect")
+-	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0644); err != nil {
++	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0o644); err != nil {
+ 		t.Fatalf("write stale redirect: %v", err)
+ 	}
+ 
+diff --git a/internal/nudge/queue.go b/internal/nudge/queue.go
+index 89ac160c..71994510 100644
+--- a/internal/nudge/queue.go
++++ b/internal/nudge/queue.go
+@@ -91,7 +91,7 @@ func randomSuffix() string {
+ // Returns an error if the queue is full (MaxQueueDepth reached).
+ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
+ 	dir := queueDir(townRoot, session)
+-	if err := os.MkdirAll(dir, 0755); err != nil {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return fmt.Errorf("creating nudge queue dir: %w", err)
+ 	}
+ 
+@@ -130,7 +130,7 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
+ 	filename := fmt.Sprintf("%d-%s.json", nudge.Timestamp.UnixNano(), randomSuffix())
+ 	path := filepath.Join(dir, filename)
+ 
+-	if err := os.WriteFile(path, data, 0644); err != nil {
++	if err := os.WriteFile(path, data, 0o644); err != nil {
+ 		return fmt.Errorf("writing nudge to queue: %w", err)
+ 	}
+ 
+@@ -365,12 +365,51 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
+ 	return removed, nil
+ }
+ 
++// dedupKey identifies nudges that carry the same signal for de-dup purposes.
++type dedupKey struct {
++	sender  string
++	message string
++	kind    string
++}
++
++// dedupNudges collapses nudges sharing the same (Sender, Message, Kind) into
++// a single entry, keeping the most recent occurrence (nudges arrive in FIFO
++// order, so the last match is the latest) and annotating its message with
++// "(xN)" when collapsed from more than one. This trims repeated spam (e.g.
++// a HEALTH_CHECK nudge re-sent every cycle) without dropping the signal —
++// the count stays visible, the line just isn't repeated N times.
++func dedupNudges(nudges []QueuedNudge) []QueuedNudge {
++	counts := make(map[dedupKey]int, len(nudges))
++	latest := make(map[dedupKey]QueuedNudge, len(nudges))
++	order := make([]dedupKey, 0, len(nudges))
++
++	for _, n := range nudges {
++		k := dedupKey{n.Sender, n.Message, n.Kind}
++		if counts[k] == 0 {
++			order = append(order, k)
++		}
++		counts[k]++
++		latest[k] = n
++	}
++
++	deduped := make([]QueuedNudge, 0, len(order))
++	for _, k := range order {
++		n := latest[k]
++		if counts[k] > 1 {
++			n.Message = fmt.Sprintf("%s (x%d)", n.Message, counts[k])
++		}
++		deduped = append(deduped, n)
++	}
++	return deduped
++}
++
+ // FormatForInjection formats queued nudges as a system-reminder block
+ // suitable for Claude Code hook output.
+ func FormatForInjection(nudges []QueuedNudge) string {
+ 	if len(nudges) == 0 {
+ 		return ""
+ 	}
++	nudges = dedupNudges(nudges)
+ 
+ 	var b strings.Builder
+ 	b.WriteString("<system-reminder>\n")
+diff --git a/internal/nudge/queue_test.go b/internal/nudge/queue_test.go
+index 8a53f33d..ff1f4b77 100644
+--- a/internal/nudge/queue_test.go
++++ b/internal/nudge/queue_test.go
+@@ -88,10 +88,10 @@ func TestDrainSkipsMalformed(t *testing.T) {
+ 
+ 	// Create queue dir and a malformed file
+ 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+-	if err := os.MkdirAll(dir, 0755); err != nil {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte("not json"), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte("not json"), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+@@ -172,6 +172,90 @@ func TestFormatForInjection_Empty(t *testing.T) {
+ 	}
+ }
+ 
++// TestDedupNudges covers the Lever C nudge coalescing (gfork-47p.4):
++// identical (Sender, Message, Kind) nudges collapse to one line with a
++// "(xN)" suffix, keeping the most recent occurrence.
++func TestDedupNudges(t *testing.T) {
++	tests := []struct {
++		name        string
++		nudges      []QueuedNudge
++		wantLen     int
++		wantMessage []string // expected Message per output index
++	}{
++		{
++			name: "no duplicates: passthrough unchanged",
++			nudges: []QueuedNudge{
++				{Sender: "mayor", Message: "Check status", Kind: "health"},
++				{Sender: "witness", Message: "Polecat stuck", Kind: "escalation"},
++			},
++			wantLen:     2,
++			wantMessage: []string{"Check status", "Polecat stuck"},
++		},
++		{
++			name: "identical sender+message+kind collapse with count suffix",
++			nudges: []QueuedNudge{
++				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
++				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
++				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
++			},
++			wantLen:     1,
++			wantMessage: []string{"HEALTH_CHECK (x3)"},
++		},
++		{
++			name: "different kind is NOT collapsed even with same sender+message",
++			nudges: []QueuedNudge{
++				{Sender: "mayor", Message: "same text", Kind: "health"},
++				{Sender: "mayor", Message: "same text", Kind: "escalation"},
++			},
++			wantLen:     2,
++			wantMessage: []string{"same text", "same text"},
++		},
++		{
++			name: "mixed: one duplicate pair, one unique, preserves FIFO order",
++			nudges: []QueuedNudge{
++				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
++				{Sender: "witness", Message: "Polecat stuck", Kind: "escalation"},
++				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
++			},
++			wantLen:     2,
++			wantMessage: []string{"HEALTH_CHECK (x2)", "Polecat stuck"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := dedupNudges(tt.nudges)
++			if len(got) != tt.wantLen {
++				t.Fatalf("dedupNudges() len = %d, want %d (got %+v)", len(got), tt.wantLen, got)
++			}
++			for i, want := range tt.wantMessage {
++				if got[i].Message != want {
++					t.Errorf("dedupNudges()[%d].Message = %q, want %q", i, got[i].Message, want)
++				}
++			}
++		})
++	}
++}
++
++// TestFormatForInjection_DedupsRepeatedNudges verifies the coalescing is
++// wired into FormatForInjection: a nudge repeated across cycles renders once
++// with a count suffix instead of one line per occurrence.
++func TestFormatForInjection_DedupsRepeatedNudges(t *testing.T) {
++	nudges := []QueuedNudge{
++		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
++		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
++		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
++	}
++	output := FormatForInjection(nudges)
++
++	if !strings.Contains(output, "HEALTH_CHECK (x3)") {
++		t.Errorf("expected collapsed count suffix, got:\n%s", output)
++	}
++	if strings.Count(output, "HEALTH_CHECK") != 1 {
++		t.Errorf("expected HEALTH_CHECK to appear exactly once (collapsed), got:\n%s", output)
++	}
++}
++
+ func TestPendingNonexistentDir(t *testing.T) {
+ 	count, err := Pending("/nonexistent/path", "session")
+ 	if err != nil {
+@@ -380,14 +464,14 @@ func TestDrainSweepsOrphanedClaims(t *testing.T) {
+ 	session := "gt-test-orphans"
+ 
+ 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+-	if err := os.MkdirAll(dir, 0755); err != nil {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+ 	// Create an orphaned .claimed file with old mod time
+ 	// Claim files now use the format: <original>.json.claimed.<suffix>
+ 	orphanPath := filepath.Join(dir, "100.json.claimed.deadbeef")
+-	if err := os.WriteFile(orphanPath, []byte(`{"sender":"ghost"}`), 0644); err != nil {
++	if err := os.WriteFile(orphanPath, []byte(`{"sender":"ghost"}`), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	// Set mod time to well past the stale threshold
+@@ -398,7 +482,7 @@ func TestDrainSweepsOrphanedClaims(t *testing.T) {
+ 
+ 	// Create a fresh .claimed file (should NOT be swept)
+ 	freshClaimPath := filepath.Join(dir, "200.json.claimed.cafebabe")
+-	if err := os.WriteFile(freshClaimPath, []byte(`{"sender":"active"}`), 0644); err != nil {
++	if err := os.WriteFile(freshClaimPath, []byte(`{"sender":"active"}`), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+
