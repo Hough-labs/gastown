@@ -1,7 +1,7 @@
 From 380b501815938144ca9bbe783204834d2403ef91 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 31 May 2026 16:00:33 -0400
-Subject: [PATCH 17/26] build(patches): retarget fork baseline upstream/main ->
+Subject: [PATCH 17/28] build(patches): retarget fork baseline upstream/main ->
  v1.2.0 tag
 
 This fork now tracks the v1.2.0 release tag, not upstream/main (which has
