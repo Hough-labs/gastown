@@ -998,3 +998,35 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 		}
 	})
 }
+
+// TestPatrolCycleReason covers the Lever A marker-reason auto-derive
+// (gfork-47p.4): a normal `gt handoff` from a patrol role writes a
+// "patrol-cycle" reason so the successor's next `gt prime` can offer the
+// lighter steady-state payload, without requiring any formula change.
+func TestPatrolCycleReason(t *testing.T) {
+	tests := []struct {
+		name           string
+		explicitReason string
+		gtRole         string
+		want           string
+	}{
+		{"explicit reason always wins", "compaction", "gastown/witness", "compaction"},
+		{"explicit reason wins even for non-patrol role", "idle", "gastown/crew/max", "idle"},
+		{"witness auto-derives patrol-cycle", "", "gastown/witness", "patrol-cycle"},
+		{"refinery auto-derives patrol-cycle", "", "gastown/refinery", "patrol-cycle"},
+		{"deacon (town-level, simple GT_ROLE) auto-derives patrol-cycle", "", "deacon", "patrol-cycle"},
+		{"crew gets no reason", "", "gastown/crew/max", ""},
+		{"polecat gets no reason", "", "gastown/polecats/toast", ""},
+		{"mayor gets no reason", "", "mayor", ""},
+		{"empty gtRole (unparseable session) gets no reason", "", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := patrolCycleReason(tt.explicitReason, tt.gtRole); got != tt.want {
+				t.Errorf("patrolCycleReason(%q, %q) = %q, want %q",
+					tt.explicitReason, tt.gtRole, got, tt.want)
+			}
+		})
+	}
+}

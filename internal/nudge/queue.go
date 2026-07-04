@@ -91,7 +91,7 @@ func randomSuffix() string {
 // Returns an error if the queue is full (MaxQueueDepth reached).
 func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	dir := queueDir(townRoot, session)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating nudge queue dir: %w", err)
 	}
 
@@ -130,7 +130,7 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	filename := fmt.Sprintf("%d-%s.json", nudge.Timestamp.UnixNano(), randomSuffix())
 	path := filepath.Join(dir, filename)
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("writing nudge to queue: %w", err)
 	}
 
@@ -365,12 +365,51 @@ func RemoveKindByThread(townRoot, session, kind, threadID string) (int, error) {
 	return removed, nil
 }
 
+// dedupKey identifies nudges that carry the same signal for de-dup purposes.
+type dedupKey struct {
+	sender  string
+	message string
+	kind    string
+}
+
+// dedupNudges collapses nudges sharing the same (Sender, Message, Kind) into
+// a single entry, keeping the most recent occurrence (nudges arrive in FIFO
+// order, so the last match is the latest) and annotating its message with
+// "(xN)" when collapsed from more than one. This trims repeated spam (e.g.
+// a HEALTH_CHECK nudge re-sent every cycle) without dropping the signal —
+// the count stays visible, the line just isn't repeated N times.
+func dedupNudges(nudges []QueuedNudge) []QueuedNudge {
+	counts := make(map[dedupKey]int, len(nudges))
+	latest := make(map[dedupKey]QueuedNudge, len(nudges))
+	order := make([]dedupKey, 0, len(nudges))
+
+	for _, n := range nudges {
+		k := dedupKey{n.Sender, n.Message, n.Kind}
+		if counts[k] == 0 {
+			order = append(order, k)
+		}
+		counts[k]++
+		latest[k] = n
+	}
+
+	deduped := make([]QueuedNudge, 0, len(order))
+	for _, k := range order {
+		n := latest[k]
+		if counts[k] > 1 {
+			n.Message = fmt.Sprintf("%s (x%d)", n.Message, counts[k])
+		}
+		deduped = append(deduped, n)
+	}
+	return deduped
+}
+
 // FormatForInjection formats queued nudges as a system-reminder block
 // suitable for Claude Code hook output.
 func FormatForInjection(nudges []QueuedNudge) string {
 	if len(nudges) == 0 {
 		return ""
 	}
+	nudges = dedupNudges(nudges)
 
 	var b strings.Builder
 	b.WriteString("<system-reminder>\n")

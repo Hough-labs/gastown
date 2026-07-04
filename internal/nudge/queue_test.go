@@ -88,10 +88,10 @@ func TestDrainSkipsMalformed(t *testing.T) {
 
 	// Create queue dir and a malformed file
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte("not json"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte("not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -169,6 +169,90 @@ func TestFormatForInjection_Empty(t *testing.T) {
 	output := FormatForInjection(nil)
 	if output != "" {
 		t.Errorf("FormatForInjection(nil) = %q, want empty", output)
+	}
+}
+
+// TestDedupNudges covers the Lever C nudge coalescing (gfork-47p.4):
+// identical (Sender, Message, Kind) nudges collapse to one line with a
+// "(xN)" suffix, keeping the most recent occurrence.
+func TestDedupNudges(t *testing.T) {
+	tests := []struct {
+		name        string
+		nudges      []QueuedNudge
+		wantLen     int
+		wantMessage []string // expected Message per output index
+	}{
+		{
+			name: "no duplicates: passthrough unchanged",
+			nudges: []QueuedNudge{
+				{Sender: "mayor", Message: "Check status", Kind: "health"},
+				{Sender: "witness", Message: "Polecat stuck", Kind: "escalation"},
+			},
+			wantLen:     2,
+			wantMessage: []string{"Check status", "Polecat stuck"},
+		},
+		{
+			name: "identical sender+message+kind collapse with count suffix",
+			nudges: []QueuedNudge{
+				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
+				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
+				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
+			},
+			wantLen:     1,
+			wantMessage: []string{"HEALTH_CHECK (x3)"},
+		},
+		{
+			name: "different kind is NOT collapsed even with same sender+message",
+			nudges: []QueuedNudge{
+				{Sender: "mayor", Message: "same text", Kind: "health"},
+				{Sender: "mayor", Message: "same text", Kind: "escalation"},
+			},
+			wantLen:     2,
+			wantMessage: []string{"same text", "same text"},
+		},
+		{
+			name: "mixed: one duplicate pair, one unique, preserves FIFO order",
+			nudges: []QueuedNudge{
+				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
+				{Sender: "witness", Message: "Polecat stuck", Kind: "escalation"},
+				{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health"},
+			},
+			wantLen:     2,
+			wantMessage: []string{"HEALTH_CHECK (x2)", "Polecat stuck"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dedupNudges(tt.nudges)
+			if len(got) != tt.wantLen {
+				t.Fatalf("dedupNudges() len = %d, want %d (got %+v)", len(got), tt.wantLen, got)
+			}
+			for i, want := range tt.wantMessage {
+				if got[i].Message != want {
+					t.Errorf("dedupNudges()[%d].Message = %q, want %q", i, got[i].Message, want)
+				}
+			}
+		})
+	}
+}
+
+// TestFormatForInjection_DedupsRepeatedNudges verifies the coalescing is
+// wired into FormatForInjection: a nudge repeated across cycles renders once
+// with a count suffix instead of one line per occurrence.
+func TestFormatForInjection_DedupsRepeatedNudges(t *testing.T) {
+	nudges := []QueuedNudge{
+		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
+		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
+		{Sender: "mayor", Message: "HEALTH_CHECK", Kind: "health", Priority: PriorityNormal},
+	}
+	output := FormatForInjection(nudges)
+
+	if !strings.Contains(output, "HEALTH_CHECK (x3)") {
+		t.Errorf("expected collapsed count suffix, got:\n%s", output)
+	}
+	if strings.Count(output, "HEALTH_CHECK") != 1 {
+		t.Errorf("expected HEALTH_CHECK to appear exactly once (collapsed), got:\n%s", output)
 	}
 }
 
@@ -380,14 +464,14 @@ func TestDrainSweepsOrphanedClaims(t *testing.T) {
 	session := "gt-test-orphans"
 
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create an orphaned .claimed file with old mod time
 	// Claim files now use the format: <original>.json.claimed.<suffix>
 	orphanPath := filepath.Join(dir, "100.json.claimed.deadbeef")
-	if err := os.WriteFile(orphanPath, []byte(`{"sender":"ghost"}`), 0644); err != nil {
+	if err := os.WriteFile(orphanPath, []byte(`{"sender":"ghost"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Set mod time to well past the stale threshold
@@ -398,7 +482,7 @@ func TestDrainSweepsOrphanedClaims(t *testing.T) {
 
 	// Create a fresh .claimed file (should NOT be swept)
 	freshClaimPath := filepath.Join(dir, "200.json.claimed.cafebabe")
-	if err := os.WriteFile(freshClaimPath, []byte(`{"sender":"active"}`), 0644); err != nil {
+	if err := os.WriteFile(freshClaimPath, []byte(`{"sender":"active"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
