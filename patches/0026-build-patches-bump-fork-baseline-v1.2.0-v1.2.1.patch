@@ -1,7 +1,7 @@
 From e7e3073779fe37be77d57323b1b3ffefded8859f Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 3 Jul 2026 23:35:40 -0400
-Subject: [PATCH 26/29] build(patches): bump fork baseline v1.2.0 -> v1.2.1
+Subject: [PATCH 26/30] build(patches): bump fork baseline v1.2.0 -> v1.2.1
 
 Rebased the local patch stack onto the released v1.2.1 tag, dropping four
 patches upstream now subsumes (costs-record polecat Stop 0005/0018 via the
