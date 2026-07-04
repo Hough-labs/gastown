@@ -140,8 +140,21 @@ func CurrentContextTokens(projectDir string, since time.Time) (int, error) {
 			continue
 		}
 		u := entry.Message.Usage
-		return u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens, nil
+		total := u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+		if total == 0 {
+			// A trailing usage event with all-zero token fields is a synthetic
+			// turn — Claude Code emits one for server_tool_use (web search/fetch)
+			// and interrupted/empty turns. It does NOT reflect the session's real
+			// context, so skip it and fall through to the most recent event that
+			// carries a real snapshot. Returning 0 here would make the watchdog
+			// read a loaded agent as empty and never fire — the exact idle-wedge
+			// this feature exists to prevent, defeated by a tool-use turn landing
+			// last. Verified against a live witness JSONL (gfork-47p.2 E2E): the
+			// newest event was a zero-token web-search turn masking a 45k context.
+			continue
+		}
+		return total, nil
 	}
 
-	return 0, fmt.Errorf("no main-chain assistant usage event found in %s", path)
+	return 0, fmt.Errorf("no main-chain assistant usage event with non-zero tokens found in %s", path)
 }

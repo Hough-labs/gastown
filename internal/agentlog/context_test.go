@@ -124,6 +124,43 @@ func TestCurrentContextTokens(t *testing.T) {
 		}
 	})
 
+	t.Run("trailing zero-token turn: falls back to last real snapshot", func(t *testing.T) {
+		dir := t.TempDir()
+		// Claude Code emits a zero-token usage event for server_tool_use (web
+		// search/fetch) and interrupted turns. It lands NEWEST but does not
+		// reflect real context, so the snapshot must fall through to the last
+		// event carrying real tokens. Regression for the gfork-47p.2 E2E
+		// finding: a live witness's newest event was a zero-token web-search
+		// turn masking a ~45k context — reported 0, would never fire.
+		lines := []string{
+			ccUsageLine(false, 2, 5, 43546, 1307), // the real snapshot — golden answer
+			ccUsageLine(false, 0, 0, 0, 0),        // trailing zero-token web-search turn
+		}
+		writeJSONLFixture(t, dir, "session", lines, time.Now())
+
+		got, err := CurrentContextTokens(dir, sessionStart)
+		if err != nil {
+			t.Fatalf("CurrentContextTokens: %v", err)
+		}
+		want := 2 + 5 + 43546 + 1307
+		if got != want {
+			t.Errorf("got %d, want %d (trailing all-zero usage event must be skipped, not taken as the snapshot)", got, want)
+		}
+	})
+
+	t.Run("all zero-token turns: error, not zero", func(t *testing.T) {
+		dir := t.TempDir()
+		// If every usage event is a zero-token synthetic turn, there is no real
+		// snapshot — must error (caller skips the tick) rather than report 0,
+		// which would read a loaded agent as safely empty.
+		writeJSONLFixture(t, dir, "session",
+			[]string{ccUsageLine(false, 0, 0, 0, 0), ccUsageLine(false, 0, 0, 0, 0)},
+			time.Now())
+		if _, err := CurrentContextTokens(dir, sessionStart); err == nil {
+			t.Error("expected error when all usage events are zero-token, got nil")
+		}
+	})
+
 	t.Run("truncated last line: falls back to newest complete line", func(t *testing.T) {
 		dir := t.TempDir()
 		good := ccUsageLine(false, 10, 50, 40000, 1000)
