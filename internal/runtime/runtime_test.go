@@ -165,9 +165,39 @@ func TestStartupFallbackCommands_AutonomousRole(t *testing.T) {
 				t.Error("StartupFallbackCommands() should return commands for autonomous role")
 			}
 			for _, cmd := range commands {
-				if cmd != "gt prime" {
-					t.Fatalf("Commands for %s = %q, want gt prime", role, cmd)
+				if cmd != "gt prime --hook" {
+					t.Fatalf("Commands for %s = %q, want gt prime --hook", role, cmd)
 				}
+			}
+		})
+	}
+}
+
+// TestStartupFallbackCommands_InterruptRecoveryAutoContinues asserts that the
+// SessionStart/resume path includes --hook so the agent auto-continues a hooked
+// molecule without emitting a "should I continue?" confirmation (hq-2kaq).
+func TestStartupFallbackCommands_InterruptRecoveryAutoContinues(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+
+	for _, role := range []string{"polecat", "witness", "deacon", "refinery"} {
+		t.Run(role, func(t *testing.T) {
+			commands := StartupFallbackCommands(role, rc)
+			if len(commands) == 0 {
+				t.Fatal("StartupFallbackCommands() returned no commands")
+			}
+			found := false
+			for _, cmd := range commands {
+				if contains(cmd, "--hook") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("StartupFallbackCommands(%q) = %v; want a command containing --hook for auto-continuation", role, commands)
 			}
 		})
 	}
@@ -628,7 +658,7 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
 	// Gemini CLI has no --settings flag; settings must go to workDir (like OpenCode).
 	settingsDir := t.TempDir()
 	workDir := t.TempDir()
-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
 		t.Fatalf("write AGENTS.md: %v", err)
 	}
 
@@ -664,7 +694,7 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
 func TestEnsureSettingsForRole_GeminiRepairsBrokenContextSymlink(t *testing.T) {
 	settingsDir := t.TempDir()
 	workDir := t.TempDir()
-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
 		t.Fatalf("write AGENTS.md: %v", err)
 	}
 	if err := os.Symlink("./rig/worktree/AGENTS.md", workDir+"/GEMINI.md"); err != nil {
@@ -695,12 +725,12 @@ func TestEnsureSettingsForRole_GeminiRepairsBrokenContextSymlink(t *testing.T) {
 func TestEnsureSettingsForRole_GeminiRepairsResolvableAgentsSymlink(t *testing.T) {
 	settingsDir := t.TempDir()
 	workDir := t.TempDir()
-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
 		t.Fatalf("write AGENTS.md: %v", err)
 	}
 	otherDir := t.TempDir()
 	otherAgents := otherDir + "/AGENTS.md"
-	if err := os.WriteFile(otherAgents, []byte("# Other Agents\n"), 0644); err != nil {
+	if err := os.WriteFile(otherAgents, []byte("# Other Agents\n"), 0o644); err != nil {
 		t.Fatalf("write other AGENTS.md: %v", err)
 	}
 	if err := os.Symlink(otherAgents, workDir+"/GEMINI.md"); err != nil {
@@ -732,10 +762,10 @@ func TestEnsureSettingsForRole_GeminiPreservesGeminiOverlay(t *testing.T) {
 	settingsDir := t.TempDir()
 	workDir := t.TempDir()
 	geminiContent := []byte("# Gemini overlay\n")
-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
 		t.Fatalf("write AGENTS.md: %v", err)
 	}
-	if err := os.WriteFile(workDir+"/GEMINI.md", geminiContent, 0644); err != nil {
+	if err := os.WriteFile(workDir+"/GEMINI.md", geminiContent, 0o644); err != nil {
 		t.Fatalf("write GEMINI.md: %v", err)
 	}
 
@@ -880,10 +910,10 @@ func TestRuntimeConfigWithMinDelay_ZeroMin(t *testing.T) {
 func makeTownRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	if err := os.MkdirAll(root+"/mayor", 0755); err != nil {
+	if err := os.MkdirAll(root+"/mayor", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(root+"/mayor/town.json", []byte(`{"type":"town"}`), 0644); err != nil {
+	if err := os.WriteFile(root+"/mayor/town.json", []byte(`{"type":"town"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return root
@@ -892,7 +922,7 @@ func makeTownRoot(t *testing.T) string {
 func makeTownRootWithGit(t *testing.T) string {
 	t.Helper()
 	root := makeTownRoot(t)
-	if err := os.MkdirAll(root+"/.git", 0755); err != nil {
+	if err := os.MkdirAll(root+"/.git", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return root
@@ -933,7 +963,7 @@ func TestCommandsInherited_NestedGitRepoInsideTownRoot(t *testing.T) {
 	// Code stops at that repo boundary, so they need explicit command provisioning.
 	root := makeTownRootWithGit(t)
 	workDir := root + "/rig/polecats/chrome/repo"
-	if err := os.MkdirAll(workDir+"/.git", 0755); err != nil {
+	if err := os.MkdirAll(workDir+"/.git", 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -945,11 +975,11 @@ func TestCommandsInherited_NestedGitRepoInsideTownRoot(t *testing.T) {
 func TestCommandsInherited_WorkDirIsOutsideTownRoot(t *testing.T) {
 	// workDir in a standalone git repo that is NOT a Gas Town workspace → not inherited
 	dir := t.TempDir()
-	if err := os.MkdirAll(dir+"/.git", 0755); err != nil {
+	if err := os.MkdirAll(dir+"/.git", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	subDir := dir + "/src"
-	if err := os.MkdirAll(subDir, 0755); err != nil {
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -974,7 +1004,7 @@ func TestEnsureSettingsForRole_SkipsCommandsWhenInheritedFromTownRoot(t *testing
 	// EnsureSettingsForRole must NOT provision a duplicate copy in the role dir.
 	root := makeTownRootWithGit(t)
 	mayorDir := root + "/mayor"
-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
