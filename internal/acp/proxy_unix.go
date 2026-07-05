@@ -54,7 +54,7 @@ func (p *Proxy) terminateProcess() {
 		}
 
 		time.AfterFunc(2*time.Second, func() {
-			if p.cmd.ProcessState == nil || !p.cmd.ProcessState.Exited() {
+			if !p.processExited.Load() {
 				if pgid == 0 {
 					pgid, _ = syscall.Getpgid(p.cmd.Process.Pid)
 				}
