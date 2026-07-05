@@ -792,13 +792,14 @@ func (d *Daemon) closeMessage(id string) error {
 
 // AgentBeadInfo represents the parsed fields from an agent bead.
 type AgentBeadInfo struct {
-	ID         string `json:"id"`
-	Type       string `json:"issue_type"`
-	State      string // From description agent_state, fallback to legacy DB column
-	HookBead   string // From DB column (hook_bead)
-	RoleType   string // Parsed from description: role_type
-	Rig        string // Parsed from description: rig
-	LastUpdate string `json:"updated_at"`
+	ID         string   `json:"id"`
+	Type       string   `json:"issue_type"`
+	State      string   // From description agent_state, fallback to legacy DB column
+	HookBead   string   // From DB column (hook_bead)
+	RoleType   string   // Parsed from description: role_type
+	Rig        string   // Parsed from description: rig
+	LastUpdate string   `json:"updated_at"`
+	Labels     []string // Raw bead labels (e.g. backoff-until:TIMESTAMP for await-signal)
 	// Note: RoleBead field removed - role definitions are now config-based
 }
 
@@ -877,6 +878,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	// Use HookBead from database column directly (not from description)
 	// The description may contain stale data - the slot is the source of truth.
 	info.HookBead = issue.HookBead
+	info.Labels = issue.Labels
 
 	return info, nil
 }

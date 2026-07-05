@@ -98,6 +98,12 @@ type Daemon struct {
 	// no sync needed.
 	contextNudgeLast map[string]time.Time
 
+	// idleAtPromptForcedLast tracks when a turn-boundary was last forced for
+	// each session by the idle-at-prompt watchdog (checkIdleAtPromptSessions).
+	// Enforces idleAtPromptForceCooldown. Lazily initialized on first write.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	idleAtPromptForcedLast map[string]time.Time
+
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
 
@@ -967,6 +973,11 @@ func (d *Daemon) heartbeat(state *State) {
 	// refinery, deacon) whose Claude Code session context has crossed the
 	// YELLOW threshold, before they hit RED and wedge idle-at-prompt (gfork-47p.2).
 	d.checkContextPressure()
+
+	// 12d. Idle-at-prompt watchdog: force a turn boundary on persistent agents
+	// (deacon, witness, refinery) that have been idle-at-prompt while stale and
+	// have pending queued nudges that cannot drain without a turn boundary (hq-2kaq).
+	d.checkIdleAtPromptSessions()
 
 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
 	// These are Task tool subagents that didn't clean up after completion.
