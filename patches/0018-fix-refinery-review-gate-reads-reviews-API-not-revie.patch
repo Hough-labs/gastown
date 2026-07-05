@@ -1,7 +1,7 @@
 From 65e45072c2ed2bdc5547fe2967c1a8134334503c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 2 Jun 2026 20:37:31 -0400
-Subject: [PATCH 18/32] fix(refinery): review gate reads reviews API, not
+Subject: [PATCH 18/33] fix(refinery): review gate reads reviews API, not
  reviewDecision (free-plan/private)
 
 GitHub only populates reviewDecision when the repo enforces reviews via
