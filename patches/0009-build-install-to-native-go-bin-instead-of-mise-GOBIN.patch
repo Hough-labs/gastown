@@ -1,7 +1,7 @@
 From 33d5a307c528d171e2aa21d9e8f5b56704b49953 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 12 Apr 2026 14:17:16 -0400
-Subject: [PATCH 09/31] build: install to native ~/go/bin instead of mise GOBIN
+Subject: [PATCH 09/32] build: install to native ~/go/bin instead of mise GOBIN
 
 INSTALL_DIR was resolving to go env GOBIN which pointed at the mise
 Go shim directory. Agents prefer native tooling, so hardcode to

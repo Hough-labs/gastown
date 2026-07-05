@@ -1,7 +1,7 @@
 From e6c1c96a2fef7ffc5a1f8366b2c71669ebeb8e28 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 12:01:21 -0400
-Subject: [PATCH 31/31] feat(daemon): idle-at-prompt watchdog forces turn
+Subject: [PATCH 31/32] feat(daemon): idle-at-prompt watchdog forces turn
  boundary to drain queued nudges (hq-2kaq)
 
 Persistent agents (deacon, witness, refinery) can land idle at an interactive

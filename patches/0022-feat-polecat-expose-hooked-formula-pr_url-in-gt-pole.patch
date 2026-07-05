@@ -1,7 +1,7 @@
 From 619935666853873ce327c7b02375bbb5846036bc Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 17:07:10 -0400
-Subject: [PATCH 22/31] feat(polecat): expose hooked formula + pr_url in `gt
+Subject: [PATCH 22/32] feat(polecat): expose hooked formula + pr_url in `gt
  polecat list --json` (hq-6wd2)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

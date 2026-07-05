@@ -1,0 +1,290 @@
+From ee244a0864f997209d1008684c32630583a922c4 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 5 Jul 2026 12:31:11 -0400
+Subject: [PATCH 32/32] feat(sling): capture cwd/beads-dir/stderr on bd mol
+ bond failure (gfork-i3d diagnostics)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`gt sling`'s `bd mol bond` can fail to resolve a bead as its second operand
+("'<bead>' not found") while `bd show` still resolves it — a live stale-read /
+wrong-database condition that surfaced only as a bare "exit status 1", hiding
+which database bd actually consulted. Capture bd's stderr and record the working
+directory, the resolved .beads database, and the exact argv in the wrapped error
+for both the primary wisp->bead bond and the direct-formula fallback, so the
+next recurrence is diagnosable instead of guessed.
+
+This is instrumentation, not a fix: gfork-i3d stays open pending a live
+recurrence with these diagnostics. AllowStale() is deliberately NOT wired onto
+the mol-bond read — its flag permits stale reads, the wrong direction for a
+stale-read bug.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/sling_bond_diagnostic_test.go | 130 +++++++++++++++++++++
+ internal/cmd/sling_helpers.go              |  45 ++++++-
+ 2 files changed, 169 insertions(+), 6 deletions(-)
+ create mode 100644 internal/cmd/sling_bond_diagnostic_test.go
+
+diff --git a/internal/cmd/sling_bond_diagnostic_test.go b/internal/cmd/sling_bond_diagnostic_test.go
+new file mode 100644
+index 00000000..37b14053
+--- /dev/null
++++ b/internal/cmd/sling_bond_diagnostic_test.go
+@@ -0,0 +1,130 @@
++package cmd
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// TestBondFailureDiagnostic verifies the diagnostic string captures the context
++// needed to root-cause a stale-read / wrong-database bond failure (gfork-i3d):
++// working directory, resolved .beads database, exact bd argv, and bd stderr.
++func TestBondFailureDiagnostic(t *testing.T) {
++	workDir := t.TempDir()
++	args := []string{"mol", "bond", "gt-wisp-1", "gt-abc", "--json"}
++
++	got := bondFailureDiagnostic(workDir, args, "  'gt-abc' not found (not an issue ID or formula name)\n")
++	for _, want := range []string{
++		"cwd=" + workDir,
++		"beads_dir=",
++		"cmd=[bd mol bond gt-wisp-1 gt-abc --json]",
++		`bd_stderr="'gt-abc' not found`,
++	} {
++		if !strings.Contains(got, want) {
++			t.Errorf("diagnostic missing %q; got: %s", want, got)
++		}
++	}
++
++	// Blank stderr must not add an empty bd_stderr= segment.
++	if got := bondFailureDiagnostic(workDir, args, "   \n"); strings.Contains(got, "bd_stderr=") {
++		t.Errorf("expected no bd_stderr segment for blank stderr; got: %s", got)
++	}
++}
++
++// TestInstantiateFormulaOnBead_BondFailureSurfacesDiagnostic drives the full
++// helper with a stub bd whose `mol bond` fails (exit 1 + stderr), and asserts
++// the returned error surfaces the enriched diagnostic instead of a bare
++// "exit status 1" — the whole point of the gfork-i3d instrumentation.
++func TestInstantiateFormulaOnBead_BondFailureSurfacesDiagnostic(t *testing.T) {
++	townRoot := t.TempDir()
++
++	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0o755); err != nil {
++		t.Fatalf("mkdir mayor/rig: %v", err)
++	}
++	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
++		t.Fatalf("mkdir .beads: %v", err)
++	}
++	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
++	if err := os.MkdirAll(rigDir, 0o755); err != nil {
++		t.Fatalf("mkdir rigDir: %v", err)
++	}
++	routes := strings.Join([]string{
++		`{"prefix":"gt-","path":"gastown/mayor/rig"}`,
++		`{"prefix":"hq-","path":"."}`,
++		"",
++	}, "\n")
++	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0o644); err != nil {
++		t.Fatalf("write routes.jsonl: %v", err)
++	}
++
++	binDir := filepath.Join(townRoot, "bin")
++	if err := os.MkdirAll(binDir, 0o755); err != nil {
++		t.Fatalf("mkdir binDir: %v", err)
++	}
++
++	// Stub bd: cook/wisp succeed; `mol bond` fails with a "not found" on stderr
++	// (both the primary wisp->bead bond and the direct-formula fallback hit this).
++	bdScript := `#!/bin/sh
++echo "CMD:$*" >> "${BD_LOG}"
++cmd="$1"
++shift || true
++case "$cmd" in
++  cook) ;;
++  mol)
++    sub="$1"
++    shift || true
++    case "$sub" in
++      wisp) echo '{"new_epic_id":"gt-wisp-288"}' ;;
++      bond)
++        echo "'gt-abc123' not found (not an issue ID or formula name)" >&2
++        exit 1
++        ;;
++    esac
++    ;;
++esac
++exit 0
++`
++	bdScriptWindows := `@echo off
++echo CMD:%*>>"%BD_LOG%"
++set "cmd=%1"
++set "sub=%2"
++if "%cmd%"=="cook" exit /b 0
++if "%cmd%"=="mol" (
++  if "%sub%"=="wisp" (
++    echo {^"new_epic_id^":^"gt-wisp-288^"}
++    exit /b 0
++  )
++  if "%sub%"=="bond" (
++    echo 'gt-abc123' not found ^(not an issue ID or formula name^) 1>&2
++    exit /b 1
++  )
++)
++exit /b 0
++`
++	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
++
++	t.Setenv("BD_LOG", filepath.Join(townRoot, "bd.log"))
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++
++	cwd, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getwd: %v", err)
++	}
++	t.Cleanup(func() { _ = os.Chdir(cwd) })
++	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
++		t.Fatalf("chdir: %v", err)
++	}
++
++	_, err = InstantiateFormulaOnBead(context.Background(), "mol-polecat-work", "gt-abc123", "Test Bug Fix", "", townRoot, false, nil)
++	if err == nil {
++		t.Fatal("expected InstantiateFormulaOnBead to fail when bond fails")
++	}
++	msg := err.Error()
++	for _, want := range []string{"beads_dir=", "cmd=[bd mol bond", "bd_stderr=", "not found"} {
++		if !strings.Contains(msg, want) {
++			t.Errorf("bond failure error missing diagnostic %q; got: %s", want, msg)
++		}
++	}
++}
+diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
+index 2d92de38..9ef037e0 100644
+--- a/internal/cmd/sling_helpers.go
++++ b/internal/cmd/sling_helpers.go
+@@ -1,6 +1,7 @@
+ package cmd
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -582,7 +583,7 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+ 	// Write back once
+ 	newDesc := beads.SetAttachmentFields(issue, fields)
+ 	if logPath != "" {
+-		_ = os.WriteFile(logPath, []byte(newDesc), 0644)
++		_ = os.WriteFile(logPath, []byte(newDesc), 0o644)
+ 		return nil
+ 	}
+ 
+@@ -835,7 +836,7 @@ func nudgeWitness(rigName, message string) {
+ 	// Test hook: log nudge for test observability
+ 	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+ 		entry := fmt.Sprintf("nudge:%s:%s\n", witnessSession, message)
+-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
++		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+ 		if err == nil {
+ 			_, _ = f.WriteString(entry)
+ 			_ = f.Close()
+@@ -869,7 +870,7 @@ func nudgeRefinery(rigName, message string) {
+ 	// Test hook: log nudge for test observability (same pattern as GT_TEST_ATTACHED_MOLECULE_LOG)
+ 	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+ 		entry := fmt.Sprintf("nudge:%s:%s\n", refinerySession, message)
+-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
++		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+ 		if err == nil {
+ 			_, _ = f.WriteString(entry)
+ 			_ = f.Close()
+@@ -1008,12 +1009,19 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
+ 	}
+ 
+ 	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
++	var bondStderr bytes.Buffer
+ 	bondOut, err := BdCmd(bondArgs...).
+ 		Dir(formulaWorkDir).
+ 		WithAutoCommit().
+ 		WithGTRoot(townRoot).
++		Stderr(&bondStderr).
+ 		Output()
+ 	if err != nil {
++		// Enrich the bare "exit status" with cwd/beads-dir/stderr so a stale-read
++		// or wrong-database bond resolution failure (gfork-i3d) is diagnosable
++		// from the log instead of guessing which database bd consulted.
++		err = fmt.Errorf("%w (%s)", err, bondFailureDiagnostic(formulaWorkDir, bondArgs, bondStderr.String()))
++
+ 		// Clean up orphaned wisp from the failed legacy path.
+ 		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
+ 
+@@ -1026,6 +1034,11 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
+ 			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+ 		}, nil
+ 	}
++	// Capturing stderr above suppresses the live passthrough bd previously had;
++	// surface any non-empty stderr on the success path to preserve behavior.
++	if bondStderr.Len() > 0 {
++		fmt.Fprint(os.Stderr, bondStderr.String())
++	}
+ 
+ 	// Parse bond output - the wisp root becomes the compound root.
+ 	// Some environments may return success with non-JSON/empty stdout while
+@@ -1057,18 +1070,36 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
+ // bondFormulaDirect retries formula attachment using direct formula->bead bond.
+ // Newer bd versions support this polymorphic path even when legacy wisp->bead
+ // bonding fails with "not found" for the generated wisp ID.
++// bondFailureDiagnostic assembles the context needed to root-cause a failed
++// `bd mol bond` bead resolution (gfork-i3d). `bd mol bond` resolves its bead
++// operand against the working-directory database, so a wrong cwd, a stale
++// redirect, or a stale Dolt read all surface as a bare "exit status 1" that
++// hides which database was actually consulted. This records the working
++// directory, the .beads database that directory resolves to (following
++// redirects), the exact bd argv, and bd's own stderr.
++func bondFailureDiagnostic(formulaWorkDir string, bondArgs []string, stderr string) string {
++	diag := fmt.Sprintf("cwd=%s beads_dir=%s cmd=[bd %s]",
++		formulaWorkDir, beads.ResolveBeadsDir(formulaWorkDir), strings.Join(bondArgs, " "))
++	if s := strings.TrimSpace(stderr); s != "" {
++		diag += fmt.Sprintf(" bd_stderr=%q", s)
++	}
++	return diag
++}
++
+ func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
+ 	bondArgs := []string{"mol", "bond", formulaName, beadID, "--json", "--ephemeral"}
+ 	for _, variable := range vars {
+ 		bondArgs = append(bondArgs, "--var", variable)
+ 	}
++	var stderr bytes.Buffer
+ 	bondOut, err := BdCmd(bondArgs...).
+ 		Dir(formulaWorkDir).
+ 		WithAutoCommit().
+ 		WithGTRoot(townRoot).
++		Stderr(&stderr).
+ 		Output()
+ 	if err != nil {
+-		return "", fmt.Errorf("%w (args: %s)", err, strings.Join(bondArgs, " "))
++		return "", fmt.Errorf("%w (%s)", err, bondFailureDiagnostic(formulaWorkDir, bondArgs, stderr.String()))
+ 	}
+ 
+ 	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
+@@ -1292,8 +1323,10 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
+ 	return nil
+ }
+ 
+-var hookBeadWithRetryFn = hookBeadWithRetry
+-var hookBeadWithRetryWithTownRootFn = hookBeadWithRetryWithTownRoot
++var (
++	hookBeadWithRetryFn             = hookBeadWithRetry
++	hookBeadWithRetryWithTownRootFn = hookBeadWithRetryWithTownRoot
++)
+ 
+ // slingBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
+ // Formula: base * 2^(attempt-1) * (1 ± 25% random), capped at max.
+-- 
+2.50.1 (Apple Git-155)
+
