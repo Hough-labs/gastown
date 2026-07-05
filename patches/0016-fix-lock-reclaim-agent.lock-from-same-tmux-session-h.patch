@@ -1,7 +1,7 @@
 From a8ee779e0f7da8c62d6c0c2c2586a0922a244816 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 12 May 2026 14:46:58 -0400
-Subject: [PATCH 16/30] fix(lock): reclaim agent.lock from same tmux session
+Subject: [PATCH 16/31] fix(lock): reclaim agent.lock from same tmux session
  (hq-uus)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

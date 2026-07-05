@@ -1,0 +1,699 @@
+From e6c1c96a2fef7ffc5a1f8366b2c71669ebeb8e28 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 5 Jul 2026 12:01:21 -0400
+Subject: [PATCH 31/31] feat(daemon): idle-at-prompt watchdog forces turn
+ boundary to drain queued nudges (hq-2kaq)
+
+Persistent agents (deacon, witness, refinery) can land idle at an interactive
+prompt after a loop step completes, where queued nudges cannot drain because
+they are only picked up at a natural turn boundary. Add a daemon-hosted
+watchdog that detects alive + idle-at-prompt + stale (>2min) + pending-nudges
+and forces a turn boundary via the proven C-c / clear / continue / Enter
+send-keys sequence.
+
+- IsIdleAtPromptWhileStale classifier: stale idle heartbeat, not working/exiting,
+  and not in a legitimate await-signal backoff (backoff-until label in the future).
+- ForceTurnBoundary + per-session 5min cooldown prevents send-keys storms.
+- Complements the v1.2.1 nudge poller (which drains witness/refinery/crew at 10s):
+  no-ops when the poller already drained (pending==0); closes the deacon gap the
+  poller does not cover.
+- SessionStart resume now uses `gt prime --hook` so an interrupted agent
+  auto-continues its hooked molecule instead of asking "should I continue?".
+
+Addresses hq-2kaq / gfork-47p.3.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/daemon/daemon.go                    |  11 +
+ internal/daemon/idle_prompt_watchdog.go      | 171 ++++++++++++++
+ internal/daemon/idle_prompt_watchdog_test.go | 236 +++++++++++++++++++
+ internal/daemon/lifecycle.go                 |  16 +-
+ internal/runtime/runtime.go                  |  16 +-
+ internal/runtime/runtime_test.go             |  60 +++--
+ 6 files changed, 484 insertions(+), 26 deletions(-)
+ create mode 100644 internal/daemon/idle_prompt_watchdog.go
+ create mode 100644 internal/daemon/idle_prompt_watchdog_test.go
+
+diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
+index f9c1013f..6950f9b4 100755
+--- a/internal/daemon/daemon.go
++++ b/internal/daemon/daemon.go
+@@ -98,6 +98,12 @@ type Daemon struct {
+ 	// no sync needed.
+ 	contextNudgeLast map[string]time.Time
+ 
++	// idleAtPromptForcedLast tracks when a turn-boundary was last forced for
++	// each session by the idle-at-prompt watchdog (checkIdleAtPromptSessions).
++	// Enforces idleAtPromptForceCooldown. Lazily initialized on first write.
++	// Only accessed from heartbeat loop goroutine - no sync needed.
++	idleAtPromptForcedLast map[string]time.Time
++
+ 	// Restart tracking with exponential backoff to prevent crash loops
+ 	restartTracker *RestartTracker
+ 
+@@ -968,6 +974,11 @@ func (d *Daemon) heartbeat(state *State) {
+ 	// YELLOW threshold, before they hit RED and wedge idle-at-prompt (gfork-47p.2).
+ 	d.checkContextPressure()
+ 
++	// 12d. Idle-at-prompt watchdog: force a turn boundary on persistent agents
++	// (deacon, witness, refinery) that have been idle-at-prompt while stale and
++	// have pending queued nudges that cannot drain without a turn boundary (hq-2kaq).
++	d.checkIdleAtPromptSessions()
++
+ 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
+ 	// These are Task tool subagents that didn't clean up after completion.
+ 	// This is a safety net - Deacon patrol also does this more frequently.
+diff --git a/internal/daemon/idle_prompt_watchdog.go b/internal/daemon/idle_prompt_watchdog.go
+new file mode 100644
+index 00000000..6eaf7eaa
+--- /dev/null
++++ b/internal/daemon/idle_prompt_watchdog.go
+@@ -0,0 +1,171 @@
++package daemon
++
++import (
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/steveyegge/gastown/internal/nudge"
++	"github.com/steveyegge/gastown/internal/polecat"
++	"github.com/steveyegge/gastown/internal/tmux"
++)
++
++// idleAtPromptStaleThreshold is the minimum heartbeat age before the watchdog
++// considers a session "no recent turn boundary." Set well below the 17-min
++// recurrence and well above the normal brief inter-turn pause.
++const idleAtPromptStaleThreshold = 2 * time.Minute
++
++// idleAtPromptForceCooldown prevents send-keys storms: a second force-turn-boundary
++// on the same session is suppressed until this window elapses.
++const idleAtPromptForceCooldown = 5 * time.Minute
++
++// IsIdleAtPromptWhileStale returns true when a session is a candidate for
++// forced turn-boundary recovery (hq-2kaq):
++//
++//   - heartbeat is stale (> idleAtPromptStaleThreshold old) — no recent gt
++//     command = no recent turn boundary
++//   - heartbeat state is idle or unset — not actively working or exiting
++//   - no active await-signal backoff (backoff-until label absent or expired)
++//
++// Returns false when:
++//   - no heartbeat file exists (unknown state — don't false-positive)
++//   - heartbeat is fresh (< threshold old)
++//   - heartbeat state is working or exiting
++//   - agentBeadLabels contains a backoff-until:TIMESTAMP in the future
++func IsIdleAtPromptWhileStale(townRoot, sessionName string, agentBeadLabels []string, now time.Time) bool {
++	hb := polecat.ReadSessionHeartbeat(townRoot, sessionName)
++	if hb == nil {
++		return false // no heartbeat = no basis for classification
++	}
++
++	if now.Sub(hb.Timestamp) < idleAtPromptStaleThreshold {
++		return false // not yet stale
++	}
++
++	state := hb.EffectiveState()
++	if state == polecat.HeartbeatWorking || state == polecat.HeartbeatExiting {
++		return false // agent is active or in gt-done flow
++	}
++
++	// Don't interrupt a legitimate await-signal backoff window.
++	// The deacon sets "backoff-until:UNIX_TIMESTAMP" on its agent bead
++	// when gt mol step await-signal computes an exponential backoff interval.
++	for _, label := range agentBeadLabels {
++		if !strings.HasPrefix(label, "backoff-until:") {
++			continue
++		}
++		tsStr := label[len("backoff-until:"):]
++		var ts int64
++		if _, err := fmt.Sscanf(tsStr, "%d", &ts); err != nil {
++			continue
++		}
++		if time.Unix(ts, 0).After(now) {
++			return false // active backoff window — leave the agent alone
++		}
++	}
++
++	return true
++}
++
++// ForceTurnBoundary sends the proven recovery key sequence to an idle-at-prompt
++// session so any queued nudges can drain at the next turn boundary (hq-2kaq):
++//
++//  1. C-c — cancel any pending partial input or escape sequence
++//  2. C-u via SendKeysReplace — clear the input line
++//  3. continueCmd — literal text of the continue directive (e.g. "gt prime --hook")
++//  4. Enter — submit the command, creating the turn boundary
++//
++// The caller is responsible for cooldown enforcement.
++func ForceTurnBoundary(t *tmux.Tmux, session, continueCmd string) error {
++	if err := t.SendKeysRaw(session, "C-c"); err != nil {
++		return fmt.Errorf("idle-at-prompt recovery: C-c failed: %w", err)
++	}
++	time.Sleep(100 * time.Millisecond)
++	if err := t.SendKeysReplace(session, continueCmd, 100); err != nil {
++		return fmt.Errorf("idle-at-prompt recovery: continue directive failed: %w", err)
++	}
++	return nil
++}
++
++// checkIdleAtPromptSessions detects patrol agents (deacon, witness, refinery)
++// stuck idle-at-prompt with pending queued nudges and forces a turn boundary.
++//
++// This is the short-threshold (2-3 min) complement to the coarse 30-min
++// HungSessionThreshold: it catches the ~17-min recurrence where a loop step
++// completes but the agent lands at an interactive prompt instead of chaining
++// to await-signal, leaving queued nudges unable to drain (hq-2kaq).
++//
++// A session is acted on when ALL of the following hold:
++//  1. tmux session is alive
++//  2. IsIdleAtPromptWhileStale reports true (stale heartbeat, not in backoff)
++//  3. nudge queue has ≥1 pending message
++//  4. tmux.IsIdle confirms the agent is at the prompt right now (not mid-turn)
++//  5. cooldown window has elapsed since the last forced recovery
++func (d *Daemon) checkIdleAtPromptSessions() {
++	if !d.tmux.IsAvailable() {
++		return
++	}
++	now := time.Now()
++
++	cfg := d.loadOperationalConfig().GetDaemonConfig()
++	targets := d.contextTargets(cfg.ContextCycleRolesV())
++	for _, target := range targets {
++		d.maybeForceIdleAtPromptTurnBoundary(target, now)
++	}
++}
++
++// maybeForceIdleAtPromptTurnBoundary evaluates one session and forces a turn
++// boundary if all idle-at-prompt-while-stale conditions are met.
++func (d *Daemon) maybeForceIdleAtPromptTurnBoundary(target contextTarget, now time.Time) {
++	// 1. Alive?
++	alive, err := d.tmux.HasSession(target.sessionName)
++	if err != nil || !alive {
++		return
++	}
++
++	// 2. Fetch agent bead labels for backoff-until check.
++	var labels []string
++	agentBeadID := d.identityToAgentBeadID(target.identity)
++	if agentBeadID != "" {
++		if info, err := d.getAgentBeadInfo(agentBeadID); err == nil {
++			labels = info.Labels
++		}
++	}
++
++	// 3. Is the session idle-at-prompt-while-stale?
++	if !IsIdleAtPromptWhileStale(d.config.TownRoot, target.sessionName, labels, now) {
++		return
++	}
++
++	// 4. Pending nudges? (cheap filesystem check — only act if there's something to drain)
++	pending := nudge.QueueLen(d.config.TownRoot, target.sessionName)
++	if pending == 0 {
++		return
++	}
++
++	// 5. Is the pane actually at the prompt right now? (confirms no race with
++	//    a turn that just started; avoids injecting mid-turn)
++	if !d.tmux.IsIdle(target.sessionName) {
++		return
++	}
++
++	// 6. Cooldown: one forced recovery per cooldown window per session.
++	if d.idleAtPromptForcedLast == nil {
++		d.idleAtPromptForcedLast = make(map[string]time.Time)
++	}
++	if last, ok := d.idleAtPromptForcedLast[target.sessionName]; ok && now.Sub(last) < idleAtPromptForceCooldown {
++		d.logger.Printf("idle-at-prompt watchdog: %s: suppressed (cooldown %s remaining)",
++			target.sessionName, (idleAtPromptForceCooldown - now.Sub(last)).Round(time.Second))
++		return
++	}
++
++	d.logger.Printf("idle-at-prompt watchdog: %s idle+stale with %d pending nudge(s), forcing turn boundary",
++		target.sessionName, pending)
++
++	continueCmd := "gt prime --hook"
++	if err := ForceTurnBoundary(d.tmux, target.sessionName, continueCmd); err != nil {
++		d.logger.Printf("idle-at-prompt watchdog: %s: force failed: %v", target.sessionName, err)
++		return
++	}
++	d.idleAtPromptForcedLast[target.sessionName] = now
++}
+diff --git a/internal/daemon/idle_prompt_watchdog_test.go b/internal/daemon/idle_prompt_watchdog_test.go
+new file mode 100644
+index 00000000..0de50c95
+--- /dev/null
++++ b/internal/daemon/idle_prompt_watchdog_test.go
+@@ -0,0 +1,236 @@
++package daemon
++
++import (
++	"encoding/json"
++	"fmt"
++	"log"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/steveyegge/gastown/internal/nudge"
++	"github.com/steveyegge/gastown/internal/polecat"
++	"github.com/steveyegge/gastown/internal/tmux"
++)
++
++// writeHeartbeat writes a synthetic heartbeat file with the given state and
++// timestamp into townRoot/.runtime/heartbeats/<session>.json.
++func writeHeartbeat(t *testing.T, townRoot, session string, state polecat.HeartbeatState, ts time.Time) {
++	t.Helper()
++	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatalf("mkdir heartbeats: %v", err)
++	}
++	hb := polecat.SessionHeartbeat{
++		Timestamp: ts.UTC(),
++		State:     state,
++	}
++	data, err := json.Marshal(hb)
++	if err != nil {
++		t.Fatalf("marshal heartbeat: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, session+".json"), data, 0o644); err != nil {
++		t.Fatalf("write heartbeat: %v", err)
++	}
++}
++
++func TestIsIdleAtPromptWhileStale(t *testing.T) {
++	const session = "gt-test-watchdog"
++	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
++	staleTS := now.Add(-3 * time.Minute)  // older than idleAtPromptStaleThreshold (2 min)
++	freshTS := now.Add(-30 * time.Second) // newer than threshold
++
++	futureBackoff := fmt.Sprintf("backoff-until:%d", now.Add(10*time.Minute).Unix())
++	pastBackoff := fmt.Sprintf("backoff-until:%d", now.Add(-5*time.Minute).Unix())
++
++	tests := []struct {
++		name   string
++		setup  func(townRoot string)
++		labels []string
++		want   bool
++	}{
++		{
++			name:  "no heartbeat file",
++			setup: func(_ string) {},
++			want:  false,
++		},
++		{
++			name: "fresh heartbeat idle",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, freshTS)
++			},
++			want: false,
++		},
++		{
++			name: "stale heartbeat working state",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatWorking, staleTS)
++			},
++			want: false,
++		},
++		{
++			name: "stale heartbeat exiting state",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatExiting, staleTS)
++			},
++			want: false,
++		},
++		{
++			name: "stale heartbeat idle no labels",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, staleTS)
++			},
++			want: true,
++		},
++		{
++			name: "stale heartbeat stuck no labels",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatStuck, staleTS)
++			},
++			want: true,
++		},
++		{
++			name: "stale heartbeat idle with active backoff",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, staleTS)
++			},
++			labels: []string{futureBackoff},
++			want:   false,
++		},
++		{
++			name: "stale heartbeat idle with expired backoff",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, staleTS)
++			},
++			labels: []string{pastBackoff},
++			want:   true,
++		},
++		{
++			name: "stale heartbeat idle with malformed backoff label",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, staleTS)
++			},
++			labels: []string{"backoff-until:not-a-number"},
++			want:   true, // malformed label is skipped — not treated as active backoff
++		},
++		{
++			name: "stale heartbeat idle unrelated labels",
++			setup: func(townRoot string) {
++				writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, staleTS)
++			},
++			labels: []string{"foo", "bar"},
++			want:   true,
++		},
++		{
++			name: "stale v1 heartbeat (no state — defaults to working)",
++			setup: func(townRoot string) {
++				// Write a v1-format heartbeat: timestamp only, no state field.
++				dir := filepath.Join(townRoot, ".runtime", "heartbeats")
++				if err := os.MkdirAll(dir, 0o755); err != nil {
++					t.Fatalf("mkdir: %v", err)
++				}
++				data := []byte(`{"timestamp":"` + staleTS.Format(time.RFC3339Nano) + `"}`)
++				path := filepath.Join(dir, session+".json")
++				if err := os.WriteFile(path, data, 0o644); err != nil {
++					t.Fatalf("write: %v", err)
++				}
++			},
++			want: false, // v1 defaults to working → not candidate for forced recovery
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			townRoot := t.TempDir()
++			tt.setup(townRoot)
++			got := IsIdleAtPromptWhileStale(townRoot, session, tt.labels, now)
++			if got != tt.want {
++				t.Errorf("IsIdleAtPromptWhileStale() = %v; want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++// TestForceTurnBoundary_SendsRecoverySequence asserts the recovery action emits
++// the proven send-keys sequence (hq-2kaq acceptance criterion #3): cancel any
++// partial input (C-c), type the continue directive, and submit it (Enter) — the
++// three keystrokes that force a turn boundary so the nudge queue can drain.
++func TestForceTurnBoundary_SendsRecoverySequence(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on Windows — fake tmux requires bash")
++	}
++	fakeBinDir := t.TempDir()
++	writeFakeContextTmux(t, fakeBinDir)
++	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
++	t.Setenv("TMUX_LOG", tmuxLog)
++
++	const session = "hq-deacon"
++	if err := ForceTurnBoundary(tmux.NewTmux(), session, "gt prime --hook"); err != nil {
++		t.Fatalf("ForceTurnBoundary: %v", err)
++	}
++
++	data, err := os.ReadFile(tmuxLog)
++	if err != nil {
++		t.Fatalf("read tmux log: %v", err)
++	}
++	got := string(data)
++	for _, want := range []string{"C-c", "gt prime --hook", "Enter"} {
++		if !strings.Contains(got, want) {
++			t.Errorf("tmux log missing %q; full log:\n%s", want, got)
++		}
++	}
++}
++
++// TestMaybeForceIdleAtPromptTurnBoundary_FiresThenCooldownSuppresses asserts the
++// full watchdog action (hq-2kaq acceptance criterion #3): a stale idle-at-prompt
++// session with a pending queued nudge gets a forced turn boundary, and a second
++// evaluation within the cooldown window is suppressed — no send-keys storm.
++func TestMaybeForceIdleAtPromptTurnBoundary_FiresThenCooldownSuppresses(t *testing.T) {
++	townRoot, logBuf, _ := setupContextWatchdogTest(t)
++	t.Setenv("FAKE_PANE_MARKER", idlePaneMarker)
++
++	const session = "hq-deacon"
++	now := time.Now()
++
++	// Stale + idle heartbeat → IsIdleAtPromptWhileStale reports true.
++	writeHeartbeat(t, townRoot, session, polecat.HeartbeatIdle, now.Add(-3*time.Minute))
++
++	// One pending queued nudge that cannot drain without a turn boundary.
++	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
++		Sender:  "test",
++		Message: "drain me",
++	}); err != nil {
++		t.Fatalf("enqueue nudge: %v", err)
++	}
++
++	d := &Daemon{
++		config: &Config{TownRoot: townRoot},
++		logger: log.New(logBuf, "", 0),
++		tmux:   tmux.NewTmux(),
++		// Bogus bd path: getAgentBeadInfo fails fast → no backoff-until labels,
++		// which is exactly the genuine-idle path (agent is not in await-signal
++		// backoff), so the watchdog is allowed to act.
++		bdPath: filepath.Join(t.TempDir(), "no-such-bd"),
++	}
++	target := contextTarget{identity: "deacon", role: "deacon", sessionName: session}
++
++	// First evaluation: all gates pass → force a turn boundary.
++	d.maybeForceIdleAtPromptTurnBoundary(target, now)
++	if !strings.Contains(logBuf.String(), "forcing turn boundary") {
++		t.Fatalf("expected first evaluation to force a turn boundary, got: %s", logBuf.String())
++	}
++	if _, ok := d.idleAtPromptForcedLast[session]; !ok {
++		t.Fatal("expected idleAtPromptForcedLast to record the forced recovery")
++	}
++
++	// Second evaluation one second later: within the 5-minute cooldown → suppressed.
++	logBuf.Reset()
++	d.maybeForceIdleAtPromptTurnBoundary(target, now.Add(time.Second))
++	if !strings.Contains(logBuf.String(), "suppressed (cooldown") {
++		t.Errorf("expected cooldown suppression on the second evaluation, got: %s", logBuf.String())
++	}
++}
+diff --git a/internal/daemon/lifecycle.go b/internal/daemon/lifecycle.go
+index 125ac9f7..a0b17e54 100644
+--- a/internal/daemon/lifecycle.go
++++ b/internal/daemon/lifecycle.go
+@@ -792,13 +792,14 @@ func (d *Daemon) closeMessage(id string) error {
+ 
+ // AgentBeadInfo represents the parsed fields from an agent bead.
+ type AgentBeadInfo struct {
+-	ID         string `json:"id"`
+-	Type       string `json:"issue_type"`
+-	State      string // From description agent_state, fallback to legacy DB column
+-	HookBead   string // From DB column (hook_bead)
+-	RoleType   string // Parsed from description: role_type
+-	Rig        string // Parsed from description: rig
+-	LastUpdate string `json:"updated_at"`
++	ID         string   `json:"id"`
++	Type       string   `json:"issue_type"`
++	State      string   // From description agent_state, fallback to legacy DB column
++	HookBead   string   // From DB column (hook_bead)
++	RoleType   string   // Parsed from description: role_type
++	Rig        string   // Parsed from description: rig
++	LastUpdate string   `json:"updated_at"`
++	Labels     []string // Raw bead labels (e.g. backoff-until:TIMESTAMP for await-signal)
+ 	// Note: RoleBead field removed - role definitions are now config-based
+ }
+ 
+@@ -877,6 +878,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
+ 	// Use HookBead from database column directly (not from description)
+ 	// The description may contain stale data - the slot is the source of truth.
+ 	info.HookBead = issue.HookBead
++	info.Labels = issue.Labels
+ 
+ 	return info, nil
+ }
+diff --git a/internal/runtime/runtime.go b/internal/runtime/runtime.go
+index 609ad1fb..8f62d413 100644
+--- a/internal/runtime/runtime.go
++++ b/internal/runtime/runtime.go
+@@ -195,10 +195,18 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
+ 	}
+ 
+ 	role = strings.ToLower(role)
+-	command := "gt prime"
+-	// NOTE: session-started nudge to deacon removed — it interrupted
+-	// the deacon's await-signal backoff (exponential sleep). The deacon
+-	// already wakes on beads activity via bd activity --follow.
++	// Use --hook so the agent auto-continues a hooked molecule on restart without
++	// emitting a "should I continue?" confirmation. This is the interrupt-recovery
++	// resume path: the propulsion context (AUTONOMOUS WORK MODE) included in --hook
++	// output suppresses confirmation and triggers immediate execution.
++	//
++	// NOTE: session-started work-directive nudge to deacon was removed — it
++	// interrupted the deacon's await-signal backoff (exponential sleep). The deacon
++	// already wakes on beads activity via bd activity --follow. This change is safe:
++	// --hook only affects session-ID reading and output tier; it does NOT re-add
++	// the removed nudge. The idle-at-prompt watchdog (checkIdleAtPromptSessions)
++	// guards against interrupting legitimate backoff via the backoff-until label.
++	command := "gt prime --hook"
+ 
+ 	return []string{command}
+ }
+diff --git a/internal/runtime/runtime_test.go b/internal/runtime/runtime_test.go
+index fba918f2..ebc6b1fc 100644
+--- a/internal/runtime/runtime_test.go
++++ b/internal/runtime/runtime_test.go
+@@ -165,14 +165,44 @@ func TestStartupFallbackCommands_AutonomousRole(t *testing.T) {
+ 				t.Error("StartupFallbackCommands() should return commands for autonomous role")
+ 			}
+ 			for _, cmd := range commands {
+-				if cmd != "gt prime" {
+-					t.Fatalf("Commands for %s = %q, want gt prime", role, cmd)
++				if cmd != "gt prime --hook" {
++					t.Fatalf("Commands for %s = %q, want gt prime --hook", role, cmd)
+ 				}
+ 			}
+ 		})
+ 	}
+ }
+ 
++// TestStartupFallbackCommands_InterruptRecoveryAutoContinues asserts that the
++// SessionStart/resume path includes --hook so the agent auto-continues a hooked
++// molecule without emitting a "should I continue?" confirmation (hq-2kaq).
++func TestStartupFallbackCommands_InterruptRecoveryAutoContinues(t *testing.T) {
++	rc := &config.RuntimeConfig{
++		Hooks: &config.RuntimeHooksConfig{
++			Provider: "none",
++		},
++	}
++
++	for _, role := range []string{"polecat", "witness", "deacon", "refinery"} {
++		t.Run(role, func(t *testing.T) {
++			commands := StartupFallbackCommands(role, rc)
++			if len(commands) == 0 {
++				t.Fatal("StartupFallbackCommands() returned no commands")
++			}
++			found := false
++			for _, cmd := range commands {
++				if contains(cmd, "--hook") {
++					found = true
++					break
++				}
++			}
++			if !found {
++				t.Errorf("StartupFallbackCommands(%q) = %v; want a command containing --hook for auto-continuation", role, commands)
++			}
++		})
++	}
++}
++
+ func TestStartupFallbackCommands_PatrolRolesSkipMailInject(t *testing.T) {
+ 	rc := &config.RuntimeConfig{
+ 		Hooks: &config.RuntimeHooksConfig{
+@@ -628,7 +658,7 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
+ 	// Gemini CLI has no --settings flag; settings must go to workDir (like OpenCode).
+ 	settingsDir := t.TempDir()
+ 	workDir := t.TempDir()
+-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
++	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
+ 		t.Fatalf("write AGENTS.md: %v", err)
+ 	}
+ 
+@@ -664,7 +694,7 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
+ func TestEnsureSettingsForRole_GeminiRepairsBrokenContextSymlink(t *testing.T) {
+ 	settingsDir := t.TempDir()
+ 	workDir := t.TempDir()
+-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
++	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
+ 		t.Fatalf("write AGENTS.md: %v", err)
+ 	}
+ 	if err := os.Symlink("./rig/worktree/AGENTS.md", workDir+"/GEMINI.md"); err != nil {
+@@ -695,12 +725,12 @@ func TestEnsureSettingsForRole_GeminiRepairsBrokenContextSymlink(t *testing.T) {
+ func TestEnsureSettingsForRole_GeminiRepairsResolvableAgentsSymlink(t *testing.T) {
+ 	settingsDir := t.TempDir()
+ 	workDir := t.TempDir()
+-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
++	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
+ 		t.Fatalf("write AGENTS.md: %v", err)
+ 	}
+ 	otherDir := t.TempDir()
+ 	otherAgents := otherDir + "/AGENTS.md"
+-	if err := os.WriteFile(otherAgents, []byte("# Other Agents\n"), 0644); err != nil {
++	if err := os.WriteFile(otherAgents, []byte("# Other Agents\n"), 0o644); err != nil {
+ 		t.Fatalf("write other AGENTS.md: %v", err)
+ 	}
+ 	if err := os.Symlink(otherAgents, workDir+"/GEMINI.md"); err != nil {
+@@ -732,10 +762,10 @@ func TestEnsureSettingsForRole_GeminiPreservesGeminiOverlay(t *testing.T) {
+ 	settingsDir := t.TempDir()
+ 	workDir := t.TempDir()
+ 	geminiContent := []byte("# Gemini overlay\n")
+-	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
++	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
+ 		t.Fatalf("write AGENTS.md: %v", err)
+ 	}
+-	if err := os.WriteFile(workDir+"/GEMINI.md", geminiContent, 0644); err != nil {
++	if err := os.WriteFile(workDir+"/GEMINI.md", geminiContent, 0o644); err != nil {
+ 		t.Fatalf("write GEMINI.md: %v", err)
+ 	}
+ 
+@@ -880,10 +910,10 @@ func TestRuntimeConfigWithMinDelay_ZeroMin(t *testing.T) {
+ func makeTownRoot(t *testing.T) string {
+ 	t.Helper()
+ 	root := t.TempDir()
+-	if err := os.MkdirAll(root+"/mayor", 0755); err != nil {
++	if err := os.MkdirAll(root+"/mayor", 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if err := os.WriteFile(root+"/mayor/town.json", []byte(`{"type":"town"}`), 0644); err != nil {
++	if err := os.WriteFile(root+"/mayor/town.json", []byte(`{"type":"town"}`), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	return root
+@@ -892,7 +922,7 @@ func makeTownRoot(t *testing.T) string {
+ func makeTownRootWithGit(t *testing.T) string {
+ 	t.Helper()
+ 	root := makeTownRoot(t)
+-	if err := os.MkdirAll(root+"/.git", 0755); err != nil {
++	if err := os.MkdirAll(root+"/.git", 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	return root
+@@ -933,7 +963,7 @@ func TestCommandsInherited_NestedGitRepoInsideTownRoot(t *testing.T) {
+ 	// Code stops at that repo boundary, so they need explicit command provisioning.
+ 	root := makeTownRootWithGit(t)
+ 	workDir := root + "/rig/polecats/chrome/repo"
+-	if err := os.MkdirAll(workDir+"/.git", 0755); err != nil {
++	if err := os.MkdirAll(workDir+"/.git", 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+@@ -945,11 +975,11 @@ func TestCommandsInherited_NestedGitRepoInsideTownRoot(t *testing.T) {
+ func TestCommandsInherited_WorkDirIsOutsideTownRoot(t *testing.T) {
+ 	// workDir in a standalone git repo that is NOT a Gas Town workspace → not inherited
+ 	dir := t.TempDir()
+-	if err := os.MkdirAll(dir+"/.git", 0755); err != nil {
++	if err := os.MkdirAll(dir+"/.git", 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	subDir := dir + "/src"
+-	if err := os.MkdirAll(subDir, 0755); err != nil {
++	if err := os.MkdirAll(subDir, 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+@@ -974,7 +1004,7 @@ func TestEnsureSettingsForRole_SkipsCommandsWhenInheritedFromTownRoot(t *testing
+ 	// EnsureSettingsForRole must NOT provision a duplicate copy in the role dir.
+ 	root := makeTownRootWithGit(t)
+ 	mayorDir := root + "/mayor"
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+

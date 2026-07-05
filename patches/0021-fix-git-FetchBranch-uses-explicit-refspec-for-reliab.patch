@@ -1,7 +1,7 @@
 From 26fb86907c75e8d86bb2be72e368ab896fbceba0 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:59 -0400
-Subject: [PATCH 21/30] fix(git): FetchBranch uses explicit refspec for
+Subject: [PATCH 21/31] fix(git): FetchBranch uses explicit refspec for
  reliable branch resume (hq-w4z7)
 
 Re-slinging a gopher onto an existing PR branch (`gt sling --branch`)
