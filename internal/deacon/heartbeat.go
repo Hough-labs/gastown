@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"time"
@@ -60,7 +59,7 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 	hbFile := HeartbeatFile(townRoot)
 
 	// Ensure deacon directory exists
-	if err := os.MkdirAll(filepath.Dir(hbFile), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(hbFile), 0o755); err != nil {
 		return err
 	}
 
@@ -74,7 +73,7 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 		return err
 	}
 
-	if err := os.WriteFile(hbFile, data, 0600); err != nil {
+	if err := os.WriteFile(hbFile, data, 0o600); err != nil {
 		return err
 	}
 
@@ -82,7 +81,7 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 	// that check this file's mtime for liveness detection (stuck-agent-dog).
 	// These scripts predate heartbeat.json and check mtime, not file contents.
 	legacyFile := filepath.Join(filepath.Dir(hbFile), ".deacon-heartbeat")
-	_ = os.WriteFile(legacyFile, []byte(""), 0644) //nolint:gosec // G306: world-readable liveness file is intentional
+	_ = os.WriteFile(legacyFile, []byte(""), 0o644) //nolint:gosec // G306: world-readable liveness file is intentional
 
 	// Update the heartbeat label on the hq-deacon bead
 	// This is checked by the daemon to determine if Deacon is alive
@@ -188,15 +187,13 @@ func updateHeartbeatLabel(townRoot string, hb *Heartbeat) error {
 	// We'll use the bd CLI to show the bead, find old heartbeat labels, and update them.
 
 	// Get current labels via bd show
-	cmd := exec.Command("bd", "show", beadID, "--json")
-	cmd.Dir = townRoot
+	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting, "show", beadID, "--json")
 
 	output, err := cmd.Output()
 	if err != nil {
 		// If the bead doesn't exist yet, just try to add the label
 		// This can happen if deacon is running for the first time
-		cmd := exec.Command("bd", "update", beadID, "--add-label", newLabel)
-		cmd.Dir = townRoot
+		cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.MutationRouting, "update", beadID, "--add-label", newLabel)
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("adding heartbeat label to new bead: %w", err)
 		}
@@ -229,8 +226,7 @@ func updateHeartbeatLabel(townRoot string, hb *Heartbeat) error {
 	}
 	cmdArgs = append(cmdArgs, "--add-label", newLabel)
 
-	cmd = exec.Command("bd", cmdArgs...)
-	cmd.Dir = townRoot
+	cmd = beads.Command(townRoot, townBeadsDir(townRoot), beads.MutationRouting, cmdArgs...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("updating heartbeat label: %w", err)
 	}
