@@ -1,0 +1,74 @@
+From 561cf6f8bd613a6fbf6fc10433227653185726a6 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sun, 5 Jul 2026 15:54:51 -0400
+Subject: [PATCH 34/34] fix(acp): kill terminateProcess/Wait data race on
+ cmd.ProcessState (gfork-93l)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+terminateProcess's SIGKILL-escalation timer (proxy_unix.go:57) read
+p.cmd.ProcessState while Forward()'s goroutine wrote it via cmd.Wait()
+(proxy.go:328) — an unsynchronized data race the -race detector flagged in
+TestIntegration_StartupPromptInjection. Replace the racy field read with an
+atomic.Bool `processExited` that the Wait goroutine stores on completion; the
+timer now escalates to SIGKILL only when the process has not yet been reaped.
+grep confirms proxy_unix.go:57 was the sole reader of cmd.ProcessState, so the
+field now has zero concurrent readers. Side benefit: no longer signals an
+already-reaped process/group (avoids a PID-recycle hazard). Windows
+terminateProcess is unaffected (it never reads ProcessState).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/acp/proxy.go      | 14 ++++++++++----
+ internal/acp/proxy_unix.go |  2 +-
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/internal/acp/proxy.go b/internal/acp/proxy.go
+index f7f12bed..acf3a447 100644
+--- a/internal/acp/proxy.go
++++ b/internal/acp/proxy.go
+@@ -65,9 +65,13 @@ type Proxy struct {
+ 	startupPromptMux   sync.RWMutex
+ 	shutdownOnce       sync.Once
+ 	isShuttingDown     atomic.Bool
+-	lastActivity       atomic.Int64
+-	pidFilePath        string
+-	townRoot           string
++	// processExited is set true once the Forward() goroutine's cmd.Wait()
++	// returns. terminateProcess reads it instead of p.cmd.ProcessState so the
++	// SIGKILL-escalation timer never races the Wait() that writes ProcessState.
++	processExited atomic.Bool
++	lastActivity  atomic.Int64
++	pidFilePath   string
++	townRoot      string
+ 	// Heartbeat support
+ 	currentModeID      string
+ 	modeMux            sync.RWMutex
+@@ -325,7 +329,9 @@ func (p *Proxy) Forward() error {
+ 	}
+ 
+ 	go func() {
+-		errChan <- p.cmd.Wait()
++		err := p.cmd.Wait()
++		p.processExited.Store(true)
++		errChan <- err
+ 	}()
+ 
+ 	var exitErr error
+diff --git a/internal/acp/proxy_unix.go b/internal/acp/proxy_unix.go
+index 065b2d82..2ec55944 100644
+--- a/internal/acp/proxy_unix.go
++++ b/internal/acp/proxy_unix.go
+@@ -54,7 +54,7 @@ func (p *Proxy) terminateProcess() {
+ 		}
+ 
+ 		time.AfterFunc(2*time.Second, func() {
+-			if p.cmd.ProcessState == nil || !p.cmd.ProcessState.Exited() {
++			if !p.processExited.Load() {
+ 				if pgid == 0 {
+ 					pgid, _ = syscall.Getpgid(p.cmd.Process.Pid)
+ 				}
+-- 
+2.50.1 (Apple Git-155)
+
