@@ -195,10 +195,18 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	}
 
 	role = strings.ToLower(role)
-	command := "gt prime"
-	// NOTE: session-started nudge to deacon removed — it interrupted
-	// the deacon's await-signal backoff (exponential sleep). The deacon
-	// already wakes on beads activity via bd activity --follow.
+	// Use --hook so the agent auto-continues a hooked molecule on restart without
+	// emitting a "should I continue?" confirmation. This is the interrupt-recovery
+	// resume path: the propulsion context (AUTONOMOUS WORK MODE) included in --hook
+	// output suppresses confirmation and triggers immediate execution.
+	//
+	// NOTE: session-started work-directive nudge to deacon was removed — it
+	// interrupted the deacon's await-signal backoff (exponential sleep). The deacon
+	// already wakes on beads activity via bd activity --follow. This change is safe:
+	// --hook only affects session-ID reading and output tier; it does NOT re-add
+	// the removed nudge. The idle-at-prompt watchdog (checkIdleAtPromptSessions)
+	// guards against interrupting legitimate backoff via the backoff-until label.
+	command := "gt prime --hook"
 
 	return []string{command}
 }
