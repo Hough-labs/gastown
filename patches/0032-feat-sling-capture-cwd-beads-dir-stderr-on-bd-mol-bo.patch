@@ -1,7 +1,7 @@
 From ee244a0864f997209d1008684c32630583a922c4 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 12:31:11 -0400
-Subject: [PATCH 32/32] feat(sling): capture cwd/beads-dir/stderr on bd mol
+Subject: [PATCH 32/33] feat(sling): capture cwd/beads-dir/stderr on bd mol
  bond failure (gfork-i3d diagnostics)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
