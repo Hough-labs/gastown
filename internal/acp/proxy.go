@@ -65,9 +65,13 @@ type Proxy struct {
 	startupPromptMux   sync.RWMutex
 	shutdownOnce       sync.Once
 	isShuttingDown     atomic.Bool
-	lastActivity       atomic.Int64
-	pidFilePath        string
-	townRoot           string
+	// processExited is set true once the Forward() goroutine's cmd.Wait()
+	// returns. terminateProcess reads it instead of p.cmd.ProcessState so the
+	// SIGKILL-escalation timer never races the Wait() that writes ProcessState.
+	processExited atomic.Bool
+	lastActivity  atomic.Int64
+	pidFilePath   string
+	townRoot      string
 	// Heartbeat support
 	currentModeID      string
 	modeMux            sync.RWMutex
@@ -325,7 +329,9 @@ func (p *Proxy) Forward() error {
 	}
 
 	go func() {
-		errChan <- p.cmd.Wait()
+		err := p.cmd.Wait()
+		p.processExited.Store(true)
+		errChan <- err
 	}()
 
 	var exitErr error
