@@ -1,0 +1,120 @@
+From 8c21c9d8d6924a821ead032bce0a1fe19f290fd2 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 6 Jul 2026 11:03:13 -0400
+Subject: [PATCH 35/35] test(deacon): stub heartbeat-label update so
+ WriteHeartbeat tests are hermetic (gfork-cpq)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+WriteHeartbeat -> updateHeartbeatLabel shells the real bd binary to maintain the
+hq-deacon heartbeat:<ts> label. Under test the town is a bare t.TempDir() with no
+provisioned beads DB, so bd exits 1 and WriteHeartbeat returns an error — failing 9
+tests regardless of Dolt health: 6 in internal/deacon/heartbeat_test.go
+(TestWriteReadHeartbeat, TestTouch, TestTouchWithAction, TestWriteHeartbeat_*) and 3
+idle-guard tests in internal/daemon (TestCheckDeaconHeartbeat_IdleGuard,
+TestCheckDeaconHeartbeat_RespectsCrashLoopGuard, TestEnsureBootRunning_IdleGuard).
+gfork-94k's beads.Command routing fixed the policy test but not hermeticity — it
+still shells real bd.
+
+Add a package-level heartbeatLabelUpdater seam (defaults to updateHeartbeatLabel;
+production behavior unchanged — the seam is only ever swapped by tests) plus an
+exported SetHeartbeatLabelUpdaterForTest setter, matching the repo's
+RegisterAgentForTesting cross-package test-seam precedent. The deacon and daemon
+test packages each install a no-op stub via TestMain, so WriteHeartbeat no longer
+shells bd under test.
+
+RED->GREEN verified this session under -race; full deacon and daemon packages green.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/daemon/testmain_test.go |  7 +++++++
+ internal/deacon/heartbeat.go     | 19 ++++++++++++++++++-
+ internal/deacon/testmain_test.go | 16 ++++++++++++++++
+ 3 files changed, 41 insertions(+), 1 deletion(-)
+ create mode 100644 internal/deacon/testmain_test.go
+
+diff --git a/internal/daemon/testmain_test.go b/internal/daemon/testmain_test.go
+index 228ae2fa..20ab53c6 100644
+--- a/internal/daemon/testmain_test.go
++++ b/internal/daemon/testmain_test.go
+@@ -7,11 +7,18 @@ import (
+ 	"path/filepath"
+ 	"testing"
+ 
++	"github.com/steveyegge/gastown/internal/deacon"
+ 	"github.com/steveyegge/gastown/internal/testutil"
+ 	"github.com/steveyegge/gastown/internal/tmux"
+ )
+ 
+ func TestMain(m *testing.M) {
++	// Stub the deacon heartbeat bead-label update so idle-guard tests that seed a
++	// heartbeat via deacon.WriteHeartbeat run hermetically against a bare temp
++	// town, without shelling real bd (which fails with "exit status 1" when the
++	// town has no provisioned beads DB for the heartbeat target). (gfork-cpq)
++	deacon.SetHeartbeatLabelUpdaterForTest(func(string, *deacon.Heartbeat) error { return nil })
++
+ 	// Start an ephemeral Dolt container for this package's tests.
+ 	// convoy_manager_test.go calls setupTestStore which sets BEADS_TEST_MODE=1,
+ 	// causing the beads SDK to create testdb_<hash> databases. By routing
+diff --git a/internal/deacon/heartbeat.go b/internal/deacon/heartbeat.go
+index c8b86ef5..96567d53 100644
+--- a/internal/deacon/heartbeat.go
++++ b/internal/deacon/heartbeat.go
+@@ -85,13 +85,30 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
+ 
+ 	// Update the heartbeat label on the hq-deacon bead
+ 	// This is checked by the daemon to determine if Deacon is alive
+-	if err := updateHeartbeatLabel(townRoot, hb); err != nil {
++	if err := heartbeatLabelUpdater(townRoot, hb); err != nil {
+ 		return fmt.Errorf("updating heartbeat label on bead: %w", err)
+ 	}
+ 
+ 	return nil
+ }
+ 
++// heartbeatLabelUpdater performs the bead-label side of WriteHeartbeat. It is a
++// package-level seam so tests can swap the real bd-shelling implementation for a
++// no-op; production always uses updateHeartbeatLabel.
++var heartbeatLabelUpdater = updateHeartbeatLabel
++
++// SetHeartbeatLabelUpdaterForTest overrides the bead-label updater used by
++// WriteHeartbeat and returns a function that restores the previous one. It lets
++// tests in this package and in internal/daemon exercise WriteHeartbeat against a
++// bare temp town without a provisioned beads DB (the real updater shells bd,
++// which fails with "exit status 1" when no heartbeat-target bead exists).
++// Test-only; the internal package keeps it module-private.
++func SetHeartbeatLabelUpdaterForTest(fn func(townRoot string, hb *Heartbeat) error) (restore func()) {
++	prev := heartbeatLabelUpdater
++	heartbeatLabelUpdater = fn
++	return func() { heartbeatLabelUpdater = prev }
++}
++
+ // ReadHeartbeat reads the Deacon heartbeat from disk.
+ // Returns nil if the file doesn't exist or can't be read.
+ func ReadHeartbeat(townRoot string) *Heartbeat {
+diff --git a/internal/deacon/testmain_test.go b/internal/deacon/testmain_test.go
+new file mode 100644
+index 00000000..f327a7b7
+--- /dev/null
++++ b/internal/deacon/testmain_test.go
+@@ -0,0 +1,16 @@
++package deacon
++
++import (
++	"os"
++	"testing"
++)
++
++// TestMain installs a no-op heartbeat-label updater for the whole package so
++// WriteHeartbeat-based tests run hermetically against a bare temp town, without
++// shelling the real bd binary (which fails with "exit status 1" when the town
++// has no provisioned beads DB for the heartbeat target). No deacon test
++// exercises the real label update. (gfork-cpq)
++func TestMain(m *testing.M) {
++	SetHeartbeatLabelUpdaterForTest(func(string, *Heartbeat) error { return nil })
++	os.Exit(m.Run())
++}
+-- 
+2.50.1 (Apple Git-155)
+
