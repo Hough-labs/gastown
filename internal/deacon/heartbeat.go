@@ -85,11 +85,28 @@ func WriteHeartbeat(townRoot string, hb *Heartbeat) error {
 
 	// Update the heartbeat label on the hq-deacon bead
 	// This is checked by the daemon to determine if Deacon is alive
-	if err := updateHeartbeatLabel(townRoot, hb); err != nil {
+	if err := heartbeatLabelUpdater(townRoot, hb); err != nil {
 		return fmt.Errorf("updating heartbeat label on bead: %w", err)
 	}
 
 	return nil
+}
+
+// heartbeatLabelUpdater performs the bead-label side of WriteHeartbeat. It is a
+// package-level seam so tests can swap the real bd-shelling implementation for a
+// no-op; production always uses updateHeartbeatLabel.
+var heartbeatLabelUpdater = updateHeartbeatLabel
+
+// SetHeartbeatLabelUpdaterForTest overrides the bead-label updater used by
+// WriteHeartbeat and returns a function that restores the previous one. It lets
+// tests in this package and in internal/daemon exercise WriteHeartbeat against a
+// bare temp town without a provisioned beads DB (the real updater shells bd,
+// which fails with "exit status 1" when no heartbeat-target bead exists).
+// Test-only; the internal package keeps it module-private.
+func SetHeartbeatLabelUpdaterForTest(fn func(townRoot string, hb *Heartbeat) error) (restore func()) {
+	prev := heartbeatLabelUpdater
+	heartbeatLabelUpdater = fn
+	return func() { heartbeatLabelUpdater = prev }
 }
 
 // ReadHeartbeat reads the Deacon heartbeat from disk.

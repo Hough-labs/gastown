@@ -7,11 +7,18 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestMain(m *testing.M) {
+	// Stub the deacon heartbeat bead-label update so idle-guard tests that seed a
+	// heartbeat via deacon.WriteHeartbeat run hermetically against a bare temp
+	// town, without shelling real bd (which fails with "exit status 1" when the
+	// town has no provisioned beads DB for the heartbeat target). (gfork-cpq)
+	deacon.SetHeartbeatLabelUpdaterForTest(func(string, *deacon.Heartbeat) error { return nil })
+
 	// Start an ephemeral Dolt container for this package's tests.
 	// convoy_manager_test.go calls setupTestStore which sets BEADS_TEST_MODE=1,
 	// causing the beads SDK to create testdb_<hash> databases. By routing
