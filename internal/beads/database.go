@@ -201,8 +201,17 @@ func doltTargetEnvFromBeadsDir(beadsDir string) []string {
 	}
 	meta := readDoltMetadata(beadsDir)
 	var env []string
-	if townRoot := FindTownRoot(filepath.Dir(beadsDir)); townRoot != "" {
-		env = append(env, "BEADS_DOLT_DATA_DIR="+filepath.Join(townRoot, ".dolt-data"))
+	// BEADS_DOLT_DATA_DIR is an embedded-mode concept: it tells bd where the
+	// local Dolt data lives. In server mode bd connects over host/port to a
+	// named database, and injecting a data-dir (e.g. the town's ~/.dolt-data,
+	// which holds only a port-pin config.yaml and NO databases) hijacks bd's
+	// database resolution — mol wisp silently misroutes to the default `hq` DB,
+	// or a pinned database trips PROJECT IDENTITY MISMATCH. Only set it when the
+	// workspace is genuinely embedded. (Dolt migration anvil:3306 -> local 3307.)
+	if !meta.ServerMode {
+		if townRoot := FindTownRoot(filepath.Dir(beadsDir)); townRoot != "" {
+			env = append(env, "BEADS_DOLT_DATA_DIR="+filepath.Join(townRoot, ".dolt-data"))
+		}
 	}
 	if meta.Host != "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+meta.Host)
@@ -215,8 +224,9 @@ func doltTargetEnvFromBeadsDir(beadsDir string) []string {
 }
 
 type doltMetadata struct {
-	Host string
-	Port string
+	Host       string
+	Port       string
+	ServerMode bool
 }
 
 func readDoltMetadata(beadsDir string) doltMetadata {
@@ -231,6 +241,7 @@ func readDoltMetadata(beadsDir string) doltMetadata {
 	var raw struct {
 		DoltServerHost string `json:"dolt_server_host"`
 		DoltServerPort int    `json:"dolt_server_port"`
+		DoltMode       string `json:"dolt_mode"`
 	}
 	if json.Unmarshal(data, &raw) != nil {
 		return meta
@@ -239,6 +250,10 @@ func readDoltMetadata(beadsDir string) doltMetadata {
 	if meta.Port == "" && raw.DoltServerPort > 0 {
 		meta.Port = strconv.Itoa(raw.DoltServerPort)
 	}
+	// "server" and "proxied-server" both connect over host/port, not a local
+	// data-dir. Treat any non-embedded mode as server mode for data-dir gating.
+	mode := strings.ToLower(strings.TrimSpace(raw.DoltMode))
+	meta.ServerMode = mode != "" && mode != "embedded"
 	return meta
 }
 
