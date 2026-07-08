@@ -1,7 +1,7 @@
 From df6e3922a1f9325d9ea2ab5aa343296bf8de5f67 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 13:39:35 -0400
-Subject: [PATCH 28/35] =?UTF-8?q?feat(daemon):=20context-lifecycle=20watch?=
+Subject: [PATCH 28/37] =?UTF-8?q?feat(daemon):=20context-lifecycle=20watch?=
  =?UTF-8?q?dog=20=E2=80=94=20auto-cycle=20persistent=20agents=20before=20c?=
  =?UTF-8?q?ontext=20RED?=
 MIME-Version: 1.0

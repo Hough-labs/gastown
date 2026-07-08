@@ -1,0 +1,206 @@
+From 5e37c073e2ebac2e3eaa4dc20b90b80435bbcd55 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 8 Jul 2026 17:01:11 -0400
+Subject: [PATCH 37/37] fix(sling): mark review-only formula beads review_only
+ so gt done skips verified_push gate (gfork-06a)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A reviewer dispatched with mol-polecat-review-pr posts its GitHub review and runs
+`gt done`, which takes the no-MR completion path and applies a verified_push gate
+(done.go). Reviewers make zero code commits, yet the gate demands HEAD be on
+origin/master — so it fails whenever the reviewer's HEAD is not an ancestor of the
+current tip (reviewer reuse with an orphaned base, or a squash-merge discarding the
+base), wedging the reviewer and holding a polecat slot.
+
+The gate already has an escape: done.go skips it when the bead is review_only
+(af.NoMerge || af.ReviewOnly). But that field never reached mol-polecat-review-pr
+reviewer beads:
+  1. The formula lacked the `review_only = true` marker its siblings declare
+     (mol-plan-review, mol-prd-review, mol-polecat-code-review).
+  2. Even with the marker, formula-level review_only only propagated via the
+     convoy-leg path (buildConvoyLegSlingArgs); the single-reviewer / scheduler
+     dispatch set the bead's ReviewOnly only from the --review-only flag.
+
+Fix:
+  - Declare `review_only = true` in mol-polecat-review-pr.formula.toml.
+  - In storeFieldsInBead (the single attachment-field write chokepoint for every
+    dispatch route), derive review_only from the attached formula so a formula that
+    declares it stamps its bead regardless of dispatch path.
+
+Marking these beads review_only also correctly classifies them as
+merge-queue-not-required (mqNotRequiredSource), matching mol-polecat-code-review.
+
+Discovered by Gassy's android require_review=true test run; characterized on an-1af.
+Provenance: upstream gap (review-only wired for convoy legs + manual flag but never
+for single-reviewer PR dispatch).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/sling_helpers.go                 | 31 +++++++
+ internal/cmd/sling_review_only_test.go        | 92 +++++++++++++++++++
+ .../mol-polecat-review-pr.formula.toml        |  2 +
+ 3 files changed, 125 insertions(+)
+ create mode 100644 internal/cmd/sling_review_only_test.go
+
+diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
+index 9ef037e0..79c8cf1c 100644
+--- a/internal/cmd/sling_helpers.go
++++ b/internal/cmd/sling_helpers.go
+@@ -564,6 +564,15 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+ 	if updates.ReviewOnly {
+ 		fields.ReviewOnly = true
+ 	}
++	// A formula that declares review_only=true marks its bead review_only on every
++	// dispatch route. Convoy legs already OR this in (buildConvoyLegSlingArgs), but
++	// the single-reviewer / scheduler dispatch did not — so an iris-dispatched
++	// mol-polecat-review-pr reviewer never got the field and wedged gt done's
++	// verified_push gate (gfork-06a). Keyed on AttachedFormula, which is always set
++	// at dispatch time.
++	if !fields.ReviewOnly && formulaDeclaresReviewOnly(fields.AttachedFormula) {
++		fields.ReviewOnly = true
++	}
+ 	if updates.Mode != "" {
+ 		fields.Mode = updates.Mode
+ 	}
+@@ -598,6 +607,28 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+ 	return nil
+ }
+ 
++// formulaDeclaresReviewOnly reports whether the named formula sets
++// review_only=true at the top level (e.g. mol-polecat-review-pr,
++// mol-polecat-code-review). This lets any dispatch path — not just convoy legs
++// (see buildConvoyLegSlingArgs) — mark a reviewer's bead review_only, so gt done's
++// no-MR completion skips the verified_push gate for a worker that produced no
++// mergeable commits (gfork-06a). Best-effort: any load/parse failure returns
++// false, and callers fall back to the explicit --review-only flag.
++func formulaDeclaresReviewOnly(name string) bool {
++	if name == "" {
++		return false
++	}
++	content, err := formula.GetEmbeddedFormulaContent(name)
++	if err != nil {
++		return false
++	}
++	f, err := formula.Parse(content)
++	if err != nil {
++		return false
++	}
++	return f.ReviewOnly
++}
++
+ // injectStartPrompt sends a prompt to the target pane to start working.
+ // Uses the reliable nudge pattern: literal mode + 500ms debounce + separate Enter.
+ func injectStartPrompt(pane, beadID, subject, args string) error {
+diff --git a/internal/cmd/sling_review_only_test.go b/internal/cmd/sling_review_only_test.go
+new file mode 100644
+index 00000000..040fac17
+--- /dev/null
++++ b/internal/cmd/sling_review_only_test.go
+@@ -0,0 +1,92 @@
++package cmd
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/formula"
++)
++
++// TestReviewPRFormula_DeclaresReviewOnly guards that the PR-review formula
++// declares review_only=true, matching its sibling review formulas
++// (mol-plan-review, mol-prd-review, mol-polecat-code-review). Without this
++// marker, a dispatched reviewer's bead never gets review_only, so gt done's
++// verified_push gate wedges the reviewer. See gfork-06a / an-1af.
++func TestReviewPRFormula_DeclaresReviewOnly(t *testing.T) {
++	content, err := formula.GetEmbeddedFormulaContent("mol-polecat-review-pr")
++	if err != nil {
++		t.Fatalf("GetEmbeddedFormulaContent: %v", err)
++	}
++	f, err := formula.Parse(content)
++	if err != nil {
++		t.Fatalf("Parse: %v", err)
++	}
++	if !f.ReviewOnly {
++		t.Error("mol-polecat-review-pr must declare review_only=true — reviewers make no code commits (gfork-06a)")
++	}
++}
++
++// TestFormulaDeclaresReviewOnly covers the helper that lets any dispatch path
++// derive review_only from the attached formula (not just convoy legs).
++func TestFormulaDeclaresReviewOnly(t *testing.T) {
++	tests := []struct {
++		name    string
++		formula string
++		want    bool
++	}{
++		{"review-pr is review-only", "mol-polecat-review-pr", true},
++		{"code-review is review-only", "mol-polecat-code-review", true},
++		{"polecat-work is not review-only", "mol-polecat-work", false},
++		{"unknown formula falls back to false", "does-not-exist", false},
++		{"empty name falls back to false", "", false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := formulaDeclaresReviewOnly(tt.formula); got != tt.want {
++				t.Errorf("formulaDeclaresReviewOnly(%q) = %v, want %v", tt.formula, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestStoreFieldsInBead_DerivesReviewOnlyFromFormula proves that dispatching a
++// review-only formula stamps review_only on the bead even when the caller does
++// not pass the explicit --review-only flag (the iris single-reviewer path).
++// The GT_TEST_ATTACHED_MOLECULE_LOG seam renders the attachment fields to a
++// file instead of hitting bd, so this stays hermetic.
++func TestStoreFieldsInBead_DerivesReviewOnlyFromFormula(t *testing.T) {
++	tests := []struct {
++		name            string
++		attachedFormula string
++		explicitReview  bool
++		wantReviewOnly  bool
++	}{
++		{"review-pr formula derives review_only without flag", "mol-polecat-review-pr", false, true},
++		{"explicit flag still wins for non-review formula", "mol-polecat-work", true, true},
++		{"non-review formula without flag stays off", "mol-polecat-work", false, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			logPath := filepath.Join(t.TempDir(), "attach.log")
++			t.Setenv("GT_TEST_ATTACHED_MOLECULE_LOG", logPath)
++
++			if err := storeFieldsInBead("an-test", beadFieldUpdates{
++				AttachedFormula: tt.attachedFormula,
++				ReviewOnly:      tt.explicitReview,
++			}); err != nil {
++				t.Fatalf("storeFieldsInBead: %v", err)
++			}
++
++			data, err := os.ReadFile(logPath)
++			if err != nil {
++				t.Fatalf("read rendered attachment log: %v", err)
++			}
++			got := strings.Contains(string(data), "review_only: true")
++			if got != tt.wantReviewOnly {
++				t.Errorf("review_only present = %v, want %v\nrendered:\n%s", got, tt.wantReviewOnly, data)
++			}
++		})
++	}
++}
+diff --git a/internal/formula/formulas/mol-polecat-review-pr.formula.toml b/internal/formula/formulas/mol-polecat-review-pr.formula.toml
+index 0dc18db9..2465bb1b 100644
+--- a/internal/formula/formulas/mol-polecat-review-pr.formula.toml
++++ b/internal/formula/formulas/mol-polecat-review-pr.formula.toml
+@@ -1,3 +1,5 @@
++review_only = true  # Reviewer evaluates the PR and records a GitHub review — no code commits (gfork-06a)
++
+ description = """
+ Review an external PR and decide on merge/reject/revise.
+ 
+-- 
+2.50.1 (Apple Git-155)
+
