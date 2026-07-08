@@ -1462,9 +1462,12 @@ func loadRigCommandVars(townRoot, rig string) []string {
 	if mq.MergeStrategy != "" {
 		vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
 	}
-	if mq.IsRequireReviewEnabled() {
-		vars = append(vars, "require_review=true")
-	}
+	// Always emit the explicit value (true OR false), mirroring the patrol path
+	// (buildRefineryPatrolVars). Emitting only on enabled left the formula
+	// default as the source of truth for the disabled case — if that default
+	// ever flips to true, omitting the var here would silently over-require
+	// review on the sling path. (gfork-a84, upstream #3370 asymmetry)
+	vars = append(vars, fmt.Sprintf("require_review=%t", mq.IsRequireReviewEnabled()))
 	return vars
 }
 
