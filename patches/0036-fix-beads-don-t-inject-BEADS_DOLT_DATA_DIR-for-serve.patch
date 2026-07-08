@@ -1,0 +1,89 @@
+From bf302ee24ab9a1b30ead856abca6ba89e9a84de3 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 7 Jul 2026 01:49:01 -0400
+Subject: [PATCH 36/37] fix(beads): don't inject BEADS_DOLT_DATA_DIR for
+ server-mode rigs
+
+gt injected BEADS_DOLT_DATA_DIR=<townRoot>/.dolt-data into every bd
+subprocess via doltTargetEnvFromBeadsDir. After the Dolt migration
+(anvil:3306 -> local hammer 3307), that dir holds only a port-pin
+config.yaml and NO databases. In server mode its presence hijacks bd's
+database resolution: `bd mol wisp` (gt sling step 2) silently misroutes
+the wisp to the default `hq` DB (hq-wisp-*) instead of the rig DB
+(gaunt-wisp-*), so the subsequent cross-DB `bd mol bond` fails with
+"not found" and every gt sling rolls back its spawned polecat. Pinning
+the database instead trips PROJECT IDENTITY MISMATCH.
+
+BEADS_DOLT_DATA_DIR is an embedded-mode concept; in server mode bd
+connects over host/port to a named database. Gate the injection on
+metadata dolt_mode so it's only set for genuinely embedded workspaces.
+gt's other uses of ~/.dolt-data (DefaultConfig port read, admission
+cmd.Dir) are separate code paths and unaffected.
+
+Verified: real `gt sling <bead> gauntlet --no-boot` now creates
+gaunt-wisp-* + bonds cleanly, no rollback; bd subprocess env carries no
+BEADS_DOLT_DATA_DIR.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/beads/database.go | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/internal/beads/database.go b/internal/beads/database.go
+index a4c61de3..0a45bdfc 100644
+--- a/internal/beads/database.go
++++ b/internal/beads/database.go
+@@ -201,8 +201,17 @@ func doltTargetEnvFromBeadsDir(beadsDir string) []string {
+ 	}
+ 	meta := readDoltMetadata(beadsDir)
+ 	var env []string
+-	if townRoot := FindTownRoot(filepath.Dir(beadsDir)); townRoot != "" {
+-		env = append(env, "BEADS_DOLT_DATA_DIR="+filepath.Join(townRoot, ".dolt-data"))
++	// BEADS_DOLT_DATA_DIR is an embedded-mode concept: it tells bd where the
++	// local Dolt data lives. In server mode bd connects over host/port to a
++	// named database, and injecting a data-dir (e.g. the town's ~/.dolt-data,
++	// which holds only a port-pin config.yaml and NO databases) hijacks bd's
++	// database resolution — mol wisp silently misroutes to the default `hq` DB,
++	// or a pinned database trips PROJECT IDENTITY MISMATCH. Only set it when the
++	// workspace is genuinely embedded. (Dolt migration anvil:3306 -> local 3307.)
++	if !meta.ServerMode {
++		if townRoot := FindTownRoot(filepath.Dir(beadsDir)); townRoot != "" {
++			env = append(env, "BEADS_DOLT_DATA_DIR="+filepath.Join(townRoot, ".dolt-data"))
++		}
+ 	}
+ 	if meta.Host != "" {
+ 		env = append(env, "BEADS_DOLT_SERVER_HOST="+meta.Host)
+@@ -215,8 +224,9 @@ func doltTargetEnvFromBeadsDir(beadsDir string) []string {
+ }
+ 
+ type doltMetadata struct {
+-	Host string
+-	Port string
++	Host       string
++	Port       string
++	ServerMode bool
+ }
+ 
+ func readDoltMetadata(beadsDir string) doltMetadata {
+@@ -231,6 +241,7 @@ func readDoltMetadata(beadsDir string) doltMetadata {
+ 	var raw struct {
+ 		DoltServerHost string `json:"dolt_server_host"`
+ 		DoltServerPort int    `json:"dolt_server_port"`
++		DoltMode       string `json:"dolt_mode"`
+ 	}
+ 	if json.Unmarshal(data, &raw) != nil {
+ 		return meta
+@@ -239,6 +250,10 @@ func readDoltMetadata(beadsDir string) doltMetadata {
+ 	if meta.Port == "" && raw.DoltServerPort > 0 {
+ 		meta.Port = strconv.Itoa(raw.DoltServerPort)
+ 	}
++	// "server" and "proxied-server" both connect over host/port, not a local
++	// data-dir. Treat any non-embedded mode as server mode for data-dir gating.
++	mode := strings.ToLower(strings.TrimSpace(raw.DoltMode))
++	meta.ServerMode = mode != "" && mode != "embedded"
+ 	return meta
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
