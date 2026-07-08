@@ -1,3 +1,5 @@
+review_only = true  # Reviewer evaluates the PR and records a GitHub review — no code commits (gfork-06a)
+
 description = """
 Review an external PR and decide on merge/reject/revise.
 
