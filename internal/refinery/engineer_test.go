@@ -19,6 +19,19 @@ import (
 	"github.com/steveyegge/gastown/internal/testutil"
 )
 
+// writeEngineerSettingsConfig writes rig merge-queue config to the canonical
+// <rigPath>/settings/config.json that Engineer.LoadConfig reads (gfork-hgx).
+func writeEngineerSettingsConfig(t *testing.T, rigPath string, data []byte) {
+	t.Helper()
+	settingsDir := filepath.Join(rigPath, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("mkdir settings dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
+		t.Fatalf("write settings/config.json: %v", err)
+	}
+}
+
 func TestDefaultMergeQueueConfig(t *testing.T) {
 	cfg := DefaultMergeQueueConfig()
 
@@ -136,11 +149,11 @@ func TestEngineerTerminalCloseClearsAgentActiveMRUsesTownBeadsDir(t *testing.T) 
 		townBeadsDir,
 		rigBeadsDir,
 	} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
 		t.Fatalf("write town.json: %v", err)
 	}
 	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
@@ -182,7 +195,7 @@ case "$cmd" in
     ;;
 esac
 `, logPath)
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write mock bd: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -382,9 +395,7 @@ func TestEngineer_LoadConfig_WithMergeQueue(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{
 		Name: "test-rig",
@@ -441,9 +452,7 @@ func TestEngineer_LoadConfig_AutoPushDisabled(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{
 		Name: "test-rig",
@@ -476,9 +485,7 @@ func TestEngineer_LoadConfig_NoMergeQueueSection(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{
 		Name: "test-rig",
@@ -511,9 +518,7 @@ func TestEngineer_LoadConfig_InvalidPollInterval(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{
 		Name: "test-rig",
@@ -553,9 +558,7 @@ func TestEngineer_LoadConfig_InvalidStaleClaimTimeout(t *testing.T) {
 			}
 
 			data, _ := json.MarshalIndent(config, "", "  ")
-			if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-				t.Fatal(err)
-			}
+			writeEngineerSettingsConfig(t, tmpDir, data)
 
 			r := &rig.Rig{
 				Name: "test-rig",
@@ -621,9 +624,7 @@ func TestEngineer_LoadConfig_WithGates(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
 	e := NewEngineer(r)
@@ -681,9 +682,7 @@ func TestEngineer_LoadConfig_GateInvalidTimeout(t *testing.T) {
 			}
 
 			data, _ := json.MarshalIndent(config, "", "  ")
-			if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-				t.Fatal(err)
-			}
+			writeEngineerSettingsConfig(t, tmpDir, data)
 
 			r := &rig.Rig{Name: "test-rig", Path: tmpDir}
 			e := NewEngineer(r)
@@ -718,9 +717,7 @@ func TestEngineer_LoadConfig_GatePhase(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
 	e := NewEngineer(r)
@@ -756,9 +753,7 @@ func TestEngineer_LoadConfig_GateInvalidPhase(t *testing.T) {
 	}
 
 	data, _ := json.MarshalIndent(config, "", "  ")
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	writeEngineerSettingsConfig(t, tmpDir, data)
 
 	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
 	e := NewEngineer(r)
@@ -1025,7 +1020,7 @@ func TestPostMergeConvoyCheck_NoTownBeads(t *testing.T) {
 
 	// Create rig dir as a subdirectory of the "town root"
 	rigDir := filepath.Join(tmpDir, "testrig")
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1059,12 +1054,12 @@ func TestCheckAndCloseCompletedConvoys_UsesHardenedBDEnvs(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	townBeads := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(townBeads, 0755); err != nil {
+	if err := os.MkdirAll(townBeads, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	rigDir := filepath.Join(tmpDir, "l9")
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1131,7 +1126,7 @@ case "$*" in
     ;;
 esac
 `
-	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1167,7 +1162,7 @@ func TestNotifyDeaconConvoyFeeding_SkipsWhenNoConvoyID(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	rigDir := filepath.Join(tmpDir, "testrig")
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1203,7 +1198,7 @@ func TestNotifyDeaconConvoyFeeding_AttemptsWhenConvoyID(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	rigDir := filepath.Join(tmpDir, "testrig")
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1324,10 +1319,10 @@ func TestEngineerNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
 	townRoot := filepath.Join(tmpDir, "town")
 	rigDir := filepath.Join(townRoot, "testrig")
 	townBeads := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(townBeads, 0755); err != nil {
+	if err := os.MkdirAll(townBeads, 0o755); err != nil {
 		t.Fatalf("mkdir town beads: %v", err)
 	}
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatalf("mkdir rig: %v", err)
 	}
 
@@ -1361,7 +1356,7 @@ case "$1" in
 esac
 exit 0
 `
-	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0o755); err != nil {
 		t.Fatalf("write bd stub: %v", err)
 	}
 
@@ -1371,7 +1366,7 @@ if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
 fi
 exit 0
 `
-	if err := os.WriteFile(gtPath, []byte(gtScript), 0755); err != nil {
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0o755); err != nil {
 		t.Fatalf("write gt stub: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -315,9 +316,12 @@ func (e *Engineer) SetOutput(w io.Writer) {
 	e.output = w
 }
 
-// LoadConfig loads merge queue configuration from the rig's config.json.
+// LoadConfig loads merge queue configuration from the rig's settings/config.json
+// (config.RigSettingsPath) — the canonical location operators write via
+// `gt rig settings set`. Reading the rig-root config.json instead silently
+// ignored every merge_queue setting (require_review, gates, etc.). (gfork-hgx)
 func (e *Engineer) LoadConfig() error {
-	configPath := filepath.Join(e.rig.Path, "config.json")
+	configPath := config.RigSettingsPath(e.rig.Path)
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1641,7 +1645,8 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 	retryCount := mr.RetryCount + 1
 
 	// Build the task description with metadata
-	description := fmt.Sprintf(`Resolve merge conflicts for branch %s
+	description := fmt.Sprintf(
+		`Resolve merge conflicts for branch %s
 
 ## Metadata
 - Original MR: %s
