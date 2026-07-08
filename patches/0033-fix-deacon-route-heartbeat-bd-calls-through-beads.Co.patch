@@ -1,7 +1,7 @@
 From 4fbe69ce4e327c8ef59be4d857971c3477bddc8e Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 15:25:29 -0400
-Subject: [PATCH 33/38] fix(deacon): route heartbeat bd calls through
+Subject: [PATCH 33/40] fix(deacon): route heartbeat bd calls through
  beads.Command (gfork-94k)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

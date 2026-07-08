@@ -1,0 +1,129 @@
+From 753f2751aea9c3f029d5b893fb41465b491644a3 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 8 Jul 2026 19:52:30 -0400
+Subject: [PATCH 40/40] fix(sling): emit require_review=%t explicitly, matching
+ patrol path (gfork-a84)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two builders feed the refinery formula's {{require_review}} var and disagreed:
+buildRefineryPatrolVars (patrol/prime) emitted require_review=%t (true OR false),
+but loadRigCommandVars (sling) emitted require_review=true only when enabled and
+OMITTED it when disabled — leaving the formula's default="false" as the single
+source of truth for the disabled case.
+
+Harmless today (default is false), but if that default ever flips to true (or a
+future formula assumes the var is always set), the sling path would silently
+over-require review while the patrol path stayed correct. Both are upstream-origin
+(PR #3370 / b793d145), present in v1.2.1.
+
+Fix (one line): loadRigCommandVars now emits require_review=%t unconditionally,
+so both paths always carry the explicit value and the formula default is a pure
+fallback. TDD red->green: internal/cmd/sling_require_review_test.go — the disabled
+case failed (var omitted) before the fix, passes after. Candidate to upstream.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/sling_helpers.go             |  9 ++-
+ internal/cmd/sling_require_review_test.go | 68 +++++++++++++++++++++++
+ 2 files changed, 74 insertions(+), 3 deletions(-)
+ create mode 100644 internal/cmd/sling_require_review_test.go
+
+diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
+index 79c8cf1c..3bdc0ba2 100644
+--- a/internal/cmd/sling_helpers.go
++++ b/internal/cmd/sling_helpers.go
+@@ -1462,9 +1462,12 @@ func loadRigCommandVars(townRoot, rig string) []string {
+ 	if mq.MergeStrategy != "" {
+ 		vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
+ 	}
+-	if mq.IsRequireReviewEnabled() {
+-		vars = append(vars, "require_review=true")
+-	}
++	// Always emit the explicit value (true OR false), mirroring the patrol path
++	// (buildRefineryPatrolVars). Emitting only on enabled left the formula
++	// default as the source of truth for the disabled case — if that default
++	// ever flips to true, omitting the var here would silently over-require
++	// review on the sling path. (gfork-a84, upstream #3370 asymmetry)
++	vars = append(vars, fmt.Sprintf("require_review=%t", mq.IsRequireReviewEnabled()))
+ 	return vars
+ }
+ 
+diff --git a/internal/cmd/sling_require_review_test.go b/internal/cmd/sling_require_review_test.go
+new file mode 100644
+index 00000000..9170e4f3
+--- /dev/null
++++ b/internal/cmd/sling_require_review_test.go
+@@ -0,0 +1,68 @@
++package cmd
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/config"
++)
++
++// TestLoadRigCommandVars_RequireReviewBothValues guards gfork-a84: the sling
++// path (loadRigCommandVars) must emit require_review for BOTH true and false,
++// matching the patrol path (buildRefineryPatrolVars). Previously it emitted the
++// var only when enabled, leaving the formula default as the single source of
++// truth for the disabled case — a silent over-require risk if that default ever
++// flips to true.
++func TestLoadRigCommandVars_RequireReviewBothValues(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		enabled bool
++		want    string
++	}{
++		{"enabled emits true", true, "true"},
++		{"disabled emits false", false, "false"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			townRoot := t.TempDir()
++			rig := "testrig"
++			settingsDir := filepath.Join(townRoot, rig, "settings")
++			if err := os.MkdirAll(settingsDir, 0o755); err != nil {
++				t.Fatal(err)
++			}
++
++			enabled := tc.enabled
++			settings := config.RigSettings{
++				Type:    "rig-settings",
++				Version: 1,
++				MergeQueue: &config.MergeQueueConfig{
++					Enabled:       true,
++					RequireReview: &enabled,
++				},
++			}
++			data, _ := json.Marshal(settings)
++			if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
++				t.Fatal(err)
++			}
++
++			vars := loadRigCommandVars(townRoot, rig)
++
++			varMap := make(map[string]string)
++			for _, v := range vars {
++				parts := splitFirstEquals(v)
++				if len(parts) == 2 {
++					varMap[parts[0]] = parts[1]
++				}
++			}
++
++			got, ok := varMap["require_review"]
++			if !ok {
++				t.Fatalf("require_review var not emitted (disabled case regressed to omit); vars=%v", vars)
++			}
++			if got != tc.want {
++				t.Errorf("require_review = %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+
