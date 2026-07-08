@@ -564,6 +564,15 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	if updates.ReviewOnly {
 		fields.ReviewOnly = true
 	}
+	// A formula that declares review_only=true marks its bead review_only on every
+	// dispatch route. Convoy legs already OR this in (buildConvoyLegSlingArgs), but
+	// the single-reviewer / scheduler dispatch did not — so an iris-dispatched
+	// mol-polecat-review-pr reviewer never got the field and wedged gt done's
+	// verified_push gate (gfork-06a). Keyed on AttachedFormula, which is always set
+	// at dispatch time.
+	if !fields.ReviewOnly && formulaDeclaresReviewOnly(fields.AttachedFormula) {
+		fields.ReviewOnly = true
+	}
 	if updates.Mode != "" {
 		fields.Mode = updates.Mode
 	}
@@ -596,6 +605,28 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 
 	return nil
+}
+
+// formulaDeclaresReviewOnly reports whether the named formula sets
+// review_only=true at the top level (e.g. mol-polecat-review-pr,
+// mol-polecat-code-review). This lets any dispatch path — not just convoy legs
+// (see buildConvoyLegSlingArgs) — mark a reviewer's bead review_only, so gt done's
+// no-MR completion skips the verified_push gate for a worker that produced no
+// mergeable commits (gfork-06a). Best-effort: any load/parse failure returns
+// false, and callers fall back to the explicit --review-only flag.
+func formulaDeclaresReviewOnly(name string) bool {
+	if name == "" {
+		return false
+	}
+	content, err := formula.GetEmbeddedFormulaContent(name)
+	if err != nil {
+		return false
+	}
+	f, err := formula.Parse(content)
+	if err != nil {
+		return false
+	}
+	return f.ReviewOnly
 }
 
 // injectStartPrompt sends a prompt to the target pane to start working.
