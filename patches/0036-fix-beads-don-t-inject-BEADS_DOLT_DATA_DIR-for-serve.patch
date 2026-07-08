@@ -1,7 +1,7 @@
 From bf302ee24ab9a1b30ead856abca6ba89e9a84de3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 7 Jul 2026 01:49:01 -0400
-Subject: [PATCH 36/37] fix(beads): don't inject BEADS_DOLT_DATA_DIR for
+Subject: [PATCH 36/38] fix(beads): don't inject BEADS_DOLT_DATA_DIR for
  server-mode rigs
 
 gt injected BEADS_DOLT_DATA_DIR=<townRoot>/.dolt-data into every bd

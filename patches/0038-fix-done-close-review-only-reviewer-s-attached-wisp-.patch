@@ -1,0 +1,255 @@
+From 2ba83da0bbb07f00dd661738a6b12380c4fcda1f Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Wed, 8 Jul 2026 19:41:51 -0400
+Subject: [PATCH 38/38] fix(done): close review-only reviewer's attached wisp
+ on no-MR completion (gfork-4sz)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A require_review=true reviewer (formula mol-polecat-review-pr) runs gt done on
+the no-MR completion path. gfork-06a made that path reachable for review-only
+beads (isNoMergeTask=true skips the verified_push gate), so the base bead is now
+force-closed via ForceCloseWithReason — bypassing its open attached wisp. That
+resolves the *blocking* half of gfork-4sz.
+
+But the no-MR path never closed the wisp itself, and updateAgentStateOnDone (run
+later via notifyWitness) then skips its own wisp-close because the base bead is
+already terminal — leaving the wisp orphaned/open. A reviewer's gt done should
+leave nothing dangling.
+
+Fix: extract the wisp-close logic into closeAttachedWisp (step descendants +
+force-close the wisp root, ErrNotFound-tolerant) and call it from both the
+no-MR close path (after the base bead force-closes) and updateAgentStateOnDone
+(behavior-preserving refactor). Auto-resolves the wisp on review-only completion.
+
+Hermetic tests (internal/cmd/done_review_wisp_test.go): closeAttachedWisp closes
+the wisp + step descendants for a review-only bead, and is a safe no-op when the
+bead has no attached molecule. Full loop green (gofumpt/vet/build clean; new
+tests pass under -race). internal/cmd's 20 pre-existing failures (macOS unsigned-
+binary SIGKILL + bd-subprocess, gfork-94k class) verified identical with this
+change stashed — zero new failures.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/done.go                  |  69 ++++++++++------
+ internal/cmd/done_review_wisp_test.go | 113 ++++++++++++++++++++++++++
+ 2 files changed, 158 insertions(+), 24 deletions(-)
+ create mode 100644 internal/cmd/done_review_wisp_test.go
+
+diff --git a/internal/cmd/done.go b/internal/cmd/done.go
+index 575694f2..8ecac6a7 100644
+--- a/internal/cmd/done.go
++++ b/internal/cmd/done.go
+@@ -634,6 +634,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
+ 					}
+ 					if closeErr != nil {
+ 						style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
++					} else {
++						// gfork-4sz: the base bead was just force-closed (bypassing
++						// its open attached wisp). But updateAgentStateOnDone will
++						// later skip its own wisp-close because the base is now
++						// terminal — orphaning the wisp. Close it here so a
++						// review-only reviewer's gt done leaves nothing dangling.
++						// Best-effort: closing the base bead is what matters.
++						if issue, showErr := bd.Show(issueID); showErr == nil {
++							if wispErr := closeAttachedWisp(bd, issue); wispErr != nil {
++								style.PrintWarning("%v", wispErr)
++							}
++						}
+ 					}
+ 				}
+ 			}
+@@ -1773,6 +1785,33 @@ func prMergeStrategyForRig(townRoot, rigName string) bool {
+ 	return settings.MergeQueue.MergeStrategy == "pr"
+ }
+ 
++// closeAttachedWisp closes a bead's attached molecule (wisp) so gt done leaves
++// no orphaned ephemeral molecule behind. It closes the wisp's step descendants
++// first (bd close does not cascade), then force-closes the wisp root — force
++// handles any status (hooked/open/in_progress) and bypasses molecule dependency
++// checks, matching gt mol burn/squash (#1879). It is a no-op when the bead has
++// no attached molecule. ErrNotFound (already burned/deleted by another path) is
++// treated as success; any other close failure is returned so the caller can
++// avoid closing a base bead whose wisp may still block it. (gfork-4sz)
++func closeAttachedWisp(bd *beads.Beads, issue *beads.Issue) error {
++	attachment := beads.ParseAttachmentFields(issue)
++	if attachment == nil || attachment.AttachedMolecule == "" {
++		return nil
++	}
++	// Close molecule step descendants before closing the wisp root — without
++	// this, open/in_progress steps stay stuck forever after gt done completes.
++	if n := closeDescendants(bd, attachment.AttachedMolecule); n > 0 {
++		fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
++	}
++	if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
++		if !errors.Is(closeErr, beads.ErrNotFound) {
++			return fmt.Errorf("couldn't close attached molecule %s: %w", attachment.AttachedMolecule, closeErr)
++		}
++		// Not found = already burned/deleted by another path, treat as done.
++	}
++	return nil
++}
++
+ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+ 	// Get role context - try multiple sources for resilience
+ 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+@@ -1873,30 +1912,12 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+ 			// has attached_molecule pointing to the wisp. Without this fix, gt done
+ 			// only closed the hooked bead, leaving the wisp orphaned.
+ 			// Order matters: wisp closes -> unblocks base bead -> base bead closes.
+-			attachment := beads.ParseAttachmentFields(hookedBead)
+-			if attachment != nil && attachment.AttachedMolecule != "" {
+-				// Close molecule step descendants before closing the wisp root.
+-				// bd close doesn't cascade — without this, open/in_progress steps
+-				// from the molecule stay stuck forever after gt done completes.
+-				// Order: step children -> wisp root -> base bead.
+-				if n := closeDescendants(bd, attachment.AttachedMolecule); n > 0 {
+-					fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
+-				}
+-
+-				// Close the wisp root with --force and audit reason.
+-				// ForceCloseWithReason handles any status (hooked, open, in_progress)
+-				// and records the reason + session for attribution.
+-				// Same pattern as gt mol burn/squash (#1879).
+-				if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
+-					if !errors.Is(closeErr, beads.ErrNotFound) {
+-						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
+-						// Don't try to close hookedBeadID - it may still be blocked.
+-						// But DO clear hooks and update agent state (goto doneStateUpdate)
+-						// so the polecat isn't stuck in 'working' state (za-o9e).
+-						goto doneStateUpdate
+-					}
+-					// Not found = already burned/deleted by another path, continue
+-				}
++			if closeErr := closeAttachedWisp(bd, hookedBead); closeErr != nil {
++				fmt.Fprintf(os.Stderr, "Warning: %v\n", closeErr)
++				// Don't try to close hookedBeadID - it may still be blocked.
++				// But DO clear hooks and update agent state (goto doneStateUpdate)
++				// so the polecat isn't stuck in 'working' state (za-o9e).
++				goto doneStateUpdate
+ 			}
+ 
+ 			// Acceptance criteria gate: skip close if criteria are unchecked.
+diff --git a/internal/cmd/done_review_wisp_test.go b/internal/cmd/done_review_wisp_test.go
+new file mode 100644
+index 00000000..afc10388
+--- /dev/null
++++ b/internal/cmd/done_review_wisp_test.go
+@@ -0,0 +1,113 @@
++package cmd
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/beads"
++)
++
++// writeWispBdStub installs a shell `bd` stub on PATH that returns two open step
++// children for the wisp and logs every close target (bead IDs, skipping flags)
++// to a returned log path. Mirrors the harness in done_closeDescendants_test.go.
++func writeWispBdStub(t *testing.T, wispID string) (bd *beads.Beads, closesLog string) {
++	t.Helper()
++	if runtime.GOOS == "windows" {
++		t.Skip("shell script bd stub not supported on Windows")
++	}
++
++	root := t.TempDir()
++	binDir := filepath.Join(root, "bin")
++	if err := os.MkdirAll(binDir, 0o755); err != nil {
++		t.Fatalf("mkdir bin: %v", err)
++	}
++	closesLog = filepath.Join(root, "closes.log")
++
++	// Skip any leading global flags, dispatch on the subcommand. `list` for the
++	// wisp returns two open children (grandchildren lists return empty), `close`
++	// logs the non-flag positional args.
++	script := `#!/bin/sh
++while [ $# -gt 0 ]; do
++  case "$1" in --*) shift ;; *) break ;; esac
++done
++cmd="$1"; shift || true
++case "$cmd" in
++  list)
++    if echo "$*" | grep -q "parent=` + wispID + `"; then
++      echo '[{"id":"gt-step-1","title":"Step 1","status":"open"},{"id":"gt-step-2","title":"Step 2","status":"open"}]'
++    else
++      echo '[]'
++    fi
++    ;;
++  close)
++    for arg in "$@"; do
++      case "$arg" in --*) continue ;; esac
++      echo "$arg" >> "` + closesLog + `"
++    done
++    ;;
++esac
++exit 0
++`
++	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
++		t.Fatalf("write bd stub: %v", err)
++	}
++	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	return beads.New(root), closesLog
++}
++
++// TestCloseAttachedWisp_ClosesWispAndDescendants guards the gfork-4sz fix: a
++// review-only reviewer's gt done must leave nothing dangling. closeAttachedWisp
++// closes the wisp's step descendants first, then force-closes the wisp root.
++// It is wired into both the no-MR close path (where the base bead is
++// force-closed ahead of updateAgentStateOnDone's now-skipped wisp close) and
++// updateAgentStateOnDone itself.
++func TestCloseAttachedWisp_ClosesWispAndDescendants(t *testing.T) {
++	bd, closesLog := writeWispBdStub(t, "gt-wisp-xyz")
++
++	issue := &beads.Issue{
++		ID: "gt-base-123",
++		Description: strings.Join([]string{
++			"attached_formula: mol-polecat-review-pr",
++			"attached_molecule: gt-wisp-xyz",
++			"review_only: true",
++		}, "\n"),
++	}
++
++	if err := closeAttachedWisp(bd, issue); err != nil {
++		t.Fatalf("closeAttachedWisp: %v", err)
++	}
++
++	data, err := os.ReadFile(closesLog)
++	if err != nil {
++		t.Fatalf("no beads were closed (wisp orphaned): %v", err)
++	}
++	closes := string(data)
++	for _, want := range []string{"gt-step-1", "gt-step-2", "gt-wisp-xyz"} {
++		if !strings.Contains(closes, want) {
++			t.Errorf("expected %s to be closed, close log:\n%s", want, closes)
++		}
++	}
++}
++
++// TestCloseAttachedWisp_NoMolecule verifies the helper is a safe no-op when the
++// bead has no attached molecule — no bd close is issued and no error returned.
++func TestCloseAttachedWisp_NoMolecule(t *testing.T) {
++	bd, closesLog := writeWispBdStub(t, "gt-wisp-xyz")
++
++	issue := &beads.Issue{
++		ID:          "gt-base-123",
++		Description: "review_only: true", // attachment fields present, but no molecule
++	}
++
++	if err := closeAttachedWisp(bd, issue); err != nil {
++		t.Fatalf("closeAttachedWisp (no molecule): %v", err)
++	}
++
++	if _, err := os.Stat(closesLog); err == nil {
++		data, _ := os.ReadFile(closesLog)
++		t.Errorf("expected no closes for a bead without an attached molecule, got:\n%s", data)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,7 @@
 From a5e89bf679fa0b8a1db6cf0bfac2ab09fc93bdb9 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 3 Jul 2026 17:19:17 -0400
-Subject: [PATCH 24/37] deps(beads): use published steveyegge/beads v1.0.5,
+Subject: [PATCH 24/38] deps(beads): use published steveyegge/beads v1.0.5,
  drop local fork
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
