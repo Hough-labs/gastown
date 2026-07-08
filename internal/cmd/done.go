@@ -965,6 +965,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					}
 					if closeErr != nil {
 						style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
+					} else {
+						// gfork-4sz: the base bead was just force-closed (bypassing
+						// its open attached wisp). But updateAgentStateOnDone will
+						// later skip its own wisp-close because the base is now
+						// terminal — orphaning the wisp. Close it here so a
+						// review-only reviewer's gt done leaves nothing dangling.
+						// Best-effort: closing the base bead is what matters.
+						if issue, showErr := bd.Show(issueID); showErr == nil {
+							if wispErr := closeAttachedWisp(bd, issue); wispErr != nil {
+								style.PrintWarning("%v", wispErr)
+							}
+						}
 					}
 				}
 			}
@@ -2091,6 +2103,33 @@ func prMergeStrategyForRig(townRoot, rigName string) bool {
 	return settings.MergeQueue.MergeStrategy == "pr"
 }
 
+// closeAttachedWisp closes a bead's attached molecule (wisp) so gt done leaves
+// no orphaned ephemeral molecule behind. It closes the wisp's step descendants
+// first (bd close does not cascade), then force-closes the wisp root — force
+// handles any status (hooked/open/in_progress) and bypasses molecule dependency
+// checks, matching gt mol burn/squash (#1879). It is a no-op when the bead has
+// no attached molecule. ErrNotFound (already burned/deleted by another path) is
+// treated as success; any other close failure is returned so the caller can
+// avoid closing a base bead whose wisp may still block it. (gfork-4sz)
+func closeAttachedWisp(bd *beads.Beads, issue *beads.Issue) error {
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || attachment.AttachedMolecule == "" {
+		return nil
+	}
+	// Close molecule step descendants before closing the wisp root — without
+	// this, open/in_progress steps stay stuck forever after gt done completes.
+	if n := closeDescendants(bd, attachment.AttachedMolecule); n > 0 {
+		fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
+	}
+	if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
+		if !errors.Is(closeErr, beads.ErrNotFound) {
+			return fmt.Errorf("couldn't close attached molecule %s: %w", attachment.AttachedMolecule, closeErr)
+		}
+		// Not found = already burned/deleted by another path, treat as done.
+	}
+	return nil
+}
+
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
@@ -2201,30 +2240,12 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 			// has attached_molecule pointing to the wisp. Without this fix, gt done
 			// only closed the hooked bead, leaving the wisp orphaned.
 			// Order matters: wisp closes -> unblocks base bead -> base bead closes.
-			attachment := beads.ParseAttachmentFields(hookedBead)
-			if attachment != nil && attachment.AttachedMolecule != "" {
-				// Close molecule step descendants before closing the wisp root.
-				// bd close doesn't cascade — without this, open/in_progress steps
-				// from the molecule stay stuck forever after gt done completes.
-				// Order: step children -> wisp root -> base bead.
-				if n := closeDescendants(bd, attachment.AttachedMolecule); n > 0 {
-					fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
-				}
-
-				// Close the wisp root with --force and audit reason.
-				// ForceCloseWithReason handles any status (hooked, open, in_progress)
-				// and records the reason + session for attribution.
-				// Same pattern as gt mol burn/squash (#1879).
-				if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
-					if !errors.Is(closeErr, beads.ErrNotFound) {
-						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
-						// Don't try to close hookedBeadID - it may still be blocked.
-						// But DO clear hooks and update agent state (goto doneStateUpdate)
-						// so the polecat isn't stuck in 'working' state (za-o9e).
-						goto doneStateUpdate
-					}
-					// Not found = already burned/deleted by another path, continue
-				}
+			if closeErr := closeAttachedWisp(bd, hookedBead); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: %v\n", closeErr)
+				// Don't try to close hookedBeadID - it may still be blocked.
+				// But DO clear hooks and update agent state (goto doneStateUpdate)
+				// so the polecat isn't stuck in 'working' state (za-o9e).
+				goto doneStateUpdate
 			}
 
 			// Acceptance criteria gate: skip close if criteria are unchecked.
