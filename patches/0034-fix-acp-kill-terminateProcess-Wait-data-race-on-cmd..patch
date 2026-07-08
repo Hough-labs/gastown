@@ -1,7 +1,7 @@
 From 561cf6f8bd613a6fbf6fc10433227653185726a6 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 15:54:51 -0400
-Subject: [PATCH 34/37] fix(acp): kill terminateProcess/Wait data race on
+Subject: [PATCH 34/38] fix(acp): kill terminateProcess/Wait data race on
  cmd.ProcessState (gfork-93l)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
