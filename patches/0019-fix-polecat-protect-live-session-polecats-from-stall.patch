@@ -1,4 +1,4 @@
-From 1e4e76ade49dcce0d92a925c96ce3568cf35ddce Mon Sep 17 00:00:00 2001
+From 4304df3e742d1eaceeb69da05850d997cbf0592c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:42 -0400
 Subject: [PATCH 19/40] fix(polecat): protect live-session polecats from
@@ -38,20 +38,20 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  5 files changed, 78 insertions(+), 34 deletions(-)
 
 diff --git a/internal/cmd/polecat.go b/internal/cmd/polecat.go
-index 005d2bc0..9415ebde 100644
+index 8dd0ca22..ee11c0e6 100644
 --- a/internal/cmd/polecat.go
 +++ b/internal/cmd/polecat.go
-@@ -1048,7 +1048,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
+@@ -1063,7 +1063,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
  	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
  	workTerminal := beadTerminal
- 	targetRefs := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
+ 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 -	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
 +	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch, SessionRunning: p.SessionRunning}
  	var gitState *GitState
  	var gitErr error
  	gitStateLoaded := false
 diff --git a/internal/polecat/manager.go b/internal/polecat/manager.go
-index 2dfef61b..b1908f03 100644
+index 9a7d03ee..7423bd8e 100644
 --- a/internal/polecat/manager.go
 +++ b/internal/polecat/manager.go
 @@ -217,7 +217,7 @@ func (m *Manager) GetNamePool() *NamePool {
@@ -72,7 +72,7 @@ index 2dfef61b..b1908f03 100644
  		return nil, fmt.Errorf("creating lock dir: %w", err)
  	}
  	lockPath := filepath.Join(lockDir, "polecat-pool.lock")
-@@ -693,7 +693,7 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
+@@ -690,7 +690,7 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
  
  	// Create polecat directory while holding both locks
  	polecatDir := m.polecatDir(name)
@@ -81,7 +81,7 @@ index 2dfef61b..b1908f03 100644
  		_ = polecatLock.Unlock()
  		_ = poolLock.Unlock()
  		return "", nil, fmt.Errorf("creating polecat dir: %w", err)
-@@ -914,7 +914,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
+@@ -911,7 +911,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
  	}
  
  	// Create polecat directory (polecats/<name>/)
@@ -90,7 +90,7 @@ index 2dfef61b..b1908f03 100644
  		return nil, fmt.Errorf("creating polecat dir: %w", err)
  	}
  
-@@ -1353,10 +1353,10 @@ func forceRemoveDir(dir string) error {
+@@ -1447,10 +1447,10 @@ func forceRemoveDir(dir string) error {
  		// Make writable (0755 for dirs, 0644 for files)
  		if d.IsDir() {
  			//nolint:gosec // Controlled cleanup of a path inside the allocated polecat directory.
@@ -103,7 +103,7 @@ index 2dfef61b..b1908f03 100644
  		}
  		return nil
  	})
-@@ -1400,10 +1400,10 @@ func (m *Manager) AllocateName() (string, error) {
+@@ -1494,10 +1494,10 @@ func (m *Manager) AllocateName() (string, error) {
  	// directory until AddWithOptions removes it after os.MkdirAll succeeds.
  	// Stale markers (process crashed before AddWithOptions) are cleaned up by
  	// cleanupOrphanPolecatState after pendingMaxAge.
@@ -116,7 +116,7 @@ index 2dfef61b..b1908f03 100644
  		return "", fmt.Errorf("writing reservation marker: %w", err)
  	}
  
-@@ -1485,7 +1485,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
+@@ -1579,7 +1579,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
  	_ = repoGit.Fetch("origin")
  
  	// Ensure polecat directory exists for new structure
@@ -125,7 +125,7 @@ index 2dfef61b..b1908f03 100644
  		return nil, fmt.Errorf("creating polecat dir: %w", err)
  	}
  
-@@ -2182,6 +2182,11 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
+@@ -2297,6 +2297,11 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
  
  func (m *Manager) workstateInputForPolecat(name string, state State, issue string) WorkstateInput {
  	input := WorkstateInput{State: state, CleanupStatus: CleanupUnknown}
@@ -137,7 +137,7 @@ index 2dfef61b..b1908f03 100644
  	agentID := m.agentBeadID(name)
  	activeMR := ""
  	sourceHint := ""
-@@ -2608,6 +2613,10 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
+@@ -2735,6 +2740,10 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
  	// session state, so we must NOT assume the session is dead — default to alive.
  	sessionRunning, sessionStale := m.polecatSessionState(name)
  	sessionDead := m.tmux != nil && (!sessionRunning || sessionStale)
@@ -148,7 +148,7 @@ index 2dfef61b..b1908f03 100644
  
  	// Primary source: the work bead itself (status=hooked + assignee).
  	// This is the direct-tracking model introduced in hq-l6mm5.
-@@ -2622,12 +2631,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
+@@ -2749,12 +2758,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
  			state = StateStalled
  		}
  		return &Polecat{
@@ -168,7 +168,7 @@ index 2dfef61b..b1908f03 100644
  		}, nil
  	}
  
-@@ -2644,12 +2654,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
+@@ -2771,12 +2781,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
  				state = StateStalled
  			}
  			return &Polecat{
@@ -188,7 +188,7 @@ index 2dfef61b..b1908f03 100644
  			}, nil
  		}
  	}
-@@ -2667,11 +2678,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
+@@ -2794,11 +2805,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
  			state = StateReviewNeeded
  		}
  		return &Polecat{
@@ -206,7 +206,7 @@ index 2dfef61b..b1908f03 100644
  		}, nil
  	}
  
-@@ -2694,12 +2706,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
+@@ -2829,12 +2841,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
  	}
  
  	return &Polecat{
@@ -226,7 +226,7 @@ index 2dfef61b..b1908f03 100644
  	}, nil
  }
  
-@@ -2790,7 +2803,8 @@ func (m *Manager) runSetupCommand(worktreePath string) error {
+@@ -2925,7 +2938,8 @@ func (m *Manager) runSetupCommand(worktreePath string) error {
  	cmd.Dir = worktreePath
  	cmd.Stdout = os.Stdout
  	cmd.Stderr = os.Stderr
@@ -237,10 +237,10 @@ index 2dfef61b..b1908f03 100644
  		fmt.Sprintf("GT_RIG_PATH=%s", m.rig.Path),
  	)
 diff --git a/internal/polecat/types.go b/internal/polecat/types.go
-index bc2cfa3d..4126a68e 100644
+index 2583a433..1d514c0e 100644
 --- a/internal/polecat/types.go
 +++ b/internal/polecat/types.go
-@@ -109,6 +109,11 @@ type Polecat struct {
+@@ -108,6 +108,11 @@ type Polecat struct {
  
  	// UpdatedAt is when the polecat was last updated.
  	UpdatedAt time.Time `json:"updated_at"`
@@ -253,10 +253,10 @@ index bc2cfa3d..4126a68e 100644
  
  // Summary provides a concise view of polecat status.
 diff --git a/internal/polecat/workstate.go b/internal/polecat/workstate.go
-index d18d1b79..51aaeb73 100644
+index a5a5c06b..0ae3df70 100644
 --- a/internal/polecat/workstate.go
 +++ b/internal/polecat/workstate.go
-@@ -35,6 +35,12 @@ type WorkstateInput struct {
+@@ -37,6 +37,12 @@ type WorkstateInput struct {
  	AssignedBeadTerminal           bool
  	MRSubmitted                    bool
  	MQLookupFailed                 bool
@@ -269,8 +269,8 @@ index d18d1b79..51aaeb73 100644
  }
  
  // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
-@@ -70,6 +76,18 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
- 		}
+@@ -85,6 +91,18 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
+ 		return d
  	}
  
 +	// A live, non-stale tmux session means the polecat is actively working even
@@ -286,15 +286,15 @@ index d18d1b79..51aaeb73 100644
 +	}
 +
  	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}
- 	block := func(reason, blocker string) {
- 		if d.Reason == "" {
+ 	capacityBlocked := false
+ 	block := func(reason, blocker string, countsTowardCapacity bool) {
 diff --git a/internal/polecat/workstate_test.go b/internal/polecat/workstate_test.go
-index ce35c09b..321e6920 100644
+index 610c0b5b..357027cd 100644
 --- a/internal/polecat/workstate_test.go
 +++ b/internal/polecat/workstate_test.go
-@@ -43,6 +43,13 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
- 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
- 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "not-idle", NeedsRecovery: false, CountsTowardCapacity: true},
+@@ -118,6 +118,13 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
+ 			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean, ActiveWorkBlocker: "assigned_work=gt-open status=open", ActiveWorkCountsTowardCapacity: true},
+ 			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"assigned_work=gt-open status=open"}},
  		},
 +		{
 +			// hq-zxhx: a live, non-stale session reads idle+clean (reviews never

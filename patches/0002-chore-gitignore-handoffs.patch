@@ -1,4 +1,4 @@
-From 3bed86d3054da0e9bdf85bec07dfb7eeed59c30a Mon Sep 17 00:00:00 2001
+From af0a1c736e8b207e28153405bae7c83505c4a2c4 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 05:56:30 -0400
 Subject: [PATCH 02/40] chore: gitignore handoffs/

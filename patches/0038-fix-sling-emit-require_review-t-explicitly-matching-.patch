@@ -1,7 +1,7 @@
-From 753f2751aea9c3f029d5b893fb41465b491644a3 Mon Sep 17 00:00:00 2001
+From e306418dbdd5164e0411f42383f89cc32be8e692 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 19:52:30 -0400
-Subject: [PATCH 40/40] fix(sling): emit require_review=%t explicitly, matching
+Subject: [PATCH 38/40] fix(sling): emit require_review=%t explicitly, matching
  patrol path (gfork-a84)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -31,10 +31,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  create mode 100644 internal/cmd/sling_require_review_test.go
 
 diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
-index 79c8cf1c..3bdc0ba2 100644
+index d91ff66a..51d6c912 100644
 --- a/internal/cmd/sling_helpers.go
 +++ b/internal/cmd/sling_helpers.go
-@@ -1462,9 +1462,12 @@ func loadRigCommandVars(townRoot, rig string) []string {
+@@ -1490,9 +1490,12 @@ func loadRigCommandVars(townRoot, rig string) []string {
  	if mq.MergeStrategy != "" {
  		vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
  	}

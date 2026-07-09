@@ -1,4 +1,4 @@
-From 336cc54529cbdb28c691ed6873ef1ca82bebb355 Mon Sep 17 00:00:00 2001
+From 1408cbe7f706f300ce7253909073601537645105 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 12 Apr 2026 14:13:12 -0400
 Subject: [PATCH 08/40] fix(session): activate agent logging on
@@ -17,10 +17,10 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/internal/session/lifecycle.go b/internal/session/lifecycle.go
-index 0c874612..9868653c 100644
+index e7744987..ce7a3600 100644
 --- a/internal/session/lifecycle.go
 +++ b/internal/session/lifecycle.go
-@@ -283,7 +283,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
+@@ -302,7 +302,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
  	// 14. Stream agent conversation events to VictoriaLogs (opt-in).
  	// Reads ~/.claude/projects/<hash>/<session>.jsonl and emits agent.event logs.
  	// Non-fatal: observability failures must never block agent startup.

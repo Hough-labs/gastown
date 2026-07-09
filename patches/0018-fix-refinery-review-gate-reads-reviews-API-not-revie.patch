@@ -1,4 +1,4 @@
-From 65e45072c2ed2bdc5547fe2967c1a8134334503c Mon Sep 17 00:00:00 2001
+From 9729592bc3f2728ff90b07714166bf15883dbe3a Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 2 Jun 2026 20:37:31 -0400
 Subject: [PATCH 18/40] fix(refinery): review gate reads reviews API, not
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 52 insertions(+), 12 deletions(-)
 
 diff --git a/internal/formula/formulas/mol-refinery-patrol.formula.toml b/internal/formula/formulas/mol-refinery-patrol.formula.toml
-index 25d20f11..1722ba0d 100644
+index a0b6e80c..44ba3fe3 100644
 --- a/internal/formula/formulas/mol-refinery-patrol.formula.toml
 +++ b/internal/formula/formulas/mol-refinery-patrol.formula.toml
 @@ -698,12 +698,24 @@ Then skip to Step 4 (archive mail) and continue patrol.
@@ -53,7 +53,7 @@ index 25d20f11..1722ba0d 100644
  
  | reviewDecision | Action |
 diff --git a/internal/git/git.go b/internal/git/git.go
-index 58a20afd..346b92b2 100644
+index c96498d9..9a8afaeb 100644
 --- a/internal/git/git.go
 +++ b/internal/git/git.go
 @@ -614,7 +614,7 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
@@ -65,7 +65,7 @@ index 58a20afd..346b92b2 100644
  		return fmt.Errorf("creating destination parent: %w", err)
  	}
  	// Run clone from a temporary directory to completely isolate from any
-@@ -1448,24 +1448,52 @@ func (g *Git) FindPRNumber(branch string) (int, error) {
+@@ -1571,24 +1571,52 @@ func (g *Git) FindPRNumber(branch string) (int, error) {
  	return prs[0].Number, nil
  }
  

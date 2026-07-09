@@ -1,4 +1,4 @@
-From 619935666853873ce327c7b02375bbb5846036bc Mon Sep 17 00:00:00 2001
+From f9763222ed5ae70bfdb8be0b6d9a71cc3e7d9323 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 17:07:10 -0400
 Subject: [PATCH 22/40] feat(polecat): expose hooked formula + pr_url in `gt
@@ -22,10 +22,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 19 insertions(+)
 
 diff --git a/internal/cmd/polecat.go b/internal/cmd/polecat.go
-index 9415ebde..d37ee67e 100644
+index ee11c0e6..27e6eb3c 100644
 --- a/internal/cmd/polecat.go
 +++ b/internal/cmd/polecat.go
-@@ -402,6 +402,11 @@ type PolecatListItem struct {
+@@ -403,6 +403,11 @@ type PolecatListItem struct {
  	SessionRunning       bool          `json:"session_running"`
  	Zombie               bool          `json:"zombie,omitempty"`
  	SessionName          string        `json:"session_name,omitempty"`
@@ -37,33 +37,33 @@ index 9415ebde..d37ee67e 100644
  }
  
  // effectivePolecatState returns the observable state used by polecat list output.
-@@ -512,6 +517,18 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
- 				Issue:          p.Issue,
- 				SessionRunning: running,
+@@ -525,6 +530,18 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
+ 				SessionRunning:       item.SessionRunning,
+ 				CountsTowardCapacity: disposition.CountsTowardCapacity,
  			})
 +			// Surface the hooked work bead's formula + pr_url so --json consumers
 +			// can dedup live reviewers per-PR. Best-effort; empty when absent. (hq-6wd2)
 +			formula := ""
 +			prURL := ""
-+			if p.Issue != "" {
-+				if issue, showErr := bd.Show(p.Issue); showErr == nil {
++			if item.Issue != "" {
++				if issue, showErr := bd.Show(item.Issue); showErr == nil {
 +					if af := beads.ParseAttachmentFields(issue); af != nil {
 +						formula = af.AttachedFormula
 +						prURL = extractFormulaVar(af.FormulaVars, "pr_url")
 +					}
 +				}
 +			}
- 			disposition := mgr.WorkstateDispositionForPolecat(p.Name, state, p.Issue)
  			allPolecats = append(allPolecats, PolecatListItem{
  				Rig:                  r.Name,
-@@ -531,6 +548,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
- 				CountsTowardCapacity: disposition.CountsTowardCapacity,
- 				ReuseStatus:          disposition.ReuseStatus,
- 				SessionRunning:       running,
+ 				Name:                 name,
+@@ -545,6 +562,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
+ 				Blockers:             disposition.Blockers,
+ 				SessionRunning:       item.SessionRunning,
+ 				SessionName:          item.SessionName,
 +				Formula:              formula,
 +				PRURL:                prURL,
  			})
- 			knownNames[p.Name] = true
+ 			knownNames[name] = true
  		}
 -- 
 2.50.1 (Apple Git-155)

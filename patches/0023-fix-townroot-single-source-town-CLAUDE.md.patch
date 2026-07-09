@@ -1,4 +1,4 @@
-From 53fccc4d6e00171bbe48eeca57f1da62d7abc416 Mon Sep 17 00:00:00 2001
+From 58993b2d74e7dbc40fb5521e8f2225dbfa2a3495 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 8 Jun 2026 13:58:24 -0400
 Subject: [PATCH 23/40] fix(townroot): single-source town CLAUDE.md
@@ -9,7 +9,7 @@ Subject: [PATCH 23/40] fix(townroot): single-source town CLAUDE.md
  2 files changed, 5 insertions(+), 22 deletions(-)
 
 diff --git a/internal/cmd/install.go b/internal/cmd/install.go
-index 35a403b7..7593515f 100644
+index 754f7401..ce143363 100644
 --- a/internal/cmd/install.go
 +++ b/internal/cmd/install.go
 @@ -16,7 +16,6 @@ import (

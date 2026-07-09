@@ -1,4 +1,4 @@
-From 380b501815938144ca9bbe783204834d2403ef91 Mon Sep 17 00:00:00 2001
+From 462929df2ac1c7142907444604ff6ab134926846 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 31 May 2026 16:00:33 -0400
 Subject: [PATCH 17/40] build(patches): retarget fork baseline upstream/main ->
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 21 insertions(+), 14 deletions(-)
 
 diff --git a/.githooks/pre-push b/.githooks/pre-push
-index d9fcef8b..57d6227a 100755
+index c006cf34..ac8ed237 100755
 --- a/.githooks/pre-push
 +++ b/.githooks/pre-push
 @@ -7,10 +7,13 @@
@@ -35,7 +35,7 @@ index d9fcef8b..57d6227a 100755
      ACTUAL=$(ls patches/*.patch 2>/dev/null | wc -l | tr -d ' ')
      if [ "$EXPECTED" != "$ACTUAL" ]; then
 diff --git a/Makefile b/Makefile
-index 7a607435..e5426971 100644
+index 4f2fefc2..b17d1d0a 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -190,24 +190,28 @@ check-version-tag:

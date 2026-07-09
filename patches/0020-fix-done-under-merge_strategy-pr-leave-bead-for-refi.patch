@@ -1,4 +1,4 @@
-From 801f8b092212c007810b4311f70abf3ca9c7f5ee Mon Sep 17 00:00:00 2001
+From a876c8d34357faf9e4611fb552d96c958b8f92d6 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:51 -0400
 Subject: [PATCH 20/40] fix(done): under merge_strategy=pr, leave bead for
@@ -30,10 +30,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 27 insertions(+), 2 deletions(-)
 
 diff --git a/internal/cmd/done.go b/internal/cmd/done.go
-index 096196b9..38d32f51 100644
+index b2557072..3783c668 100644
 --- a/internal/cmd/done.go
 +++ b/internal/cmd/done.go
-@@ -945,7 +945,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
+@@ -1293,7 +1293,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
  					prBodyBuilder.WriteString("---\n")
  					prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
  					prBody := prBodyBuilder.String()
@@ -43,17 +43,17 @@ index 096196b9..38d32f51 100644
  						"--base", defaultBranch,
  						"--head", branch,
  						"--title", prTitle,
-@@ -1062,7 +1063,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
- 					var closeErr error
- 					for attempt := 1; attempt <= 3; attempt++ {
- 						closeErr = bd.ForceCloseWithReason(
--							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
-+							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID,
-+						)
- 						if closeErr == nil {
- 							fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
- 							break
-@@ -1743,6 +1745,21 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
+@@ -1426,7 +1427,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
+ 						var closeErr error
+ 						for attempt := 1; attempt <= 3; attempt++ {
+ 							closeErr = bd.ForceCloseWithReason(
+-								fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
++								fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID,
++							)
+ 							if closeErr == nil {
+ 								fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
+ 								break
+@@ -2074,6 +2076,21 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
  // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
  // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
  // All errors are warnings, not failures - gt done must complete even if bead ops fail.
@@ -72,10 +72,10 @@ index 096196b9..38d32f51 100644
 +	return settings.MergeQueue.MergeStrategy == "pr"
 +}
 +
- func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
  	// Get role context - try multiple sources for resilience
  	roleInfo, err := GetRoleWithContext(cwd, townRoot)
-@@ -1873,6 +1890,14 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+@@ -2214,6 +2231,14 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
  			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
  				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
  				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")

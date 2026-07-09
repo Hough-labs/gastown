@@ -1,7 +1,7 @@
-From c8b0c74873049ab3fde8c5ac410acebd5d7a2a14 Mon Sep 17 00:00:00 2001
+From ad9d62a9d6a11c5a256d58a17d86d8a7763667de Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 14:43:27 -0400
-Subject: [PATCH 29/40] =?UTF-8?q?perf(agents):=20trim=20per-cycle=20contex?=
+Subject: [PATCH 28/40] =?UTF-8?q?perf(agents):=20trim=20per-cycle=20contex?=
  =?UTF-8?q?t=20intake=20=E2=80=94=20mail=20cursor=20+=20mid-weight=20patro?=
  =?UTF-8?q?l=20prime=20+=20nudge=20de-dup?=
 MIME-Version: 1.0
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  10 files changed, 740 insertions(+), 50 deletions(-)
 
 diff --git a/internal/cmd/handoff.go b/internal/cmd/handoff.go
-index 13b219be..0ca9cd4a 100644
+index c510889f..f43d6563 100644
 --- a/internal/cmd/handoff.go
 +++ b/internal/cmd/handoff.go
 @@ -329,11 +329,20 @@ func runHandoff(cmd *cobra.Command, args []string) error {
@@ -52,7 +52,7 @@ index 13b219be..0ca9cd4a 100644
  	}
  
  	// Record handoff time for cooldown enforcement (gt-058d).
-@@ -1740,6 +1749,24 @@ func isPatrolRole(role string) bool {
+@@ -1745,6 +1754,24 @@ func isPatrolRole(role string) bool {
  	return false
  }
  
@@ -78,10 +78,10 @@ index 13b219be..0ca9cd4a 100644
  // --cycle` respawning currentSession. Patrol roles fresh-start (no
  // --continue) so each cycle is independent instead of reloading the same
 diff --git a/internal/cmd/handoff_test.go b/internal/cmd/handoff_test.go
-index 2b20ff53..c4a65920 100644
+index 263f43c0..d48def08 100644
 --- a/internal/cmd/handoff_test.go
 +++ b/internal/cmd/handoff_test.go
-@@ -998,3 +998,35 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+@@ -1008,3 +1008,35 @@ func TestEnforceHandoffCooldown(t *testing.T) {
  		}
  	})
  }
@@ -316,10 +316,10 @@ index c9b5bb09..86884c94 100644
 +	}
 +}
 diff --git a/internal/cmd/prime.go b/internal/cmd/prime.go
-index 9fb9f3b3..da1e22ad 100644
+index 775f4406..9a33ca39 100644
 --- a/internal/cmd/prime.go
 +++ b/internal/cmd/prime.go
-@@ -27,17 +27,21 @@ import (
+@@ -28,17 +28,21 @@ import (
  	worktreeintegrity "github.com/steveyegge/gastown/internal/worktree"
  )
  
@@ -349,7 +349,7 @@ index 9fb9f3b3..da1e22ad 100644
  
  // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
  // when running in hook mode. Used to provide lighter output on compaction/resume.
-@@ -47,6 +51,19 @@ var primeHookSource string
+@@ -48,6 +52,19 @@ var primeHookSource string
  // Set by checkHandoffMarker when a marker with a reason field is found.
  var primeHandoffReason string
  
@@ -369,7 +369,7 @@ index 9fb9f3b3..da1e22ad 100644
  // Role represents a detected agent role.
  type Role string
  
-@@ -179,6 +196,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
+@@ -180,6 +197,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
  		return nil
  	}
  
@@ -386,7 +386,7 @@ index 9fb9f3b3..da1e22ad 100644
  	if err := setupPrimeSession(ctx, roleInfo); err != nil {
  		return err
  	}
-@@ -401,6 +428,17 @@ func isCompactResume() bool {
+@@ -409,6 +436,17 @@ func isCompactResume() bool {
  	return primeHookSource == "compact" || primeHookSource == "resume" || primeHandoffReason == "compaction"
  }
  
@@ -405,10 +405,10 @@ index 9fb9f3b3..da1e22ad 100644
  func warnRoleMismatch(roleInfo RoleInfo, cwd string) {
  	if !roleInfo.Mismatch {
 diff --git a/internal/cmd/prime_output.go b/internal/cmd/prime_output.go
-index 6141f581..35f9e5e8 100644
+index 8fc5bd63..40b07b16 100644
 --- a/internal/cmd/prime_output.go
 +++ b/internal/cmd/prime_output.go
-@@ -25,6 +25,15 @@ import (
+@@ -27,6 +27,15 @@ import (
  // outputPrimeContext outputs the role-specific context using templates or fallback.
  // Returns the rendered template content (empty string when using fallback path).
  func outputPrimeContext(ctx RoleContext) (string, error) {
@@ -424,8 +424,8 @@ index 6141f581..35f9e5e8 100644
  	// Try to use templates first
  	tmpl, err := templates.New()
  	if err != nil {
-@@ -94,6 +103,37 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
- 	return output, nil
+@@ -110,6 +119,37 @@ func roleRigContext(ctx RoleContext) (defaultBranch string, isForkRig bool, upst
+ 	return defaultBranch, false, ""
  }
  
 +// outputPrimeContextLite emits a minimal identity block for steady-state
@@ -462,7 +462,7 @@ index 6141f581..35f9e5e8 100644
  // outputRoleDirectives loads and emits operator-provided role directives.
  // These come from the directive file layout (town-level and/or rig-level)
  // and override formula defaults where they conflict.
-@@ -465,9 +505,49 @@ func outputHandoffContent(ctx RoleContext) {
+@@ -488,9 +528,49 @@ func outputHandoffContent(ctx RoleContext) {
  	fmt.Println(style.Dim.Render("(Clear with: gt rig reset --handoff)"))
  }
  
@@ -513,7 +513,7 @@ index 6141f581..35f9e5e8 100644
  	case RoleMayor:
  		fmt.Println()
 diff --git a/internal/cmd/prime_output_test.go b/internal/cmd/prime_output_test.go
-index 117d60d5..01311e8e 100644
+index aa4b325e..52611742 100644
 --- a/internal/cmd/prime_output_test.go
 +++ b/internal/cmd/prime_output_test.go
 @@ -2,10 +2,15 @@ package cmd
@@ -594,9 +594,9 @@ index 117d60d5..01311e8e 100644
  			t.Fatal(err)
  		}
  
-@@ -180,3 +185,193 @@ func TestOutputRoleDirectives(t *testing.T) {
- 		}
- 	})
+@@ -198,3 +203,193 @@ func TestOutputCommandQuickReferenceBootBlocksRawTmux(t *testing.T) {
+ 		t.Fatalf("Boot quick reference still calls raw tmux merely unreliable:\n%s", output)
+ 	}
  }
 +
 +// TestOutputPrimeContextLite covers the Lever A steady-state patrol prime
@@ -789,10 +789,10 @@ index 117d60d5..01311e8e 100644
 +	})
 +}
 diff --git a/internal/cmd/prime_test.go b/internal/cmd/prime_test.go
-index 035bbd1b..1276d995 100644
+index 3dd4760b..3a5a5b73 100644
 --- a/internal/cmd/prime_test.go
 +++ b/internal/cmd/prime_test.go
-@@ -49,7 +49,7 @@ func captureStdout(t *testing.T, fn func()) string {
+@@ -50,7 +50,7 @@ func captureStdout(t *testing.T, fn func()) string {
  func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
  	t.Helper()
  	beadsDir := filepath.Join(townRoot, ".beads")
@@ -801,7 +801,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("create beads dir: %v", err)
  	}
  	if err := beads.WriteRoutes(beadsDir, routes); err != nil {
-@@ -206,13 +206,13 @@ func TestCheckHandoffMarkerDryRun(t *testing.T) {
+@@ -245,13 +245,13 @@ func TestCheckHandoffMarkerDryRun(t *testing.T) {
  
  	// Create .runtime directory and handoff marker
  	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -817,7 +817,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("write handoff marker: %v", err)
  	}
  
-@@ -252,7 +252,7 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
+@@ -291,7 +291,7 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
  
  	// Create .runtime directory but no marker
  	runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -826,7 +826,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("create runtime dir: %v", err)
  	}
  
-@@ -296,12 +296,12 @@ func TestDetectSessionState(t *testing.T) {
+@@ -335,12 +335,12 @@ func TestDetectSessionState(t *testing.T) {
  
  		// Create handoff marker
  		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -841,7 +841,7 @@ index 035bbd1b..1276d995 100644
  			t.Fatalf("write handoff marker: %v", err)
  		}
  
-@@ -501,12 +501,12 @@ func TestOutputState(t *testing.T) {
+@@ -540,12 +540,12 @@ func TestOutputState(t *testing.T) {
  
  		// Create handoff marker
  		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -856,7 +856,7 @@ index 035bbd1b..1276d995 100644
  			t.Fatalf("write marker: %v", err)
  		}
  
-@@ -596,7 +596,7 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
+@@ -635,7 +635,7 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
  
  	// Set up minimal workspace structure
  	beadsDir := filepath.Join(townRoot, ".beads")
@@ -865,7 +865,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("create beads dir: %v", err)
  	}
  
-@@ -608,11 +608,11 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
+@@ -647,11 +647,11 @@ func TestDryRunSkipsSideEffects(t *testing.T) {
  
  	// Create handoff marker that should NOT be removed in dry-run
  	runtimeDir := filepath.Join(townRoot, constants.DirRuntime)
@@ -879,7 +879,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("write marker: %v", err)
  	}
  
-@@ -707,6 +707,32 @@ func TestIsCompactResume(t *testing.T) {
+@@ -746,6 +746,32 @@ func TestIsCompactResume(t *testing.T) {
  	}
  }
  
@@ -912,7 +912,7 @@ index 035bbd1b..1276d995 100644
  func TestHookSessionBeaconLines(t *testing.T) {
  	origStructured := primeStructuredSessionStartOutput
  	defer func() {
-@@ -777,13 +803,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
+@@ -816,13 +842,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
  		workDir := t.TempDir()
  
  		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -928,7 +928,7 @@ index 035bbd1b..1276d995 100644
  			t.Fatalf("write marker: %v", err)
  		}
  
-@@ -808,13 +834,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
+@@ -847,13 +873,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
  		workDir := t.TempDir()
  
  		runtimeDir := filepath.Join(workDir, constants.DirRuntime)
@@ -944,7 +944,7 @@ index 035bbd1b..1276d995 100644
  			t.Fatalf("write marker: %v", err)
  		}
  
-@@ -955,10 +981,10 @@ func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
+@@ -1141,10 +1167,10 @@ func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
  	rigRoot := filepath.Join(townRoot, "testrig")
  	witnessDir := filepath.Join(rigRoot, "witness")
  	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
@@ -957,7 +957,7 @@ index 035bbd1b..1276d995 100644
  		t.Fatalf("mkdir mayor beads dir: %v", err)
  	}
  
-@@ -988,26 +1014,26 @@ func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
+@@ -1174,26 +1200,26 @@ func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
  	workDir := filepath.Join(rigRoot, "polecats", "worker1", "testrig")
  	workBeadsDir := filepath.Join(workDir, ".beads")
  

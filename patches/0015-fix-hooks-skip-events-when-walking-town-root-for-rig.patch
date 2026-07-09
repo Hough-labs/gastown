@@ -1,4 +1,4 @@
-From e9af1506b2df450dad4648e4e88cd23d77dd36f1 Mon Sep 17 00:00:00 2001
+From c19f6f6a4cc59003f51df58c1c73bcd3483ab644 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 12 May 2026 12:51:34 -0400
 Subject: [PATCH 15/40] fix(hooks): skip events/ when walking town root for rig
@@ -39,10 +39,10 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
  2 files changed, 62 insertions(+), 4 deletions(-)
 
 diff --git a/internal/hooks/config.go b/internal/hooks/config.go
-index b3fcceb6..2e656a35 100644
+index 7bd2e63e..2e51ef90 100644
 --- a/internal/hooks/config.go
 +++ b/internal/hooks/config.go
-@@ -527,8 +527,8 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
+@@ -591,8 +591,8 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
  	}
  
  	for _, entry := range entries {
@@ -53,7 +53,7 @@ index b3fcceb6..2e656a35 100644
  			continue
  		}
  
-@@ -621,8 +621,8 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
+@@ -685,8 +685,8 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
  	}
  
  	for _, entry := range entries {
@@ -64,7 +64,7 @@ index b3fcceb6..2e656a35 100644
  			continue
  		}
  
-@@ -719,6 +719,19 @@ func isRig(path string) bool {
+@@ -783,6 +783,19 @@ func isRig(path string) bool {
  	return false
  }
  
@@ -85,10 +85,10 @@ index b3fcceb6..2e656a35 100644
  var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit", "WorktreeCreate", "WorktreeRemove"}
  
 diff --git a/internal/hooks/config_test.go b/internal/hooks/config_test.go
-index 21cc1699..aa76a12d 100644
+index 9ee88389..66c517ad 100644
 --- a/internal/hooks/config_test.go
 +++ b/internal/hooks/config_test.go
-@@ -1068,6 +1068,51 @@ func TestDiscoverRoleLocations_SkipsNonRigs(t *testing.T) {
+@@ -1116,6 +1116,51 @@ func TestDiscoverRoleLocations_SkipsNonRigs(t *testing.T) {
  	}
  }
  

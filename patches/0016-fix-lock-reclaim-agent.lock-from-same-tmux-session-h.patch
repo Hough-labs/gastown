@@ -1,4 +1,4 @@
-From a8ee779e0f7da8c62d6c0c2c2586a0922a244816 Mon Sep 17 00:00:00 2001
+From 8d2056487ecf25654b9e8ae3725f537bc91fc1ce Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 12 May 2026 14:46:58 -0400
 Subject: [PATCH 16/40] fix(lock): reclaim agent.lock from same tmux session

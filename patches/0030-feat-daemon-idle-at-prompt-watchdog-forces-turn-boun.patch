@@ -1,7 +1,7 @@
-From e6c1c96a2fef7ffc5a1f8366b2c71669ebeb8e28 Mon Sep 17 00:00:00 2001
+From c0897f27ddda1f43ea215a3c18b47e6428b7bc75 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 12:01:21 -0400
-Subject: [PATCH 31/40] feat(daemon): idle-at-prompt watchdog forces turn
+Subject: [PATCH 30/40] feat(daemon): idle-at-prompt watchdog forces turn
  boundary to drain queued nudges (hq-2kaq)
 
 Persistent agents (deacon, witness, refinery) can land idle at an interactive
@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  create mode 100644 internal/daemon/idle_prompt_watchdog_test.go
 
 diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
-index f9c1013f..6950f9b4 100755
+index 11ea4987..ff426c4a 100755
 --- a/internal/daemon/daemon.go
 +++ b/internal/daemon/daemon.go
 @@ -98,6 +98,12 @@ type Daemon struct {
@@ -51,7 +51,7 @@ index f9c1013f..6950f9b4 100755
  	// Restart tracking with exponential backoff to prevent crash loops
  	restartTracker *RestartTracker
  
-@@ -968,6 +974,11 @@ func (d *Daemon) heartbeat(state *State) {
+@@ -994,6 +1000,11 @@ func (d *Daemon) heartbeat(state *State) {
  	// YELLOW threshold, before they hit RED and wedge idle-at-prompt (gfork-47p.2).
  	d.checkContextPressure()
  
@@ -483,10 +483,10 @@ index 00000000..0de50c95
 +	}
 +}
 diff --git a/internal/daemon/lifecycle.go b/internal/daemon/lifecycle.go
-index 125ac9f7..a0b17e54 100644
+index ddd4733e..bc4f6da8 100644
 --- a/internal/daemon/lifecycle.go
 +++ b/internal/daemon/lifecycle.go
-@@ -792,13 +792,14 @@ func (d *Daemon) closeMessage(id string) error {
+@@ -801,13 +801,14 @@ func (d *Daemon) closeMessage(id string) error {
  
  // AgentBeadInfo represents the parsed fields from an agent bead.
  type AgentBeadInfo struct {
@@ -508,7 +508,7 @@ index 125ac9f7..a0b17e54 100644
  	// Note: RoleBead field removed - role definitions are now config-based
  }
  
-@@ -877,6 +878,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
+@@ -886,6 +887,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
  	// Use HookBead from database column directly (not from description)
  	// The description may contain stale data - the slot is the source of truth.
  	info.HookBead = issue.HookBead

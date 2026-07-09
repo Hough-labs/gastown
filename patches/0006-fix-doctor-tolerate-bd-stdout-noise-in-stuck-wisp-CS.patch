@@ -1,4 +1,4 @@
-From abbcec4951c3cfb66d2afdfb3e18a43883560842 Mon Sep 17 00:00:00 2001
+From 58f7b272030e24a9f0f1a4ffc02d16fa18bfc0ff Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Apr 2026 09:21:31 -0400
 Subject: [PATCH 06/40] fix(doctor): tolerate bd stdout noise in stuck-wisp CSV

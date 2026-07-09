@@ -1,7 +1,7 @@
-From df6e3922a1f9325d9ea2ab5aa343296bf8de5f67 Mon Sep 17 00:00:00 2001
+From c18f668da00e66d784fc4c541829d38bbfee3b9d Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 13:39:35 -0400
-Subject: [PATCH 28/40] =?UTF-8?q?feat(daemon):=20context-lifecycle=20watch?=
+Subject: [PATCH 27/40] =?UTF-8?q?feat(daemon):=20context-lifecycle=20watch?=
  =?UTF-8?q?dog=20=E2=80=94=20auto-cycle=20persistent=20agents=20before=20c?=
  =?UTF-8?q?ontext=20RED?=
 MIME-Version: 1.0
@@ -446,7 +446,7 @@ index 00000000..8ff82c91
 +	})
 +}
 diff --git a/internal/cmd/handoff.go b/internal/cmd/handoff.go
-index 129f98ff..13b219be 100644
+index 6fd18a9d..c510889f 100644
 --- a/internal/cmd/handoff.go
 +++ b/internal/cmd/handoff.go
 @@ -331,9 +331,9 @@ func runHandoff(cmd *cobra.Command, args []string) error {
@@ -517,7 +517,7 @@ index 129f98ff..13b219be 100644
  	if err != nil {
  		fmt.Fprintf(os.Stderr, "handoff --cycle: could not build restart command: %v\n", err)
  		return err
-@@ -1721,9 +1724,9 @@ func recordHandoffTime() {
+@@ -1726,9 +1729,9 @@ func recordHandoffTime() {
  	}
  
  	runtimeDir := filepath.Join(cwd, constants.DirRuntime)
@@ -529,7 +529,7 @@ index 129f98ff..13b219be 100644
  }
  
  // isPatrolRole returns true if the role runs a patrol loop (refinery, witness, deacon).
-@@ -1736,3 +1739,21 @@ func isPatrolRole(role string) bool {
+@@ -1741,3 +1744,21 @@ func isPatrolRole(role string) bool {
  	}
  	return false
  }
@@ -552,10 +552,10 @@ index 129f98ff..13b219be 100644
 +	}
 +}
 diff --git a/internal/cmd/handoff_test.go b/internal/cmd/handoff_test.go
-index 5de9c699..2b20ff53 100644
+index 3b54c7d4..263f43c0 100644
 --- a/internal/cmd/handoff_test.go
 +++ b/internal/cmd/handoff_test.go
-@@ -125,13 +125,13 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
+@@ -135,13 +135,13 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
  	rigPath := filepath.Join(townRoot, "gastown")
  	witnessDir := filepath.Join(rigPath, "witness")
  
@@ -572,7 +572,7 @@ index 5de9c699..2b20ff53 100644
  		t.Fatalf("mkdir witness dir: %v", err)
  	}
  
-@@ -199,13 +199,13 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
+@@ -209,13 +209,13 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
  	rigPath := filepath.Join(townRoot, "gastown")
  	witnessDir := filepath.Join(rigPath, "witness")
  
@@ -589,7 +589,7 @@ index 5de9c699..2b20ff53 100644
  		t.Fatalf("mkdir witness dir: %v", err)
  	}
  
-@@ -275,13 +275,13 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+@@ -285,13 +285,13 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
  	rigPath := filepath.Join(townRoot, "gastown")
  	crewDir := filepath.Join(rigPath, "crew", "bear")
  
@@ -606,7 +606,7 @@ index 5de9c699..2b20ff53 100644
  		t.Fatalf("mkdir crew dir: %v", err)
  	}
  
-@@ -343,6 +343,44 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+@@ -353,6 +353,44 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
  	})
  }
  
@@ -651,7 +651,7 @@ index 5de9c699..2b20ff53 100644
  func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
  	// Save original env vars and restore after test
  	origTownRoot := os.Getenv("GT_TOWN_ROOT")
-@@ -355,11 +393,11 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+@@ -365,11 +403,11 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
  	// Create a temp directory that looks like a valid town
  	tmpTown := t.TempDir()
  	mayorDir := filepath.Join(tmpTown, "mayor")
@@ -665,7 +665,7 @@ index 5de9c699..2b20ff53 100644
  		t.Fatalf("creating town.json: %v", err)
  	}
  
-@@ -403,8 +441,8 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+@@ -413,8 +451,8 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
  		// Create another temp town for GT_ROOT
  		anotherTown := t.TempDir()
  		anotherMayor := filepath.Join(anotherTown, "mayor")
@@ -676,7 +676,7 @@ index 5de9c699..2b20ff53 100644
  
  		// Set both env vars
  		os.Setenv("GT_TOWN_ROOT", tmpTown)
-@@ -441,7 +479,7 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+@@ -451,7 +489,7 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
  		// Create a temp town with only mayor/ directory (no town.json)
  		secondaryTown := t.TempDir()
  		mayorOnlyDir := filepath.Join(secondaryTown, workspace.SecondaryMarker)
@@ -685,7 +685,7 @@ index 5de9c699..2b20ff53 100644
  
  		os.Setenv("GT_TOWN_ROOT", secondaryTown)
  		os.Setenv("GT_ROOT", "")
-@@ -546,11 +584,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
+@@ -556,11 +594,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
  			gtLog := filepath.Join(t.TempDir(), "gt.log")
  			_ = writeBDStub(t, binDir, "#!/bin/sh\nexit 0\n", "@echo off\r\nexit /b 0\r\n")
  			gtStub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + gtLog + "\"\nprintf 'stub gt %s\\n' \"$*\"\nexit 0\n"
@@ -699,7 +699,7 @@ index 5de9c699..2b20ff53 100644
  				t.Fatalf("write gt.cmd stub: %v", err)
  			}
  			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-@@ -627,7 +665,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+@@ -637,7 +675,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
  
  	t.Run("warns on untracked file", func(t *testing.T) {
  		dir := makeTestGitRepo(t)
@@ -708,7 +708,7 @@ index 5de9c699..2b20ff53 100644
  		os.Chdir(dir)
  		t.Cleanup(func() { os.Chdir(origCwd) })
  		output := captureStderr(t, func() {
-@@ -645,11 +683,11 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+@@ -655,11 +693,11 @@ func TestWarnHandoffGitStatus(t *testing.T) {
  		dir := makeTestGitRepo(t)
  		// Create and commit a file
  		fpath := filepath.Join(dir, "tracked.txt")
@@ -722,7 +722,7 @@ index 5de9c699..2b20ff53 100644
  		os.Chdir(dir)
  		t.Cleanup(func() { os.Chdir(origCwd) })
  		output := captureStderr(t, func() {
-@@ -666,8 +704,8 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+@@ -676,8 +714,8 @@ func TestWarnHandoffGitStatus(t *testing.T) {
  	t.Run("no warning for .beads-only changes", func(t *testing.T) {
  		dir := makeTestGitRepo(t)
  		// Only .beads/ untracked files — should be clean (excluded)
@@ -733,7 +733,7 @@ index 5de9c699..2b20ff53 100644
  		os.Chdir(dir)
  		t.Cleanup(func() { os.Chdir(origCwd) })
  		output := captureStderr(t, func() {
-@@ -690,7 +728,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+@@ -700,7 +738,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
  
  	t.Run("no-git-check flag suppresses warning", func(t *testing.T) {
  		dir := makeTestGitRepo(t)
@@ -742,7 +742,7 @@ index 5de9c699..2b20ff53 100644
  		os.Chdir(dir)
  		t.Cleanup(func() { os.Chdir(origCwd) })
  		// Simulate --no-git-check by setting the flag
-@@ -714,8 +752,8 @@ func TestHandoffProcessNames(t *testing.T) {
+@@ -724,8 +762,8 @@ func TestHandoffProcessNames(t *testing.T) {
  
  		tmpTown := t.TempDir()
  		mayorDir := filepath.Join(tmpTown, "mayor")
@@ -753,7 +753,7 @@ index 5de9c699..2b20ff53 100644
  
  		t.Setenv("GT_ROOT", tmpTown)
  		t.Setenv("GT_AGENT", "claude")
-@@ -739,8 +777,8 @@ func TestHandoffProcessNames(t *testing.T) {
+@@ -749,8 +787,8 @@ func TestHandoffProcessNames(t *testing.T) {
  
  		tmpTown := t.TempDir()
  		mayorDir := filepath.Join(tmpTown, "mayor")
@@ -764,7 +764,7 @@ index 5de9c699..2b20ff53 100644
  
  		t.Setenv("GT_ROOT", tmpTown)
  		t.Setenv("GT_AGENT", "claude")
-@@ -782,7 +820,7 @@ func TestCollectGitState(t *testing.T) {
+@@ -792,7 +830,7 @@ func TestCollectGitState(t *testing.T) {
  		}
  
  		// Create a file and commit
@@ -773,7 +773,7 @@ index 5de9c699..2b20ff53 100644
  			t.Fatalf("write: %v", err)
  		}
  		for _, args := range [][]string{
-@@ -797,7 +835,7 @@ func TestCollectGitState(t *testing.T) {
+@@ -807,7 +845,7 @@ func TestCollectGitState(t *testing.T) {
  		}
  
  		// Modify a file to create uncommitted changes
@@ -782,7 +782,7 @@ index 5de9c699..2b20ff53 100644
  			t.Fatalf("write: %v", err)
  		}
  
-@@ -876,9 +914,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+@@ -886,9 +924,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
  
  		// Create a last_handoff_ts file with old mtime
  		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
@@ -794,7 +794,7 @@ index 5de9c699..2b20ff53 100644
  		// Set mtime to well in the past
  		oldTime := time.Now().Add(-10 * time.Minute)
  		os.Chtimes(tsPath, oldTime, oldTime)
-@@ -900,9 +938,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+@@ -910,9 +948,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
  
  		// Create a last_handoff_ts file with very recent mtime
  		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
@@ -806,7 +806,7 @@ index 5de9c699..2b20ff53 100644
  		// Set mtime to (MinHandoffCooldown - 1s) ago so remaining is ~1s
  		recentTime := time.Now().Add(-(constants.MinHandoffCooldown - 1*time.Second))
  		os.Chtimes(tsPath, recentTime, recentTime)
-@@ -927,9 +965,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+@@ -937,9 +975,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
  
  		// Create a recent handoff file that would normally trigger cooldown
  		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
@@ -818,7 +818,7 @@ index 5de9c699..2b20ff53 100644
  
  		start := time.Now()
  		enforceHandoffCooldown()
-@@ -947,9 +985,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+@@ -957,9 +995,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
  
  		// Create a recent handoff file that would normally trigger cooldown
  		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
@@ -1002,7 +1002,7 @@ index c821e313..39774aec 100644
  
  // GetDeaconConfig returns the deacon thresholds, never nil.
 diff --git a/internal/config/types.go b/internal/config/types.go
-index 5f394214..87e9f4eb 100644
+index e49db03d..8c23e19e 100644
 --- a/internal/config/types.go
 +++ b/internal/config/types.go
 @@ -372,6 +372,32 @@ type DaemonThresholds struct {
@@ -1762,7 +1762,7 @@ index 00000000..0cebeb0d
 +
 +func intPtr(v int) *int { return &v }
 diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
-index e5715039..f9c1013f 100755
+index 3c28d64c..11ea4987 100755
 --- a/internal/daemon/daemon.go
 +++ b/internal/daemon/daemon.go
 @@ -90,6 +90,14 @@ type Daemon struct {
@@ -1806,7 +1806,7 @@ index e5715039..f9c1013f 100755
  		return nil, fmt.Errorf("creating daemon directory: %w", err)
  	}
  
-@@ -953,6 +963,11 @@ func (d *Daemon) heartbeat(state *State) {
+@@ -979,6 +989,11 @@ func (d *Daemon) heartbeat(state *State) {
  	// Kill sessions that have been idle longer than the configured threshold.
  	d.reapIdlePolecats()
  
@@ -1818,7 +1818,7 @@ index e5715039..f9c1013f 100755
  	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
  	// These are Task tool subagents that didn't clean up after completion.
  	// This is a safety net - Deacon patrol also does this more frequently.
-@@ -1063,7 +1078,8 @@ func (d *Daemon) checkAllRigsDolt() error {
+@@ -1089,7 +1104,8 @@ func (d *Daemon) checkAllRigsDolt() error {
  	if backend := readBeadsBackend(townBeadsDir); backend != "" && backend != "dolt" {
  		problems = append(problems, fmt.Sprintf(
  			"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
@@ -1828,7 +1828,7 @@ index e5715039..f9c1013f 100755
  	}
  
  	// Check each registered rig
-@@ -1073,7 +1089,8 @@ func (d *Daemon) checkAllRigsDolt() error {
+@@ -1099,7 +1115,8 @@ func (d *Daemon) checkAllRigsDolt() error {
  			rigPath := filepath.Join(d.config.TownRoot, rigName)
  			problems = append(problems, fmt.Sprintf(
  				"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",

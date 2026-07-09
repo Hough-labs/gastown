@@ -1,7 +1,7 @@
-From ee244a0864f997209d1008684c32630583a922c4 Mon Sep 17 00:00:00 2001
+From d0363d8b096eb0fdef686a7822189bcd90ea59b7 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 5 Jul 2026 12:31:11 -0400
-Subject: [PATCH 32/40] feat(sling): capture cwd/beads-dir/stderr on bd mol
+Subject: [PATCH 31/40] feat(sling): capture cwd/beads-dir/stderr on bd mol
  bond failure (gfork-i3d diagnostics)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -23,8 +23,8 @@ stale-read bug.
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
  internal/cmd/sling_bond_diagnostic_test.go | 130 +++++++++++++++++++++
- internal/cmd/sling_helpers.go              |  45 ++++++-
- 2 files changed, 169 insertions(+), 6 deletions(-)
+ internal/cmd/sling_helpers.go              |  33 +++++-
+ 2 files changed, 157 insertions(+), 6 deletions(-)
  create mode 100644 internal/cmd/sling_bond_diagnostic_test.go
 
 diff --git a/internal/cmd/sling_bond_diagnostic_test.go b/internal/cmd/sling_bond_diagnostic_test.go
@@ -164,7 +164,7 @@ index 00000000..37b14053
 +	}
 +}
 diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
-index 2d92de38..9ef037e0 100644
+index 71e00948..8df0430c 100644
 --- a/internal/cmd/sling_helpers.go
 +++ b/internal/cmd/sling_helpers.go
 @@ -1,6 +1,7 @@
@@ -175,7 +175,7 @@ index 2d92de38..9ef037e0 100644
  	"context"
  	"encoding/json"
  	"fmt"
-@@ -582,7 +583,7 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+@@ -676,7 +677,7 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
  	// Write back once
  	newDesc := beads.SetAttachmentFields(issue, fields)
  	if logPath != "" {
@@ -184,7 +184,7 @@ index 2d92de38..9ef037e0 100644
  		return nil
  	}
  
-@@ -835,7 +836,7 @@ func nudgeWitness(rigName, message string) {
+@@ -933,7 +934,7 @@ func nudgeWitness(rigName, message string) {
  	// Test hook: log nudge for test observability
  	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
  		entry := fmt.Sprintf("nudge:%s:%s\n", witnessSession, message)
@@ -193,7 +193,7 @@ index 2d92de38..9ef037e0 100644
  		if err == nil {
  			_, _ = f.WriteString(entry)
  			_ = f.Close()
-@@ -869,7 +870,7 @@ func nudgeRefinery(rigName, message string) {
+@@ -967,7 +968,7 @@ func nudgeRefinery(rigName, message string) {
  	// Test hook: log nudge for test observability (same pattern as GT_TEST_ATTACHED_MOLECULE_LOG)
  	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
  		entry := fmt.Sprintf("nudge:%s:%s\n", refinerySession, message)
@@ -202,42 +202,10 @@ index 2d92de38..9ef037e0 100644
  		if err == nil {
  			_, _ = f.WriteString(entry)
  			_ = f.Close()
-@@ -1008,12 +1009,19 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
- 	}
+@@ -1082,19 +1083,37 @@ func formulaVarsForBead(formulaName, beadID, title string, extraVars []string) [
+ 	return ensureFormulaRequiredVars(formulaName, formulaVars)
+ }
  
- 	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
-+	var bondStderr bytes.Buffer
- 	bondOut, err := BdCmd(bondArgs...).
- 		Dir(formulaWorkDir).
- 		WithAutoCommit().
- 		WithGTRoot(townRoot).
-+		Stderr(&bondStderr).
- 		Output()
- 	if err != nil {
-+		// Enrich the bare "exit status" with cwd/beads-dir/stderr so a stale-read
-+		// or wrong-database bond resolution failure (gfork-i3d) is diagnosable
-+		// from the log instead of guessing which database bd consulted.
-+		err = fmt.Errorf("%w (%s)", err, bondFailureDiagnostic(formulaWorkDir, bondArgs, bondStderr.String()))
-+
- 		// Clean up orphaned wisp from the failed legacy path.
- 		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
- 
-@@ -1026,6 +1034,11 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
- 			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
- 		}, nil
- 	}
-+	// Capturing stderr above suppresses the live passthrough bd previously had;
-+	// surface any non-empty stderr on the success path to preserve behavior.
-+	if bondStderr.Len() > 0 {
-+		fmt.Fprint(os.Stderr, bondStderr.String())
-+	}
- 
- 	// Parse bond output - the wisp root becomes the compound root.
- 	// Some environments may return success with non-JSON/empty stdout while
-@@ -1057,18 +1070,36 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
- // bondFormulaDirect retries formula attachment using direct formula->bead bond.
- // Newer bd versions support this polymorphic path even when legacy wisp->bead
- // bonding fails with "not found" for the generated wisp ID.
 +// bondFailureDiagnostic assembles the context needed to root-cause a failed
 +// `bd mol bond` bead resolution (gfork-i3d). `bd mol bond` resolves its bead
 +// operand against the working-directory database, so a wrong cwd, a stale
@@ -254,8 +222,9 @@ index 2d92de38..9ef037e0 100644
 +	return diag
 +}
 +
- func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
- 	bondArgs := []string{"mol", "bond", formulaName, beadID, "--json", "--ephemeral"}
+ // bondFormulaDirect attaches a formula to a bead through bd's canonical bond path.
+ func bondFormulaDirect(bondTarget, formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
+ 	bondArgs := []string{"mol", "bond", bondTarget, beadID, "--json", "--ephemeral"}
  	for _, variable := range vars {
  		bondArgs = append(bondArgs, "--var", variable)
  	}
@@ -272,7 +241,7 @@ index 2d92de38..9ef037e0 100644
  	}
  
  	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
-@@ -1292,8 +1323,10 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
+@@ -1332,8 +1351,10 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
  	return nil
  }
  

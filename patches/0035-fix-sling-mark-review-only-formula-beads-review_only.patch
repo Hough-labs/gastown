@@ -1,7 +1,7 @@
-From 5e37c073e2ebac2e3eaa4dc20b90b80435bbcd55 Mon Sep 17 00:00:00 2001
+From e5c23a7d1d1d524cb4a61d9610bb527c3628dce2 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 17:01:11 -0400
-Subject: [PATCH 37/40] fix(sling): mark review-only formula beads review_only
+Subject: [PATCH 35/40] fix(sling): mark review-only formula beads review_only
  so gt done skips verified_push gate (gfork-06a)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -45,10 +45,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  create mode 100644 internal/cmd/sling_review_only_test.go
 
 diff --git a/internal/cmd/sling_helpers.go b/internal/cmd/sling_helpers.go
-index 9ef037e0..79c8cf1c 100644
+index 8df0430c..d91ff66a 100644
 --- a/internal/cmd/sling_helpers.go
 +++ b/internal/cmd/sling_helpers.go
-@@ -564,6 +564,15 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+@@ -658,6 +658,15 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
  	if updates.ReviewOnly {
  		fields.ReviewOnly = true
  	}
@@ -61,10 +61,10 @@ index 9ef037e0..79c8cf1c 100644
 +	if !fields.ReviewOnly && formulaDeclaresReviewOnly(fields.AttachedFormula) {
 +		fields.ReviewOnly = true
 +	}
- 	if updates.Mode != "" {
- 		fields.Mode = updates.Mode
+ 	if updates.Mode != nil {
+ 		fields.Mode = *updates.Mode
  	}
-@@ -598,6 +607,28 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+@@ -696,6 +705,28 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
  	return nil
  }
  

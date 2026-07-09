@@ -1,4 +1,4 @@
-From 33d5a307c528d171e2aa21d9e8f5b56704b49953 Mon Sep 17 00:00:00 2001
+From c8d65ae0b61e16c029e857a8102804d022c16a82 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 12 Apr 2026 14:17:16 -0400
 Subject: [PATCH 09/40] build: install to native ~/go/bin instead of mise GOBIN
@@ -16,10 +16,10 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
  2 files changed, 19 insertions(+), 9 deletions(-)
 
 diff --git a/.githooks/pre-push b/.githooks/pre-push
-index f88eb77d..1214db61 100755
+index 3bdcf5f4..7869029a 100755
 --- a/.githooks/pre-push
 +++ b/.githooks/pre-push
-@@ -108,8 +108,8 @@ while read local_ref local_sha remote_ref remote_sha; do
+@@ -134,8 +134,8 @@ while read local_ref local_sha remote_ref remote_sha; do
    fi
  done
  
@@ -31,7 +31,7 @@ index f88eb77d..1214db61 100755
  
  exit 0
 diff --git a/Makefile b/Makefile
-index f5250b9d..00db14e9 100644
+index 0dfd2234..4d666a43 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -3,10 +3,7 @@

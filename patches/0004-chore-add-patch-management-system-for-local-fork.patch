@@ -1,4 +1,4 @@
-From c30b25bc1f58b8b1b43eabd270d0e1a0b6a46080 Mon Sep 17 00:00:00 2001
+From dfaa479f35441a300384c293e2d359f880aadd94 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Apr 2026 07:42:49 -0400
 Subject: [PATCH 04/40] chore: add patch management system for local fork
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
  create mode 100755 scripts/upgrade-anvil.sh
 
 diff --git a/.githooks/pre-push b/.githooks/pre-push
-index fc1d22f7..24a14eb9 100755
+index b0766b6f..11f3ef58 100755
 --- a/.githooks/pre-push
 +++ b/.githooks/pre-push
 @@ -1,4 +1,17 @@
@@ -49,8 +49,8 @@ index fc1d22f7..24a14eb9 100755
  # Block PRs by preventing pushes to arbitrary feature branches.
  # Gas Town agents push to main (crew) or polecat/* branches (polecats).
  # PRs are for external contributors only.
-@@ -35,7 +48,7 @@ while read local_ref local_sha remote_ref remote_sha; do
-   branch="${remote_ref#refs/heads/}"
+@@ -61,7 +74,7 @@ while read local_ref local_sha remote_ref remote_sha; do
+   fi
  
    case "$branch" in
 -    "${default_branch}"|beads-sync|polecat/*|integration/*)
@@ -59,7 +59,7 @@ index fc1d22f7..24a14eb9 100755
        ;;
      *)
 diff --git a/Makefile b/Makefile
-index 8fbd1c6c..b140d47b 100644
+index ab1bb97e..503cbd1a 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,4 +1,4 @@

@@ -1,4 +1,4 @@
-From 0b2935d1d57599cbc4d9f072237502c714e88b18 Mon Sep 17 00:00:00 2001
+From b53db17130f65ea613c2c8e796006f855f23996b Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 24 Apr 2026 17:48:25 -0400
 Subject: [PATCH 14/40] fix(make): fetch upstream/main before exporting patches
@@ -22,7 +22,7 @@ still produce the same output they produced before.
  1 file changed, 11 insertions(+)
 
 diff --git a/Makefile b/Makefile
-index 156bb585..7a607435 100644
+index 6e05f317..4f2fefc2 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -192,8 +192,19 @@ check-version-tag:

@@ -1,7 +1,7 @@
-From 8c21c9d8d6924a821ead032bce0a1fe19f290fd2 Mon Sep 17 00:00:00 2001
+From a1e4fba28172a7b138507258394191732598f78a Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 6 Jul 2026 11:03:13 -0400
-Subject: [PATCH 35/40] test(deacon): stub heartbeat-label update so
+Subject: [PATCH 34/40] test(deacon): stub heartbeat-label update so
  WriteHeartbeat tests are hermetic (gfork-cpq)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

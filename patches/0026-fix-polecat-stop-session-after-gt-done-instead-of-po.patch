@@ -1,7 +1,7 @@
-From e29ab29dc1aff64ef16cf062cd7db1347b9ad6bb Mon Sep 17 00:00:00 2001
+From 0b19379080892bc397b54d2f25e513b07c1712a4 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 13:39:23 -0400
-Subject: [PATCH 27/40] fix(polecat): stop session after gt done instead of
+Subject: [PATCH 26/40] fix(polecat): stop session after gt done instead of
  poll-looping the MR
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -13,78 +13,14 @@ Validated this session: gofumpt/vet/build/test-race green. E2E/devbox soak pendi
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- internal/cmd/done.go                          | 33 +++++++++++++------
- .../mol-polecat-code-review.formula.toml      | 18 ++++++----
- .../mol-polecat-review-pr.formula.toml        | 18 ++++++----
- .../mol-polecat-work-monorepo.formula.toml    | 14 +++++---
- .../formulas/mol-polecat-work.formula.toml    | 18 ++++++----
- 5 files changed, 69 insertions(+), 32 deletions(-)
+ .../mol-polecat-code-review.formula.toml       | 18 ++++++++++++------
+ .../mol-polecat-review-pr.formula.toml         | 18 ++++++++++++------
+ .../mol-polecat-work-monorepo.formula.toml     | 12 +++++++++---
+ .../formulas/mol-polecat-work.formula.toml     | 16 +++++++++++-----
+ 4 files changed, 44 insertions(+), 20 deletions(-)
 
-diff --git a/internal/cmd/done.go b/internal/cmd/done.go
-index 38d32f51..575694f2 100644
---- a/internal/cmd/done.go
-+++ b/internal/cmd/done.go
-@@ -7,6 +7,7 @@ import (
- 	"os"
- 	"os/exec"
- 	"path/filepath"
-+	"runtime"
- 	"strings"
- 	"time"
- 
-@@ -18,11 +19,10 @@ import (
- 	"github.com/steveyegge/gastown/internal/mail"
- 	"github.com/steveyegge/gastown/internal/polecat"
- 	"github.com/steveyegge/gastown/internal/rig"
--	"github.com/steveyegge/gastown/internal/session"
- 	"github.com/steveyegge/gastown/internal/style"
- 	"github.com/steveyegge/gastown/internal/telemetry"
- 	"github.com/steveyegge/gastown/internal/templates"
--	"github.com/steveyegge/gastown/internal/tmux"
-+	"github.com/steveyegge/gastown/internal/util"
- 	"github.com/steveyegge/gastown/internal/workspace"
- )
- 
-@@ -1470,16 +1470,29 @@ notifyWitness:
- 	// instead of transitioning to IDLE. This gives fresh context windows
- 	// per task, reduces token waste, and eliminates stale state bugs.
- 	// Must be the LAST thing gt done does — everything above must complete first.
-+	//
-+	// Gated on !pushFailed && !mrFailed: a failed submission keeps the session
-+	// alive so the witness/human can recover the work instead of it vanishing
-+	// mid-failure.
-+	//
-+	// Spawned as a DETACHED subprocess, not a goroutine: a goroutine sleeping
-+	// past gt done's return would be killed along with the process before it
-+	// ever fires. The subprocess reparents to PID 1 on exit and survives.
- 	if isPolecat {
- 		daemonCfg := config.LoadOperationalConfig(townRoot).GetDaemonConfig()
--		if daemonCfg.PolecatSelfTerminate != nil && *daemonCfg.PolecatSelfTerminate {
--			fmt.Printf("%s Self-terminating session (polecat_self_terminate=true)\n", style.Bold.Render("✓"))
--			sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
--			go func() {
--				time.Sleep(3 * time.Second)
--				t := tmux.NewTmux()
--				_ = t.KillSessionWithProcesses(sessionName)
--			}()
-+		if daemonCfg.PolecatSelfTerminate != nil && *daemonCfg.PolecatSelfTerminate && !pushFailed && !mrFailed && runtime.GOOS != "windows" {
-+			gtBin, exeErr := os.Executable()
-+			if exeErr != nil {
-+				style.PrintWarning("could not resolve gt binary for self-terminate: %v (idle reaper will collect)", exeErr)
-+			} else {
-+				fmt.Printf("%s Self-terminating session (polecat_self_terminate=true)\n", style.Bold.Render("✓"))
-+				killCmd := exec.Command("/bin/sh", "-c", `sleep 3; exec "$GT_BIN" session stop --force "$GT_TARGET"`)
-+				killCmd.Env = append(os.Environ(), "GT_BIN="+gtBin, "GT_TARGET="+rigName+"/"+polecatName)
-+				util.SetDetachedProcessGroup(killCmd)
-+				if startErr := killCmd.Start(); startErr != nil {
-+					style.PrintWarning("could not schedule self-terminate: %v (idle reaper will collect)", startErr)
-+				}
-+			}
- 		}
- 	}
- 
 diff --git a/internal/formula/formulas/mol-polecat-code-review.formula.toml b/internal/formula/formulas/mol-polecat-code-review.formula.toml
-index b44f29ba..189909dd 100644
+index 217a18fd..4417cdd0 100644
 --- a/internal/formula/formulas/mol-polecat-code-review.formula.toml
 +++ b/internal/formula/formulas/mol-polecat-code-review.formula.toml
 @@ -12,11 +12,12 @@ opportunities. The output is a set of beads capturing actionable findings.
@@ -112,7 +48,7 @@ index b44f29ba..189909dd 100644
  
  [[steps]]
  id = "load-context"
-@@ -289,7 +290,7 @@ Signal completion and clean up. You cease to exist after this step.
+@@ -298,7 +299,7 @@ Signal completion and clean up. You cease to exist after this step.
  **Self-Cleaning Model:**
  Once you run `gt done`, you're gone. The command:
  1. Syncs beads (final sync)
@@ -121,7 +57,7 @@ index b44f29ba..189909dd 100644
  3. Exits your session immediately
  
  **Run gt done:**
-@@ -305,7 +306,12 @@ gt done
+@@ -314,7 +315,12 @@ gt done
  
  You are NOT involved in any of that. You're gone. Done means gone.
  
@@ -188,7 +124,7 @@ index 737b7284..0dc18db9 100644
  [vars]
  [vars.pr_url]
 diff --git a/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml b/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
-index aad79a66..7c63a665 100644
+index f0905451..1933e3b5 100644
 --- a/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
 +++ b/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
 @@ -13,11 +13,12 @@ crash after any step and resume from the last completed step.
@@ -206,16 +142,7 @@ index aad79a66..7c63a665 100644
  
  **Important:** This formula defines the workflow template. Steps are shown inline
  when you run `gt prime` — there are no separate step beads to close. Work through
-@@ -61,7 +62,7 @@ to post comments and address them all before submitting to the merge queue.
- | Context filling | Use gt handoff to cycle to fresh session |
- | Unsure what to do | Mail Witness, don't guess |"""
- formula = "mol-polecat-work-monorepo"
--version = 1
-+version = 2
- 
- [[steps]]
- id = "load-context"
-@@ -555,7 +556,12 @@ Check your base_branch variable:
+@@ -570,7 +571,12 @@ Check your base_branch variable:
  
  You are GONE after `gt done`. Done means gone.
  
@@ -230,7 +157,7 @@ index aad79a66..7c63a665 100644
  [vars]
  [vars.issue]
 diff --git a/internal/formula/formulas/mol-polecat-work.formula.toml b/internal/formula/formulas/mol-polecat-work.formula.toml
-index b8545fe2..33e3a595 100644
+index b40a0675..09130b4f 100644
 --- a/internal/formula/formulas/mol-polecat-work.formula.toml
 +++ b/internal/formula/formulas/mol-polecat-work.formula.toml
 @@ -10,11 +10,12 @@ crash after any step and resume from the last completed step.
@@ -248,16 +175,7 @@ index b8545fe2..33e3a595 100644
  
  **Important:** This formula defines the workflow template. Steps are shown inline
  when you run `gt prime` — there are no separate step beads to close. Work through
-@@ -52,7 +53,7 @@ stale, the refinery falls through to normal gate execution.
- | Context filling | Use gt handoff to cycle to fresh session |
- | Unsure what to do | Mail Witness, don't guess |"""
- formula = "mol-polecat-work"
--version = 10
-+version = 11
- 
- [[steps]]
- id = "load-context"
-@@ -489,7 +490,7 @@ Submit your work and clean up. You cease to exist after this step.
+@@ -521,7 +522,7 @@ Submit your work and clean up. You cease to exist after this step.
  Once you run `gt done`, you're gone. The command:
  1. Pushes your branch to origin
  2. Creates an MR bead in the merge queue
@@ -266,7 +184,7 @@ index b8545fe2..33e3a595 100644
  4. Exits your session immediately
  
  **Pre-flight: Verify you have actual work to submit (HARD GATE):**
-@@ -518,7 +519,7 @@ You should see output like:
+@@ -550,7 +551,7 @@ You should see output like:
    Source: polecat/<name>
    Target: {{base_branch}}
    Issue: {{issue}}
@@ -275,7 +193,7 @@ index b8545fe2..33e3a595 100644
  ✓ Session exiting
  ```
  
-@@ -531,7 +532,12 @@ You should see output like:
+@@ -563,7 +564,12 @@ You should see output like:
  
  You are NOT involved in any of that. You're gone. Done means gone.
  

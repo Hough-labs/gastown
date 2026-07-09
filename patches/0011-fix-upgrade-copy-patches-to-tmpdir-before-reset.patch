@@ -1,4 +1,4 @@
-From 8b8beeb92d98e2cfec752b59c67a1a8f6855e0ad Mon Sep 17 00:00:00 2001
+From e9d9748028dcae34cfa2420c8ebeb6ea5e3fb88f Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 16 Apr 2026 19:42:47 -0400
 Subject: [PATCH 11/40] fix(upgrade): copy patches to tmpdir before reset

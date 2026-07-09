@@ -1,7 +1,7 @@
-From e7e3073779fe37be77d57323b1b3ffefded8859f Mon Sep 17 00:00:00 2001
+From b323712d109caa338b2a1e8390eed23e1dd1efcf Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 3 Jul 2026 23:35:40 -0400
-Subject: [PATCH 26/40] build(patches): bump fork baseline v1.2.0 -> v1.2.1
+Subject: [PATCH 25/40] build(patches): bump fork baseline v1.2.0 -> v1.2.1
 
 Rebased the local patch stack onto the released v1.2.1 tag, dropping four
 patches upstream now subsumes (costs-record polecat Stop 0005/0018 via the
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  2 files changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/.githooks/pre-push b/.githooks/pre-push
-index 57d6227a..400f6464 100755
+index ac8ed237..af66cbb8 100755
 --- a/.githooks/pre-push
 +++ b/.githooks/pre-push
 @@ -9,7 +9,7 @@
@@ -29,7 +29,7 @@ index 57d6227a..400f6464 100755
  if [ "$BRANCH_NAME" = "anvil" ]; then
      PATCH_TMPDIR=$(mktemp -d)
 diff --git a/Makefile b/Makefile
-index e5426971..2918be40 100644
+index b17d1d0a..4071a42a 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -193,7 +193,7 @@ check-version-tag:

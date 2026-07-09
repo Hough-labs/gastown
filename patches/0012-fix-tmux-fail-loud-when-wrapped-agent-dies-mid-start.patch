@@ -1,4 +1,4 @@
-From bac52760b0ef795eb5bbdc2a3985827211281a9c Mon Sep 17 00:00:00 2001
+From aa808b9083fea0a3e018cbead41aaa68c5c3fd0d Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 21 Apr 2026 09:40:52 -0400
 Subject: [PATCH 12/40] fix(tmux): fail loud when wrapped agent dies
@@ -39,15 +39,15 @@ surfaces the real failure ("pods polecat-pool-294ds not found") inline.
 (cherry picked from commit 2a7e39fd2188f3b4a8c23e414dba015b82e17f37)
 ---
  internal/config/loader.go              | 60 ++++++++++--------
- internal/polecat/session_manager.go    | 18 +++++-
+ internal/polecat/session_manager.go    | 24 +++++--
  internal/refinery/manager.go           | 18 ++++--
  internal/tmux/session_creation_test.go | 88 ++++++++++++++++++++++++++
  internal/tmux/tmux.go                  | 78 ++++++++++++++++++++++-
  internal/witness/manager.go            | 16 +++--
- 6 files changed, 237 insertions(+), 41 deletions(-)
+ 6 files changed, 240 insertions(+), 44 deletions(-)
 
 diff --git a/internal/config/loader.go b/internal/config/loader.go
-index de6e018b..aed735e3 100644
+index 83d5e1ff..5ca8ada9 100644
 --- a/internal/config/loader.go
 +++ b/internal/config/loader.go
 @@ -65,7 +65,7 @@ func SaveTownConfig(path string, config *TownConfig) error {
@@ -230,7 +230,7 @@ index de6e018b..aed735e3 100644
  		return fmt.Errorf("writing settings: %w", err)
  	}
  
-@@ -2320,7 +2320,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
+@@ -2321,7 +2321,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
  			townRoot = os.TempDir()
  		}
  		scriptDir := filepath.Join(townRoot, "daemon", "scripts")
@@ -239,7 +239,7 @@ index de6e018b..aed735e3 100644
  		role := resolvedEnv["GT_ROLE"]
  		if role == "" {
  			role = "agent"
-@@ -2329,7 +2329,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
+@@ -2330,7 +2330,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
  		safeRole := strings.ReplaceAll(role, "/", "-")
  		scriptPath := filepath.Join(scriptDir, safeRole+"-startup.ps1")
  		scriptContent := strings.Join(scriptLines, "\n") + "\n"
@@ -248,7 +248,7 @@ index de6e018b..aed735e3 100644
  			// Fallback: inline command (may fail if too long)
  			cmd = strings.Join(scriptLines, "; ")
  		} else {
-@@ -2573,7 +2573,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
+@@ -2574,7 +2574,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
  			townRoot = os.TempDir()
  		}
  		scriptDir := filepath.Join(townRoot, "daemon", "scripts")
@@ -257,7 +257,7 @@ index de6e018b..aed735e3 100644
  		role := resolvedEnv["GT_ROLE"]
  		if role == "" {
  			role = "agent"
-@@ -2581,7 +2581,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
+@@ -2582,7 +2582,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
  		safeRole := strings.ReplaceAll(role, "/", "-")
  		scriptPath := filepath.Join(scriptDir, safeRole+"-startup.ps1")
  		scriptContent := strings.Join(scriptLines, "\n") + "\n"
@@ -266,7 +266,7 @@ index de6e018b..aed735e3 100644
  			cmd = strings.Join(scriptLines, "; ")
  		} else {
  			cmd = "& " + psQuote(scriptPath)
-@@ -2726,6 +2726,14 @@ func resolveExecWrapper(rigPath string) []string {
+@@ -2727,6 +2727,14 @@ func resolveExecWrapper(rigPath string) []string {
  	return nil
  }
  
@@ -281,7 +281,7 @@ index de6e018b..aed735e3 100644
  // ExpectedPaneCommands returns tmux pane command names that indicate the runtime is running.
  // Claude can report as "node" (older versions) or "claude" (newer versions).
  // Other runtimes typically report their executable name.
-@@ -2842,7 +2850,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
+@@ -2843,7 +2851,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
  		return err
  	}
  
@@ -290,7 +290,7 @@ index de6e018b..aed735e3 100644
  		return fmt.Errorf("creating directory: %w", err)
  	}
  
-@@ -2851,7 +2859,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
+@@ -2852,7 +2860,7 @@ func SaveEscalationConfig(path string, config *EscalationConfig) error {
  		return fmt.Errorf("encoding escalation config: %w", err)
  	}
  
@@ -300,10 +300,10 @@ index de6e018b..aed735e3 100644
  	}
  
 diff --git a/internal/polecat/session_manager.go b/internal/polecat/session_manager.go
-index 9b25a6a1..6db9de7f 100644
+index 35c08d25..84491e8e 100644
 --- a/internal/polecat/session_manager.go
 +++ b/internal/polecat/session_manager.go
-@@ -527,8 +527,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+@@ -505,8 +505,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
  	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
  	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
  
@@ -322,24 +322,30 @@ index 9b25a6a1..6db9de7f 100644
  
  	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
  	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
-@@ -536,7 +544,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+@@ -518,10 +526,14 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
  	// Wait for runtime to be fully ready at the prompt (not just started).
  	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
  	// falling back to ReadyDelayMs sleep for agents without prompt detection.
 -	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+-	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
+-		_ = m.tmux.KillSessionWithProcesses(sessionID)
+-		return fmt.Errorf("startup blocked: %w", err)
 +	// For wrapped rigs the prompt-based probe is pointless (already covered by
 +	// WaitForAgentReady above).
 +	if !wrapped {
 +		debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
-+	}
++		if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
++			_ = m.tmux.KillSessionWithProcesses(sessionID)
++			return fmt.Errorf("startup blocked: %w", err)
++		}
+ 	}
  
  	// Handle fallback nudges for non-hook agents.
- 	// See StartupFallbackInfo in runtime package for the fallback matrix.
 diff --git a/internal/refinery/manager.go b/internal/refinery/manager.go
-index 74f5df7b..2e8884fe 100644
+index 7094f591..58983596 100644
 --- a/internal/refinery/manager.go
 +++ b/internal/refinery/manager.go
-@@ -240,12 +240,18 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
+@@ -297,12 +297,18 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
  	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
  	_ = t.AcceptStartupDialogs(sessionID)
  
@@ -363,7 +369,7 @@ index 74f5df7b..2e8884fe 100644
  	}
  
  	// Start nudge-queue poller (gt-dgf). Claude's UserPromptSubmit hook only
-@@ -289,7 +295,7 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
+@@ -377,7 +383,7 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
  	}
  
  	// Ensure parent directory exists
@@ -479,10 +485,10 @@ index 0747af25..d3f4ddb3 100644
  func TestSanitizeNudgeMessage(t *testing.T) {
  	t.Parallel()
 diff --git a/internal/tmux/tmux.go b/internal/tmux/tmux.go
-index 8473388f..cf33b2d7 100644
+index 1ed3056a..7f8e3edf 100644
 --- a/internal/tmux/tmux.go
 +++ b/internal/tmux/tmux.go
-@@ -452,6 +452,11 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
+@@ -455,6 +455,11 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
  // fail immediately (binary not found, syntax error, etc.). Expects remain-on-exit
  // to already be enabled on the session. Checks the exit status after a brief delay.
  // Only returns an error for non-zero exits (command failures), not clean exits (status 0).
@@ -494,7 +500,7 @@ index 8473388f..cf33b2d7 100644
  func (t *Tmux) checkSessionAfterCreate(name, command string) error {
  	checkPaneDead := func() (bool, error) {
  		paneDead, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead}")
-@@ -483,11 +488,42 @@ func (t *Tmux) checkSessionAfterCreate(name, command string) error {
+@@ -486,11 +491,42 @@ func (t *Tmux) checkSessionAfterCreate(name, command string) error {
  		return err
  	}
  
@@ -539,7 +545,7 @@ index 8473388f..cf33b2d7 100644
  // EnsureSessionFresh ensures a session is available and healthy.
  // If the session exists but is a zombie (Claude not running), it kills the session first.
  // This prevents "session already exists" errors when trying to restart dead agents.
-@@ -2774,6 +2810,9 @@ func (t *Tmux) resolveSessionProcessNames(session string) []string {
+@@ -2921,6 +2957,9 @@ func (t *Tmux) resolveSessionProcessNames(session string) []string {
  // This handles agents wrapped in shell scripts (e.g., c2claude wrapping
  // claude-original) where exec env does not replace the shell as the pane
  // foreground process. Replaces process-tree probing (IsAgentAlive) per gt-sk5u.
@@ -549,7 +555,7 @@ index 8473388f..cf33b2d7 100644
  func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
  	// ZFC: Clear agent-ready sentinel to prevent stale values from previous
  	// agent runs. The agent's SessionStart hook (gt prime --hook) sets this
-@@ -2783,6 +2822,9 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout
+@@ -2930,6 +2969,9 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout
  
  	deadline := time.Now().Add(timeout)
  	for time.Now().Before(deadline) {
@@ -559,7 +565,7 @@ index 8473388f..cf33b2d7 100644
  		cmd, err := t.GetPaneCommand(session)
  		if err != nil {
  			time.Sleep(constants.PollInterval)
-@@ -2810,6 +2852,32 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout
+@@ -2957,6 +2999,32 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout
  	return fmt.Errorf("timeout waiting for command (still running excluded command)")
  }
  
@@ -592,7 +598,7 @@ index 8473388f..cf33b2d7 100644
  // WaitForShellReady polls until the pane is running a shell command.
  // Useful for waiting until a process has exited and returned to shell.
  func (t *Tmux) WaitForShellReady(session string, timeout time.Duration) error {
-@@ -2910,6 +2978,12 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
+@@ -3096,6 +3164,12 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
  
  	deadline := time.Now().Add(timeout)
  	for time.Now().Before(deadline) {

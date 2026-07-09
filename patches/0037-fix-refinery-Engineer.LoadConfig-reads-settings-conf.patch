@@ -1,7 +1,7 @@
-From e908cd718516c029e4b78500b5c27da6df9f9342 Mon Sep 17 00:00:00 2001
+From 45d70f6bb4b4c31534d8a0d59732d499dea3fb01 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 19:49:37 -0400
-Subject: [PATCH 39/40] fix(refinery): Engineer.LoadConfig reads
+Subject: [PATCH 37/40] fix(refinery): Engineer.LoadConfig reads
  settings/config.json, not rig-root (gfork-hgx)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -29,12 +29,12 @@ tests pass. Pre-existing TestEngineerClearAgentActiveMRUsesTownBeadsDir failure
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
  internal/refinery/engineer.go               | 11 ++-
- internal/refinery/engineer_pr_merge_test.go | 16 ++---
+ internal/refinery/engineer_pr_merge_test.go |  9 +--
  internal/refinery/engineer_test.go          | 75 ++++++++++-----------
- 3 files changed, 48 insertions(+), 54 deletions(-)
+ 3 files changed, 45 insertions(+), 50 deletions(-)
 
 diff --git a/internal/refinery/engineer.go b/internal/refinery/engineer.go
-index 82a4a822..479dfc6b 100644
+index 0b4e437b..a87a0fb8 100644
 --- a/internal/refinery/engineer.go
 +++ b/internal/refinery/engineer.go
 @@ -18,6 +18,7 @@ import (
@@ -45,7 +45,7 @@ index 82a4a822..479dfc6b 100644
  	"github.com/steveyegge/gastown/internal/crew"
  	"github.com/steveyegge/gastown/internal/events"
  	"github.com/steveyegge/gastown/internal/git"
-@@ -310,9 +311,12 @@ func (e *Engineer) SetOutput(w io.Writer) {
+@@ -312,9 +313,12 @@ func (e *Engineer) SetOutput(w io.Writer) {
  	e.output = w
  }
  
@@ -60,7 +60,7 @@ index 82a4a822..479dfc6b 100644
  	data, err := os.ReadFile(configPath)
  	if err != nil {
  		if os.IsNotExist(err) {
-@@ -1462,7 +1466,8 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
+@@ -1682,7 +1686,8 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
  	retryCount := mr.RetryCount + 1
  
  	// Build the task description with metadata
@@ -71,19 +71,18 @@ index 82a4a822..479dfc6b 100644
  ## Metadata
  - Original MR: %s
 diff --git a/internal/refinery/engineer_pr_merge_test.go b/internal/refinery/engineer_pr_merge_test.go
-index e52e6c69..ec96949e 100644
+index 51b3e8e0..f681b519 100644
 --- a/internal/refinery/engineer_pr_merge_test.go
 +++ b/internal/refinery/engineer_pr_merge_test.go
-@@ -4,8 +4,6 @@ import (
+@@ -4,7 +4,6 @@ import (
  	"bytes"
  	"context"
  	"encoding/json"
 -	"os"
--	"path/filepath"
+ 	"path/filepath"
  	"strings"
  	"testing"
- 
-@@ -29,9 +27,7 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
+@@ -29,9 +28,7 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -94,17 +93,7 @@ index e52e6c69..ec96949e 100644
  
  	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  	e := NewEngineer(r)
-@@ -51,16 +47,14 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
- 	tmpDir := t.TempDir()
- 
- 	config := map[string]interface{}{
--		"type":    "rig",
--		"version": 1,
--		"name":    "test-rig",
-+		"type":        "rig",
-+		"version":     1,
-+		"name":        "test-rig",
- 		"merge_queue": map[string]interface{}{},
+@@ -58,9 +55,7 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -116,11 +105,11 @@ index e52e6c69..ec96949e 100644
  	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  	e := NewEngineer(r)
 diff --git a/internal/refinery/engineer_test.go b/internal/refinery/engineer_test.go
-index d2296b73..e4857f26 100644
+index 6ad4e271..b511a137 100644
 --- a/internal/refinery/engineer_test.go
 +++ b/internal/refinery/engineer_test.go
-@@ -17,6 +17,19 @@ import (
- 	"github.com/steveyegge/gastown/internal/rig"
+@@ -19,6 +19,19 @@ import (
+ 	"github.com/steveyegge/gastown/internal/testutil"
  )
  
 +// writeEngineerSettingsConfig writes rig merge-queue config to the canonical
@@ -139,7 +128,7 @@ index d2296b73..e4857f26 100644
  func TestDefaultMergeQueueConfig(t *testing.T) {
  	cfg := DefaultMergeQueueConfig()
  
-@@ -57,11 +70,11 @@ func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
+@@ -136,11 +149,11 @@ func TestEngineerTerminalCloseClearsAgentActiveMRUsesTownBeadsDir(t *testing.T)
  		townBeadsDir,
  		rigBeadsDir,
  	} {
@@ -153,16 +142,16 @@ index d2296b73..e4857f26 100644
  		t.Fatalf("write town.json: %v", err)
  	}
  	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
-@@ -101,7 +114,7 @@ case "$cmd" in
+@@ -182,7 +195,7 @@ case "$cmd" in
      ;;
  esac
- `, logPath, townBeadsDir)
+ `, logPath)
 -	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
 +	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
  		t.Fatalf("write mock bd: %v", err)
  	}
  	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-@@ -178,9 +191,7 @@ func TestEngineer_LoadConfig_WithMergeQueue(t *testing.T) {
+@@ -382,9 +395,7 @@ func TestEngineer_LoadConfig_WithMergeQueue(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -173,7 +162,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{
  		Name: "test-rig",
-@@ -237,9 +248,7 @@ func TestEngineer_LoadConfig_AutoPushDisabled(t *testing.T) {
+@@ -441,9 +452,7 @@ func TestEngineer_LoadConfig_AutoPushDisabled(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -184,7 +173,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{
  		Name: "test-rig",
-@@ -272,9 +281,7 @@ func TestEngineer_LoadConfig_NoMergeQueueSection(t *testing.T) {
+@@ -476,9 +485,7 @@ func TestEngineer_LoadConfig_NoMergeQueueSection(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -195,7 +184,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{
  		Name: "test-rig",
-@@ -307,9 +314,7 @@ func TestEngineer_LoadConfig_InvalidPollInterval(t *testing.T) {
+@@ -511,9 +518,7 @@ func TestEngineer_LoadConfig_InvalidPollInterval(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -206,7 +195,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{
  		Name: "test-rig",
-@@ -349,9 +354,7 @@ func TestEngineer_LoadConfig_InvalidStaleClaimTimeout(t *testing.T) {
+@@ -553,9 +558,7 @@ func TestEngineer_LoadConfig_InvalidStaleClaimTimeout(t *testing.T) {
  			}
  
  			data, _ := json.MarshalIndent(config, "", "  ")
@@ -217,7 +206,7 @@ index d2296b73..e4857f26 100644
  
  			r := &rig.Rig{
  				Name: "test-rig",
-@@ -417,9 +420,7 @@ func TestEngineer_LoadConfig_WithGates(t *testing.T) {
+@@ -621,9 +624,7 @@ func TestEngineer_LoadConfig_WithGates(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -228,7 +217,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  	e := NewEngineer(r)
-@@ -477,9 +478,7 @@ func TestEngineer_LoadConfig_GateInvalidTimeout(t *testing.T) {
+@@ -681,9 +682,7 @@ func TestEngineer_LoadConfig_GateInvalidTimeout(t *testing.T) {
  			}
  
  			data, _ := json.MarshalIndent(config, "", "  ")
@@ -239,7 +228,7 @@ index d2296b73..e4857f26 100644
  
  			r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  			e := NewEngineer(r)
-@@ -514,9 +513,7 @@ func TestEngineer_LoadConfig_GatePhase(t *testing.T) {
+@@ -718,9 +717,7 @@ func TestEngineer_LoadConfig_GatePhase(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -250,7 +239,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  	e := NewEngineer(r)
-@@ -552,9 +549,7 @@ func TestEngineer_LoadConfig_GateInvalidPhase(t *testing.T) {
+@@ -756,9 +753,7 @@ func TestEngineer_LoadConfig_GateInvalidPhase(t *testing.T) {
  	}
  
  	data, _ := json.MarshalIndent(config, "", "  ")
@@ -261,7 +250,7 @@ index d2296b73..e4857f26 100644
  
  	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
  	e := NewEngineer(r)
-@@ -821,7 +816,7 @@ func TestPostMergeConvoyCheck_NoTownBeads(t *testing.T) {
+@@ -1025,7 +1020,7 @@ func TestPostMergeConvoyCheck_NoTownBeads(t *testing.T) {
  
  	// Create rig dir as a subdirectory of the "town root"
  	rigDir := filepath.Join(tmpDir, "testrig")
@@ -270,7 +259,7 @@ index d2296b73..e4857f26 100644
  		t.Fatal(err)
  	}
  
-@@ -855,12 +850,12 @@ func TestCheckAndCloseCompletedConvoys_UsesHardenedBDEnvs(t *testing.T) {
+@@ -1059,12 +1054,12 @@ func TestCheckAndCloseCompletedConvoys_UsesHardenedBDEnvs(t *testing.T) {
  
  	tmpDir := t.TempDir()
  	townBeads := filepath.Join(tmpDir, ".beads")
@@ -285,7 +274,7 @@ index d2296b73..e4857f26 100644
  		t.Fatal(err)
  	}
  
-@@ -927,7 +922,7 @@ case "$*" in
+@@ -1131,7 +1126,7 @@ case "$*" in
      ;;
  esac
  `
@@ -294,7 +283,7 @@ index d2296b73..e4857f26 100644
  		t.Fatal(err)
  	}
  	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-@@ -963,7 +958,7 @@ func TestNotifyDeaconConvoyFeeding_SkipsWhenNoConvoyID(t *testing.T) {
+@@ -1167,7 +1162,7 @@ func TestNotifyDeaconConvoyFeeding_SkipsWhenNoConvoyID(t *testing.T) {
  	defer os.RemoveAll(tmpDir)
  
  	rigDir := filepath.Join(tmpDir, "testrig")
@@ -303,7 +292,7 @@ index d2296b73..e4857f26 100644
  		t.Fatal(err)
  	}
  
-@@ -999,7 +994,7 @@ func TestNotifyDeaconConvoyFeeding_AttemptsWhenConvoyID(t *testing.T) {
+@@ -1203,7 +1198,7 @@ func TestNotifyDeaconConvoyFeeding_AttemptsWhenConvoyID(t *testing.T) {
  	defer os.RemoveAll(tmpDir)
  
  	rigDir := filepath.Join(tmpDir, "testrig")
@@ -312,7 +301,7 @@ index d2296b73..e4857f26 100644
  		t.Fatal(err)
  	}
  
-@@ -1120,10 +1115,10 @@ func TestEngineerNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
+@@ -1324,10 +1319,10 @@ func TestEngineerNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
  	townRoot := filepath.Join(tmpDir, "town")
  	rigDir := filepath.Join(townRoot, "testrig")
  	townBeads := filepath.Join(townRoot, ".beads")
@@ -325,7 +314,7 @@ index d2296b73..e4857f26 100644
  		t.Fatalf("mkdir rig: %v", err)
  	}
  
-@@ -1157,7 +1152,7 @@ case "$1" in
+@@ -1361,7 +1356,7 @@ case "$1" in
  esac
  exit 0
  `
@@ -334,7 +323,7 @@ index d2296b73..e4857f26 100644
  		t.Fatalf("write bd stub: %v", err)
  	}
  
-@@ -1167,7 +1162,7 @@ if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
+@@ -1371,7 +1366,7 @@ if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
  fi
  exit 0
  `

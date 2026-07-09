@@ -1,4 +1,4 @@
-From 3b5fc306696cbcd1d0cb9f5370a1126d5215fef1 Mon Sep 17 00:00:00 2001
+From 94d0027a92653a047edfa3fecee59a001d90dc6c Mon Sep 17 00:00:00 2001
 From: deacon <git@hough.ink>
 Date: Fri, 24 Apr 2026 16:53:14 -0400
 Subject: [PATCH 13/40] Fix: gt deacon heartbeat now updates bead label

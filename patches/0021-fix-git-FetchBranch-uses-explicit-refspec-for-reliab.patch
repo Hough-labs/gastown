@@ -1,4 +1,4 @@
-From 26fb86907c75e8d86bb2be72e368ab896fbceba0 Mon Sep 17 00:00:00 2001
+From 96578e976713cf3ec3eb1a46ee338474c7ef3bd3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:59 -0400
 Subject: [PATCH 21/40] fix(git): FetchBranch uses explicit refspec for
@@ -22,10 +22,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  1 file changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/internal/git/git.go b/internal/git/git.go
-index 346b92b2..798654c0 100644
+index 9a8afaeb..4990e2c0 100644
 --- a/internal/git/git.go
 +++ b/internal/git/git.go
-@@ -908,8 +908,17 @@ func (g *Git) FetchPrune(remote string) error {
+@@ -916,8 +916,17 @@ func (g *Git) FetchPrune(remote string) error {
  }
  
  // FetchBranch fetches a specific branch from the remote.
