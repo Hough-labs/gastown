@@ -190,10 +190,12 @@ check-version-tag:
 	fi; \
 	echo "check-version-tag: OK (tag $$TAG matches Version=$$CODE_VERSION)"
 
-# Upstream baseline this fork tracks. We pin to a release TAG (not upstream/main)
-# because main diverges from release tags. Bump this on every upstream upgrade
-# (and the matching ref in .githooks/pre-push), then rebase patches onto it.
-UPSTREAM_BASE := v1.2.1
+# Upstream baseline this fork tracks. Normally a release TAG, but there is no
+# tag past v1.2.1, so we pin to an upstream/main SHA (the fork was rebased onto
+# it to pick up the beads v1.0.5 dependency-schema migration). Bump this on every
+# upstream upgrade (and the matching ref in .githooks/pre-push), then rebase
+# patches onto it. The SHA must be fetched/reachable for `make patches`.
+UPSTREAM_BASE := 81233d36f27465fcae83944f78bdea1674d7143e
 
 # Export current local commits (UPSTREAM_BASE..HEAD divergence) to patches/.
 # Run this after adding or editing a local patch commit.

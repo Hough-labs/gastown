@@ -7,9 +7,9 @@
 #    (Upstream logic — do not remove.)
 
 # ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
-# Baseline tag this fork tracks. Keep in sync with UPSTREAM_BASE in the Makefile;
-# bump both on every upstream upgrade.
-UPSTREAM_BASE="v1.2.1"
+# Baseline this fork tracks (an upstream/main SHA — no tag exists past v1.2.1).
+# Keep in sync with UPSTREAM_BASE in the Makefile; bump both on every upstream upgrade.
+UPSTREAM_BASE="81233d36f27465fcae83944f78bdea1674d7143e"
 BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
 if [ "$BRANCH_NAME" = "anvil" ]; then
     PATCH_TMPDIR=$(mktemp -d)
