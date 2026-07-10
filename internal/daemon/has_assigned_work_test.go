@@ -28,6 +28,18 @@ func TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag(t *testing
 	binDir := t.TempDir()
 	logPath := filepath.Join(binDir, "bd.log")
 	expectedBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	// Materialize the routed rig dir on disk before the lookup. hasAssignedOpenWork
+	// resolves the pinned dir via GetRigDirForName -> pathWithin, which runs
+	// filepath.EvalSymlinks on both townRoot and the candidate rig dir. On macOS
+	// t.TempDir() lives under /var (a symlink to /private/var): a rig dir that does
+	// not exist on disk stays unresolved while townRoot resolves, so the two paths
+	// diverge (/var vs /private/var), pathWithin returns false, and the daemon falls
+	// back to the routing branch instead of the pinned branch this test exercises.
+	// Creating it keeps EvalSymlinks symmetric and mirrors a real town, where the
+	// rig dir always exists on disk.
+	if err := os.MkdirAll(expectedBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir rig beads: %v", err)
+	}
 	script := `#!/bin/sh
 for arg in "$@"; do
   case "$arg" in
