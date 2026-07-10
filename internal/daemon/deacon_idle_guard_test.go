@@ -53,6 +53,20 @@ if [[ "$cmd" == "has-session" ]]; then
   exit 0
 fi
 
+# The very-stale escalation subtest drives restartStuckDeacon ->
+# ensureDeaconRunning -> deacon.Manager.Start -> WaitForCommand, which polls
+# display-message for the pane's foreground command until it is no longer a
+# shell (Claude started) or ClaudeStartTimeout (180s) elapses. Report a live
+# pane already running a non-shell command so WaitForCommand returns on the
+# first poll instead of hanging for the full timeout (gfork-g0d).
+if [[ "$cmd" == "display-message" ]]; then
+  case "$*" in
+    *pane_current_command*) echo "claude" ;;
+    *pane_dead*)            echo "0" ;;
+  esac
+  exit 0
+fi
+
 exit 0
 `
 	path := filepath.Join(dir, "tmux")
