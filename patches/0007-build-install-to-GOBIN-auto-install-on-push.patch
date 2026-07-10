@@ -1,7 +1,7 @@
 From 856ff07c6c42168ae697188be93e457aa8b06713 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 10 Apr 2026 12:19:09 -0400
-Subject: [PATCH 07/37] build: install to GOBIN, auto-install on push
+Subject: [PATCH 07/38] build: install to GOBIN, auto-install on push
 
 INSTALL_DIR now uses go env GOBIN with ~/go/bin fallback.
 Pre-push hook runs make install after branch policy checks.
