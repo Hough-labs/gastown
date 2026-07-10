@@ -1,7 +1,7 @@
 From 5df2cecf777be4a7f103259441afda7e4d7dbd73 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 9 Jul 2026 23:43:35 -0400
-Subject: [PATCH 38/38] =?UTF-8?q?fix(test):=20make=20deacon=20idle-guard?=
+Subject: [PATCH 38/39] =?UTF-8?q?fix(test):=20make=20deacon=20idle-guard?=
  =?UTF-8?q?=20fake=20tmux=20hermetic=20=E2=80=94=20no=20180s=20WaitForComm?=
  =?UTF-8?q?and=20hang=20(gfork-g0d)?=
 MIME-Version: 1.0
