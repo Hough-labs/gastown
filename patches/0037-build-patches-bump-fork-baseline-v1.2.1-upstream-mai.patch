@@ -1,7 +1,7 @@
-From 782054716d1ebb5ede23a7db6ebf6393be6c4acb Mon Sep 17 00:00:00 2001
+From 9e31187f6f80a0cc16868b0d2f4b8585c6e18949 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 9 Jul 2026 15:47:10 -0400
-Subject: [PATCH 40/40] build(patches): bump fork baseline v1.2.1 ->
+Subject: [PATCH 37/37] build(patches): bump fork baseline v1.2.1 ->
  upstream/main 81233d36
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

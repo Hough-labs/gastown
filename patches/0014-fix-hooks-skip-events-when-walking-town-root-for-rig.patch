@@ -1,7 +1,7 @@
-From c19f6f6a4cc59003f51df58c1c73bcd3483ab644 Mon Sep 17 00:00:00 2001
+From c4bb631b9bd4bdb537379e9731b9ddf32355d6b0 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 12 May 2026 12:51:34 -0400
-Subject: [PATCH 15/40] fix(hooks): skip events/ when walking town root for rig
+Subject: [PATCH 14/37] fix(hooks): skip events/ when walking town root for rig
  discovery
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
