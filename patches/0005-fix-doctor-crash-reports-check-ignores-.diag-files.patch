@@ -1,7 +1,7 @@
 From 01da74d7382b6ece9bed4bb95df2b7f6cc80457a Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Apr 2026 09:14:53 -0400
-Subject: [PATCH 05/40] fix(doctor): crash-reports check ignores .diag files
+Subject: [PATCH 05/41] fix(doctor): crash-reports check ignores .diag files
 
 macOS writes two kinds of reports to DiagnosticReports/:
   - .ips files: actual crashes
