@@ -638,6 +638,21 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
 	}
 
+	// Guard against re-dispatching work already submitted to the merge queue
+	// (gfork-649). Under merge_strategy=pr the source bead stays open until
+	// its PR merges (hq-6wd2) and the polecat session stops after gt done —
+	// so to convoy/orphan recovery a completed-but-unmerged bead looks
+	// abandoned (open bead, dead session). Re-slinging it spawns a duplicate
+	// polecat that can false-close the bead while the PR is still open. A
+	// clean open MR means the refinery owns completion; MRs with
+	// conflict/retry evidence are legitimate takeover targets (GH#gt-zqvj)
+	// and pass through.
+	if !slingForce {
+		if mrID, blocked := openMRDispatchBlock(townRoot, beadID); blocked {
+			return fmt.Errorf("refusing to sling bead %s: open merge request %s is awaiting merge/review\nThe work is already submitted — the refinery closes the bead when the PR merges.\nIf the MR is stale, reject it first (gt mq reject %s) or use --force", beadID, mrID, mrID)
+		}
+	}
+
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
 	force := slingForce // local copy to avoid mutating package-level flag

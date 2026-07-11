@@ -928,6 +928,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					skipClose = true
 				}
 
+				// False-close guard (gfork-649): "no commits ahead" does NOT
+				// mean the work landed — a prior attempt may have submitted it
+				// and its PR is still open awaiting merge/review. The
+				// verified_push gate below passes vacuously in that case (HEAD
+				// sits on the master base commit), so check for open MRs
+				// explicitly. The refinery closes the source issue when the MR
+				// merges (Manager.PostMerge).
+				if !skipClose {
+					if openMRs, findErr := bd.FindOpenMRsForIssue(issueID); findErr == nil && len(openMRs) > 0 {
+						skipReason := fmt.Sprintf("open merge request %s already references %s — work is submitted, awaiting merge", openMRs[0].ID, issueID)
+						style.PrintWarning("skipping close: %s", skipReason)
+						fmt.Printf("  The bead stays open; the refinery closes it when the PR merges.\n")
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+						skipClose = true
+					}
+				}
+
 				if !skipClose {
 					closeReason := "Completed with no code changes (already fixed or already merged)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
