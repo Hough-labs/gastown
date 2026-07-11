@@ -1659,6 +1659,15 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 				if !convoyops.IsSlingableType(t.IssueType) {
 					continue
 				}
+				// An issue with a clean open MR is not stranded — its work is
+				// submitted and awaiting merge/review; the refinery closes it
+				// on merge (gfork-649). Feeding it would re-sling a duplicate
+				// polecat (gt sling refuses these anyway; skipping here keeps
+				// the daemon from retrying every scan).
+				if mrID, blocked := openMRDispatchBlock(townBeads, t.ID); blocked {
+					fmt.Fprintf(os.Stderr, "⚠ Note: convoy %s: %s has open MR %s awaiting merge — not stranded\n", convoy.ID, t.ID, mrID)
+					continue
+				}
 				readyIssues = append(readyIssues, t.ID)
 			}
 		}
