@@ -607,30 +607,56 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if running {
-		fmt.Printf("%s Dolt server is %s (PID %d)\n",
-			style.Bold.Render("●"),
-			style.Bold.Render("running"),
-			pid)
+		// A server reachable on the town port but with no gt-managed process
+		// backing it (IsRunning reports PID 0) is an EXTERNAL server (launchd/
+		// systemd). PID 0 means "not gt-managed", NOT "dead", and the gt state
+		// file describes the retired local daemon. Report the real listening
+		// PID so the deacon/boot health check does not misread PID 0 + stale
+		// gt state as an outage (hq-80nx/hq-89vh/hq-ysvn).
+		var extDiag doltserver.ExternalServerDiag
+		external := false
+		if pid == 0 {
+			if d, ok := doltserver.InspectExternalServer(townRoot); ok {
+				extDiag, external = d, true
+			}
+		}
 
-		// Load state for more details
-		state, err := doltserver.LoadState(townRoot)
-		if err == nil && !state.StartedAt.IsZero() {
-			fmt.Printf("  Started: %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
-			fmt.Printf("  Port: %d\n", state.Port)
-			fmt.Printf("  Data dir: %s\n", state.DataDir)
-			if len(state.Databases) > 0 {
-				owners := doltserver.CollectDatabaseOwners(townRoot)
-				fmt.Printf("  Databases:\n")
-				for _, db := range state.Databases {
-					if owner, ok := owners[db]; ok {
-						fmt.Printf("    - %-20s (%s)\n", db, owner)
-					} else {
-						fmt.Printf("    - %s\n", db)
-					}
-				}
+		if external {
+			fmt.Printf("%s Dolt server is %s (external, PID %d — not gt-managed)\n",
+				style.Bold.Render("●"),
+				style.Bold.Render("reachable"),
+				extDiag.PID)
+			if extDiag.DataDir != "" {
+				fmt.Printf("  Data dir: %s (live process --data-dir)\n", extDiag.DataDir)
 			}
 			fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
 			printBeadsRuntimeConfig(townRoot)
+		} else {
+			fmt.Printf("%s Dolt server is %s (PID %d)\n",
+				style.Bold.Render("●"),
+				style.Bold.Render("running"),
+				pid)
+
+			// Load state for more details
+			state, err := doltserver.LoadState(townRoot)
+			if err == nil && !state.StartedAt.IsZero() {
+				fmt.Printf("  Started: %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+				fmt.Printf("  Port: %d\n", state.Port)
+				fmt.Printf("  Data dir: %s\n", state.DataDir)
+				if len(state.Databases) > 0 {
+					owners := doltserver.CollectDatabaseOwners(townRoot)
+					fmt.Printf("  Databases:\n")
+					for _, db := range state.Databases {
+						if owner, ok := owners[db]; ok {
+							fmt.Printf("    - %-20s (%s)\n", db, owner)
+						} else {
+							fmt.Printf("    - %s\n", db)
+						}
+					}
+				}
+				fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+				printBeadsRuntimeConfig(townRoot)
+			}
 		}
 
 		// Resource metrics
@@ -830,6 +856,39 @@ func runDoltLogs(cmd *cobra.Command, args []string) error {
 	return tailCmd.Run()
 }
 
+// doltDumpTargetLines renders the target-identity lines of `gt dolt dump`,
+// choosing between the gt-managed presentation and the external-server
+// presentation. A server reachable on the town port but not gt-managed
+// (IsRunning reported PID 0) has its real data dir and logs elsewhere, so the
+// config defaults (the empty <townRoot>/.dolt-data shim and a frozen
+// daemon/dolt.log) must not be shown as the live server's. Pure, so the
+// branching is unit-tested without a live server; the caller emits the
+// Connection line and the log section.
+func doltDumpTargetLines(pid int, config *doltserver.Config, ext doltserver.ExternalServerDiag, external bool) []string {
+	if external {
+		lines := []string{
+			"  Server:     reachable, EXTERNAL (not gt-managed; e.g. launchd/systemd)",
+			fmt.Sprintf("  Live PID:   %d (listening process; gt does not track it, so gt's own \"PID 0\" is expected, not a death signal)", ext.PID),
+			fmt.Sprintf("  Port:       %d", config.Port),
+		}
+		if ext.DataDir != "" {
+			lines = append(lines, fmt.Sprintf("  Data dir:   %s (from the live process --data-dir)", ext.DataDir))
+		} else {
+			lines = append(lines, fmt.Sprintf("  Data dir:   unknown (external server; gt's %s intentionally holds no databases)", config.DataDir))
+		}
+		if ext.ConfigPath != "" {
+			lines = append(lines, fmt.Sprintf("  Config:     %s (live process --config)", ext.ConfigPath))
+		}
+		return lines
+	}
+	return []string{
+		fmt.Sprintf("  Live PID:   %d", pid),
+		fmt.Sprintf("  Port:       %d", config.Port),
+		fmt.Sprintf("  Data dir:   %s", config.DataDir),
+		fmt.Sprintf("  Log file:   %s", config.LogFile),
+	}
+}
+
 func runDoltDump(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -846,45 +905,77 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 
 	config := doltserver.DefaultConfig(townRoot)
 
+	// A server reachable on the town port with no gt-managed process backing it
+	// (IsRunning reports PID 0) is an EXTERNAL server: after the local->external
+	// migration the town connects to a launchd-managed sql-server on
+	// 127.0.0.1:<port> whose data dir and logs live elsewhere. The gt-managed
+	// defaults (config.DataDir = the empty <townRoot>/.dolt-data shim;
+	// config.LogFile = a frozen dead-daemon log) do NOT describe it. Presenting
+	// them made this snapshot read "PID 0 / data missing / logs frozen months
+	// ago", which the deacon/boot health check escalated as CRITICAL "Dolt
+	// server unreachable" against a healthy server (hq-80nx/hq-89vh/hq-ysvn).
+	// Resolve the real listening process for accurate, read-only display.
+	var extDiag doltserver.ExternalServerDiag
+	external := false
+	if pid == 0 {
+		if d, ok := doltserver.InspectExternalServer(townRoot); ok {
+			extDiag, external = d, true
+		}
+	}
+
 	fmt.Printf("Dolt diagnostic snapshot (non-fatal)\n")
-	fmt.Printf("  Live PID:   %d\n", pid)
-	fmt.Printf("  Port:       %d\n", config.Port)
-	fmt.Printf("  Data dir:   %s\n", config.DataDir)
-	fmt.Printf("  Log file:   %s\n", config.LogFile)
+	for _, line := range doltDumpTargetLines(pid, config, extDiag, external) {
+		fmt.Println(line)
+	}
 	fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
 
-	if info, err := doltserver.ReadSQLServerInfo(townRoot); err == nil {
-		fmt.Printf("  SQL metadata: %s\n", info.Path)
-		fmt.Printf("    PID:       %d\n", info.PID)
-		fmt.Printf("    Port:      %d\n", info.Port)
-		if info.ServerID != "" {
-			fmt.Printf("    Server ID: %s\n", info.ServerID)
+	// gt-managed SQL metadata and daemon state describe the retired local
+	// server; for an external server they are absent or stale, so skip them.
+	if !external {
+		if info, err := doltserver.ReadSQLServerInfo(townRoot); err == nil {
+			fmt.Printf("  SQL metadata: %s\n", info.Path)
+			fmt.Printf("    PID:       %d\n", info.PID)
+			fmt.Printf("    Port:      %d\n", info.Port)
+			if info.ServerID != "" {
+				fmt.Printf("    Server ID: %s\n", info.ServerID)
+			}
+		} else {
+			fmt.Printf("  SQL metadata: unavailable (%v)\n", err)
+		}
+
+		if state, err := doltserver.LoadState(townRoot); err == nil && state.PID > 0 {
+			fmt.Printf("  Daemon state: %s\n", doltserver.StateFile(townRoot))
+			fmt.Printf("    PID:       %d", state.PID)
+			if state.PID != pid {
+				fmt.Printf(" (stale; live PID is %d)", pid)
+			}
+			fmt.Println()
+			if !state.StartedAt.IsZero() {
+				fmt.Printf("    Started:   %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+			}
+			if state.DataDir != "" {
+				fmt.Printf("    Data dir:  %s\n", state.DataDir)
+			}
+		}
+	}
+
+	if external {
+		// The live server's logs are owned by its external supervisor
+		// (launchd/systemd), not gt. Tailing config.LogFile here would print a
+		// frozen dead-daemon log and read as "no recent activity" = dead.
+		fmt.Printf("\nRecent Dolt log lines: skipped — server is external (not gt-managed).\n")
+		fmt.Printf("  gt's local log %s belongs to the retired gt-managed daemon and is stale.\n", config.LogFile)
+		if extDiag.ConfigPath != "" {
+			fmt.Printf("  Live logs are managed by the supervisor of the process using %s.\n", extDiag.ConfigPath)
 		}
 	} else {
-		fmt.Printf("  SQL metadata: unavailable (%v)\n", err)
-	}
-
-	if state, err := doltserver.LoadState(townRoot); err == nil && state.PID > 0 {
-		fmt.Printf("  Daemon state: %s\n", doltserver.StateFile(townRoot))
-		fmt.Printf("    PID:       %d", state.PID)
-		if state.PID != pid {
-			fmt.Printf(" (stale; live PID is %d)", pid)
+		fmt.Printf("\nRecent Dolt log lines:\n")
+		tailCmd := exec.Command("tail", "-n", "200", config.LogFile)
+		tailCmd.Stdout = os.Stdout
+		tailCmd.Stderr = os.Stderr
+		if err := tailCmd.Run(); err != nil {
+			fmt.Printf("  (unable to read recent logs: %v)\n", err)
 		}
-		fmt.Println()
-		if !state.StartedAt.IsZero() {
-			fmt.Printf("    Started:   %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
-		}
-		if state.DataDir != "" {
-			fmt.Printf("    Data dir:  %s\n", state.DataDir)
-		}
-	}
-
-	fmt.Printf("\nRecent Dolt log lines:\n")
-	tailCmd := exec.Command("tail", "-n", "200", config.LogFile)
-	tailCmd.Stdout = os.Stdout
-	tailCmd.Stderr = os.Stderr
-	if err := tailCmd.Run(); err != nil {
-		fmt.Printf("  (unable to read recent logs: %v)\n", err)
 	}
 
 	fmt.Printf("\nNo signal was sent. Do not use kill -QUIT for routine diagnostics unless the Dolt version has been verified not to terminate on SIGQUIT.\n")

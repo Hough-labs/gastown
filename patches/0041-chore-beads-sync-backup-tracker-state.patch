@@ -1,7 +1,7 @@
-From 1f5af146215baff58099071567390c5fdfd6e10e Mon Sep 17 00:00:00 2001
+From bcc4cd0e73d081386feec2314415821c9dc6eb18 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 11 Jul 2026 02:09:09 -0400
-Subject: [PATCH 41/41] chore(beads): sync backup tracker state
+Subject: [PATCH 41/43] chore(beads): sync backup tracker state
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---

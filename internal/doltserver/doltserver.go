@@ -1109,6 +1109,47 @@ func getDoltConfigPathFromProcess(pid int) string {
 	return resolveProcessPath(pid, getDoltFlagFromArgs(getProcessArgs(pid), "--config"))
 }
 
+// ExternalServerDiag holds read-only diagnostic facts about a Dolt sql-server
+// that is reachable on the town's port but is NOT managed by gt — e.g. a
+// launchd- or systemd-supervised server after the local->external migration,
+// where gt connects to 127.0.0.1:<port> but does not own the process.
+//
+// Every field is derived from read-only inspection of the listening process.
+// None of it may be fed to a stop/kill path: IsRunning deliberately reports
+// PID 0 for an unmanaged server so `gt dolt stop` cannot kill it (a foreign
+// PID here would re-open the hq-rhlx footgun of killing the shared server).
+// This type exists purely so `gt dolt status`/`dump` can describe the live
+// external server instead of the stale gt-managed defaults.
+type ExternalServerDiag struct {
+	PID        int    // real listening-process PID (lsof/ss); 0 if unresolved
+	DataDir    string // --data-dir from the live process args; "" if unresolved
+	ConfigPath string // --config from the live process args; "" if unresolved
+}
+
+// InspectExternalServer resolves read-only diagnostic facts about the process
+// currently listening on the town's Dolt port. It is intended for callers that
+// have already established the server is reachable but NOT gt-managed (IsRunning
+// returned PID 0), so that `gt dolt status`/`dump` report the live server's real
+// PID and data dir rather than the post-migration gt-managed defaults — an empty
+// <townRoot>/.dolt-data and a frozen daemon/dolt.log — which read as
+// "PID 0 / data missing / logs months stale" and triggered false "Dolt
+// unreachable" escalations (hq-80nx/hq-89vh/hq-ysvn) against a healthy server.
+//
+// ok is false when no listening process can be resolved; the caller should then
+// fall back to its existing gt-managed display.
+func InspectExternalServer(townRoot string) (ExternalServerDiag, bool) {
+	config := DefaultConfig(townRoot)
+	pid := findDoltServerOnPort(config.Port)
+	if pid <= 0 {
+		return ExternalServerDiag{}, false
+	}
+	return ExternalServerDiag{
+		PID:        pid,
+		DataDir:    GetDoltDataDirFromProcess(pid),
+		ConfigPath: getDoltConfigPathFromProcess(pid),
+	}, true
+}
+
 func doltProcessMatchesTownPaths(expectedDataDir, actualDataDir, actualConfigPath, actualCWD, stateDataDir string) bool {
 	expectedDir, _ := filepath.Abs(expectedDataDir)
 	if actualDataDir != "" {
