@@ -2179,7 +2179,125 @@ func ListDatabases(townRoot string) ([]string, error) {
 		return listDatabasesCached(config)
 	}
 
+	// A loopback host does NOT imply a gt-managed embedded server whose
+	// databases live under <townRoot>/.dolt-data. After the anvil->local
+	// migration the town connects to an EXTERNAL sql-server on 127.0.0.1:<port>
+	// (e.g. launchd com.bastion.dolt) whose data dir is elsewhere
+	// (~/.local/share/bastion/dolt/databases), while <townRoot>/.dolt-data
+	// intentionally holds only config.yaml and NO databases. Filesystem-scanning
+	// that empty dir false-reports every database as missing (gt doctor
+	// rig-config-sync, deacon/boot "Dolt data missing" health checks). The
+	// running server's catalog is the source of truth, so query it whenever a
+	// server is actually reachable — regardless of loopback host. Only fall back
+	// to the local filesystem scan when no server answers (the genuine
+	// gt-managed embedded / offline case).
+	if serverIsReachable(config) {
+		served, err := listDatabasesCached(config)
+		if err != nil {
+			// Server went unreachable between the probe and the query — fall
+			// back to the local scan rather than surfacing a transient error.
+			return listDatabasesLocal(config)
+		}
+		// ListDatabases has always meant "this town's databases": pre-migration
+		// the town's local dolt server only ever held them, so the filesystem
+		// scan was implicitly town-scoped. A shared external server serves other
+		// projects' databases too (e.g. ~/.local/share/bastion/dolt/databases
+		// holds this whole machine's beads DBs), so intersect the catalog with
+		// the databases this town references (hq + registered rigs + routes) to
+		// preserve that contract and keep gt from inspecting unrelated DBs.
+		return scopeToTownDatabases(townRoot, served), nil
+	}
+
 	return listDatabasesLocal(config)
+}
+
+// serverIsReachable reports whether a Dolt sql-server is accepting TCP
+// connections at the config's host:port. It is side-effect free (dial + close)
+// and is used to decide between querying a running server's catalog and
+// scanning the local data dir. The short timeout bounds the cost when no server
+// is running; when one is, the loopback dial returns in ~microseconds. Mirrors
+// the reachability probe used by CheckServerReachable.
+func serverIsReachable(config *Config) bool {
+	conn, err := net.DialTimeout("tcp", config.HostPort(), 1*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// scopeToTownDatabases filters a server's full SHOW DATABASES catalog down to
+// the databases this town owns. This preserves the historical contract of
+// ListDatabases (town-scoped) when the town connects to a shared external
+// server that also serves unrelated projects' databases.
+func scopeToTownDatabases(townRoot string, served []string) []string {
+	town := townOwnedDatabases(townRoot)
+	scoped := make([]string, 0, len(served))
+	for _, db := range served {
+		if town[db] {
+			scoped = append(scoped, db)
+		}
+	}
+	return scoped
+}
+
+// townOwnedDatabases returns the set of Dolt database names this town owns:
+// hq, plus every registered rig (rigs.json), plus every route target
+// (routes.jsonl, which catches rigs with a route but not yet in rigs.json).
+//
+// Unlike collectReferencedDatabases (used by orphan cleanup, which is
+// deliberately over-inclusive to avoid dropping legitimate DBs) this does NOT
+// scan arbitrary top-level directories under the town root. A Gas Town root
+// commonly contains unrelated project checkouts, each with its own
+// .beads/metadata.json; those projects are NOT town databases even though they
+// may share the same external Dolt server.
+func townOwnedDatabases(townRoot string) map[string]bool {
+	dbs := make(map[string]bool)
+
+	// Town-level beads (hq).
+	if db := readExistingDoltDatabase(filepath.Join(townRoot, ".beads")); db != "" {
+		dbs[db] = true
+	}
+
+	// Registered rigs (rigs.json).
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	if data, err := os.ReadFile(rigsPath); err == nil {
+		var cfg struct {
+			Rigs map[string]interface{} `json:"rigs"`
+		}
+		if json.Unmarshal(data, &cfg) == nil {
+			for rigName := range cfg.Rigs {
+				if beadsDir := FindRigBeadsDir(townRoot, rigName); beadsDir != "" {
+					if db := readExistingDoltDatabase(beadsDir); db != "" {
+						dbs[db] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Route targets (routes.jsonl) — catches rigs with a route but not yet in
+	// rigs.json.
+	routesPath := filepath.Join(townRoot, ".beads", "routes.jsonl")
+	if routesData, err := os.ReadFile(routesPath); err == nil {
+		for _, line := range strings.Split(string(routesData), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var route struct {
+				Path string `json:"path"`
+			}
+			if json.Unmarshal([]byte(line), &route) != nil || route.Path == "" {
+				continue
+			}
+			if db := readExistingDoltDatabase(filepath.Join(townRoot, route.Path, ".beads")); db != "" {
+				dbs[db] = true
+			}
+		}
+	}
+
+	return dbs
 }
 
 // listDatabasesLocal scans the filesystem for valid Dolt database directories.
