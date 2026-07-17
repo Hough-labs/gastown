@@ -4240,15 +4240,22 @@ func TestDefaultConfig_ManagedDefaultsAndEnvOverrides(t *testing.T) {
 	if config.DoltStatsEnabled != "0" {
 		t.Errorf("DoltStatsEnabled = %q, want 0", config.DoltStatsEnabled)
 	}
+	if config.AutoGC != "on" {
+		t.Errorf("AutoGC = %q, want on", config.AutoGC)
+	}
 
 	t.Setenv("GT_DOLT_STATS_ENABLED", "omit")
 	t.Setenv("GT_DOLT_EVENT_SCHEDULER", "omit")
+	t.Setenv("GT_DOLT_AUTO_GC", "off")
 	config = DefaultConfig(townRoot)
 	if config.DoltStatsEnabled != "omit" {
 		t.Errorf("DoltStatsEnabled = %q, want omit", config.DoltStatsEnabled)
 	}
 	if config.EventScheduler != "omit" {
 		t.Errorf("EventScheduler = %q, want omit", config.EventScheduler)
+	}
+	if config.AutoGC != "off" {
+		t.Errorf("AutoGC = %q, want off", config.AutoGC)
 	}
 }
 
