@@ -85,6 +85,16 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
 			continue
 		}
 
+		// A reusable idle polecat with a structurally-missing worktree is a cleanly
+		// nuked polecat whose identity/CV chain is intact. Leave it for the
+		// reuse/repair path (ReuseOrRepairIdlePolecat), which re-provisions its
+		// worktree in place — do NOT reclaim(remove) it and destroy its identity.
+		// Only genuinely non-reusable broken polecats are removed here so a fresh
+		// one can take the slot. (hq-c899)
+		if polecatMgr.ReuseDecisionForPolecat(candidate.Name, candidate.State).Reusable {
+			continue
+		}
+
 		fmt.Printf("  Reclaiming broken idle polecat %s before allocation: %v\n", candidate.Name, verifyErr)
 		if err := polecatMgr.ReclaimBrokenIdlePolecat(candidate.Name); err != nil {
 			fmt.Printf("  Broken idle polecat %s was not safe to reclaim: %v\n", candidate.Name, err)
@@ -226,12 +236,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			BaseBranch:   baseBranch,
 			ResumeBranch: opts.ResumeBranch,
 		}
+		// ReuseOrRepairIdlePolecat fast-paths a healthy worktree (branch-only reuse)
+		// and re-provisions a missing one in place (a cleanly nuked polecat), so a
+		// nuked-but-reusable slot is reactivated under its own identity instead of
+		// stranded. (hq-c899)
 		reuseOK := false
-		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
+		if _, err := polecatMgr.ReuseOrRepairIdlePolecat(polecatName, addOpts); err != nil {
 			if errors.Is(err, polecat.ErrPolecatNeedsRecovery) {
 				fmt.Printf("  Idle polecat %s needs recovery before reuse: %v; allocating new...\n", polecatName, err)
 			} else {
-				fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
+				fmt.Printf("  Reuse/repair failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
 			}
 		} else {
 			reuseOK = true
