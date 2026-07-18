@@ -519,9 +519,10 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		for _, name := range polecatNames {
 			agentBeadID := polecatBeadIDForRig(r, r.Name, name)
 			fields := parsePolecatAgentFields(agents[agentBeadID])
-			item := buildPolecatInventoryItem(r.Name, name, fields, activeWork[name], sessions)
+			worktreeMissing := polecatWorktreeMissing(r.Path, r.Name, name)
+			item := buildPolecatInventoryItem(r.Name, name, fields, activeWork[name], sessions, worktreeMissing)
 			if activeWorkErr != nil {
-				item = buildPolecatInventoryItemFromEvidence(r.Name, name, fields, polecatActiveWorkLookupError(activeWorkErr), sessions)
+				item = buildPolecatInventoryItemFromEvidence(r.Name, name, fields, polecatActiveWorkLookupError(activeWorkErr), sessions, worktreeMissing)
 			}
 			disposition := item.Disposition
 			state := effectivePolecatState(PolecatListItem{
