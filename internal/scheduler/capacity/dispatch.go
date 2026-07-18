@@ -75,6 +75,12 @@ type DispatchCycle struct {
 	// BatchSize caps items dispatched per cycle.
 	BatchSize int
 
+	// ReviewerReserve is the number of pool slots kept available for reviewer
+	// polecats. Worker dispatch is capped at (capacity - ReviewerReserve);
+	// reviewer dispatch is prioritized and may use the full capacity. Zero
+	// preserves the prior shared-pool behavior (hq-2b2v).
+	ReviewerReserve int
+
 	// SpawnDelay between dispatches.
 	SpawnDelay time.Duration
 }
@@ -99,7 +105,7 @@ func (c *DispatchCycle) Plan() (DispatchPlan, error) {
 		return DispatchPlan{}, fmt.Errorf("querying pending: %w", err)
 	}
 
-	return PlanDispatch(cap, c.BatchSize, pending), nil
+	return PlanDispatch(cap, c.BatchSize, c.ReviewerReserve, pending), nil
 }
 
 // onSuccessRetries is the number of times to retry OnSuccess before giving up.

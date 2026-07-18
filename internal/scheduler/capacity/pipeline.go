@@ -40,6 +40,14 @@ type SlingContextFields struct {
 	LastFailure      string `json:"last_failure,omitempty"`
 }
 
+// IsReviewer reports whether this pending bead dispatches a reviewer polecat
+// (review-only work) rather than a worker polecat. Reviewer dispatch is
+// prioritized and may draw on slots reserved via scheduler.reviewer_reserve
+// (hq-2b2v).
+func (b PendingBead) IsReviewer() bool {
+	return b.Context != nil && b.Context.ReviewOnly
+}
+
 // LabelSlingContext is the label used to identify sling context beads.
 const LabelSlingContext = "gt:sling-context"
 
@@ -126,13 +134,20 @@ func BlockerAware(readyIDs map[string]bool) ReadinessFilter {
 // PlanDispatch computes which beads to dispatch given capacity constraints.
 // availableCapacity: free slots (positive = that many slots, <= 0 = no capacity).
 // batchSize: max beads per cycle.
+// reviewerReserve: slots (out of the pool) that workers may not consume, kept
+//
+//	available for reviewer polecats. Reviewer dispatch is prioritized and may
+//	draw on the full availableCapacity; worker dispatch is capped at
+//	max(0, availableCapacity - reviewerReserve). Pass 0 for the prior
+//	shared-pool behavior (hq-2b2v).
+//
 // ready: beads that passed readiness filtering.
 //
 // Messaging-labeled beads (gt:message / gt:handoff / gt:merge-request) are
 // filtered out defensively before any capacity math runs. They are inter-agent
 // communication artifacts and never dispatchable work; if any survived earlier
 // filtering they must not reach a polecat (gt-el4).
-func PlanDispatch(availableCapacity, batchSize int, ready []PendingBead) DispatchPlan {
+func PlanDispatch(availableCapacity, batchSize, reviewerReserve int, ready []PendingBead) DispatchPlan {
 	ready, msgSkipped := FilterMessagingBeads(ready)
 
 	if len(ready) == 0 {
@@ -148,34 +163,92 @@ func PlanDispatch(availableCapacity, batchSize int, ready []PendingBead) Dispatc
 			Reason:  "capacity",
 		}
 	}
-
-	// Dispatch up to the smallest of capacity, batchSize, and readyBeads count
-	toDispatch := batchSize
-	if availableCapacity < toDispatch {
-		toDispatch = availableCapacity
-	}
-	if len(ready) < toDispatch {
-		toDispatch = len(ready)
+	if reviewerReserve < 0 {
+		reviewerReserve = 0
 	}
 
-	reason := "batch"
-	if availableCapacity < batchSize && availableCapacity < len(ready) {
-		reason = "capacity"
-	}
-	if len(ready) < batchSize && len(ready) < availableCapacity {
-		reason = "ready"
+	// Partition into reviewers and workers, preserving the caller's ordering
+	// within each class (contexts arrive oldest-first). Reviewers dispatch first
+	// so a per-PR reviewer never waits behind a worker burst.
+	reviewers := make([]PendingBead, 0, len(ready))
+	workers := make([]PendingBead, 0, len(ready))
+	for _, b := range ready {
+		if b.IsReviewer() {
+			reviewers = append(reviewers, b)
+		} else {
+			workers = append(workers, b)
+		}
 	}
 
-	skipped := len(ready) - toDispatch + msgSkipped
+	// Worker capacity is the pool minus the reviewer reserve; reviewers may use
+	// everything that is free.
+	workerCapacity := availableCapacity - reviewerReserve
+	if workerCapacity < 0 {
+		workerCapacity = 0
+	}
+
+	remainingCapacity := availableCapacity // total free slots this cycle
+	remainingBatch := batchSize
+	var toDispatch []PendingBead
+
+	take := func(pool []PendingBead, classCap int) (used int) {
+		for _, b := range pool {
+			if remainingBatch <= 0 || remainingCapacity <= 0 || classCap-used <= 0 {
+				break
+			}
+			toDispatch = append(toDispatch, b)
+			used++
+			remainingCapacity--
+			remainingBatch--
+		}
+		return used
+	}
+
+	reviewersDispatched := take(reviewers, remainingCapacity)
+	// Workers are bounded both by the remaining free slots and by the
+	// reserve-adjusted worker capacity. Reviewers already dispatched this cycle
+	// consume shared slots, shrinking what workers can take.
+	workerCap := workerCapacity
+	if remainingCapacity < workerCap {
+		workerCap = remainingCapacity
+	}
+	workersDispatched := take(workers, workerCap)
+
+	dispatched := reviewersDispatched + workersDispatched
+	skipped := len(ready) - dispatched + msgSkipped
+
+	reason := planReason(availableCapacity, batchSize, len(ready), dispatched)
 	if msgSkipped > 0 {
 		reason = reason + "+messaging-filtered"
 	}
 
 	return DispatchPlan{
-		ToDispatch: ready[:toDispatch],
+		ToDispatch: toDispatch,
 		Skipped:    skipped,
 		Reason:     reason,
 	}
+}
+
+// planReason classifies why a dispatch cycle stopped where it did, for operator
+// visibility. It preserves the original single-pool three-way classification
+// ("capacity" | "ready" | "batch") and adds a reserve-stranding case: when
+// fewer beads were dispatched than free slots and batch would have allowed —
+// i.e. the reviewer reserve (or worker cap) was the binding constraint — the
+// reason is "capacity" rather than the coincidental "batch"/"ready".
+func planReason(availableCapacity, batchSize, readyN, dispatched int) string {
+	reason := "batch"
+	if availableCapacity < batchSize && availableCapacity < readyN {
+		reason = "capacity"
+	}
+	if readyN < batchSize && readyN < availableCapacity {
+		reason = "ready"
+	}
+	// Reserve/worker-cap stranded work: we left ready beads undispatched even
+	// though neither the total free slots nor the batch cap were exhausted.
+	if dispatched < readyN && dispatched < batchSize && dispatched < availableCapacity {
+		reason = "capacity"
+	}
+	return reason
 }
 
 // NoRetryPolicy returns a FailurePolicy that always quarantines on first failure.

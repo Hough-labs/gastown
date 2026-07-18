@@ -136,6 +136,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		batchSize = batchOverride
 	}
 	spawnDelay := schedulerCfg.GetSpawnDelay()
+	reviewerReserve := schedulerCfg.EffectiveReviewerReserve(maxPolecats)
 
 	// Clean up invalid/stale contexts before querying for ready beads.
 	// Skip during dry-run to avoid mutating state.
@@ -219,8 +220,9 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			}
 			recordDispatchFailure(beadsForPendingContext(townRoot, b), b, err)
 		},
-		BatchSize:  batchSize,
-		SpawnDelay: spawnDelay,
+		BatchSize:       batchSize,
+		ReviewerReserve: reviewerReserve,
+		SpawnDelay:      spawnDelay,
 	}
 
 	if dryRun {

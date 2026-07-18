@@ -198,6 +198,12 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 			capacitySnapshot.ReusableIdle,
 			capacitySnapshot.PendingMR,
 		)
+		if capacitySnapshot.ReviewerReserve > 0 {
+			fmt.Printf("  Reviewer reserve: %d slot(s) (worker free: %d)\n",
+				capacitySnapshot.ReviewerReserve,
+				capacitySnapshot.WorkerFree,
+			)
+		}
 	} else {
 		fmt.Printf("  Capacity:  direct dispatch (scheduler.max_polecats=%d)\n", capacitySnapshot.Max)
 	}

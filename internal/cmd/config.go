@@ -626,6 +626,7 @@ Supported keys:
                               another Gas Town instance is using the same port.
                               Writes GT_DOLT_PORT to mayor/daemon.json env section.
   scheduler.max_polecats      Dispatch mode: -1 = direct (default), N > 0 = deferred
+  scheduler.reviewer_reserve  Slots reserved for reviewer polecats (default: 0)
   scheduler.batch_size        Beads per heartbeat (default: 1)
   scheduler.spawn_delay       Delay between spawns (default: 0s)
   polecat.target_clean_policy When to delete <polecat>/target/ on reuse
@@ -673,6 +674,7 @@ Supported keys:
   cli_theme                   CLI color scheme
   default_agent               Default agent preset name
   scheduler.max_polecats      Dispatch mode (-1 = direct, N > 0 = deferred)
+  scheduler.reviewer_reserve  Slots reserved for reviewer polecats
   scheduler.batch_size        Beads per heartbeat
   scheduler.spawn_delay       Delay between spawns
   polecat.target_clean_policy When to delete <polecat>/target/ on reuse
@@ -752,6 +754,19 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 		}
 		townSettings.Scheduler.MaxPolecats = &n
 
+	case "scheduler.reviewer_reserve":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %w (expected integer)", key, err)
+		}
+		if n < 0 {
+			return fmt.Errorf("invalid value for %s: must be >= 0 (0 = no reserve, N > 0 = reserve N slots for reviewer polecats)", key)
+		}
+		if townSettings.Scheduler == nil {
+			townSettings.Scheduler = capacity.DefaultSchedulerConfig()
+		}
+		townSettings.Scheduler.ReviewerReserve = &n
+
 	case "scheduler.batch_size":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 {
@@ -812,7 +827,7 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 		if strings.HasPrefix(key, "lifecycle.") {
 			return setLifecycleConfig(townRoot, key, value)
 		}
-		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  polecat.target_clean_policy\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
+		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.reviewer_reserve\n  scheduler.batch_size\n  scheduler.spawn_delay\n  polecat.target_clean_policy\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
 	}
 
 	if err := config.SaveTownSettings(settingsPath, townSettings); err != nil {
@@ -865,6 +880,13 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 		}
 		value = strconv.Itoa(scfg.GetMaxPolecats())
 
+	case "scheduler.reviewer_reserve":
+		scfg := townSettings.Scheduler
+		if scfg == nil {
+			scfg = capacity.DefaultSchedulerConfig()
+		}
+		value = strconv.Itoa(scfg.GetReviewerReserve())
+
 	case "scheduler.batch_size":
 		scfg := townSettings.Scheduler
 		if scfg == nil {
@@ -904,7 +926,7 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 		if strings.HasPrefix(key, "lifecycle.") {
 			return getLifecycleConfig(townRoot, key)
 		}
-		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  polecat.target_clean_policy\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
+		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.reviewer_reserve\n  scheduler.batch_size\n  scheduler.spawn_delay\n  polecat.target_clean_policy\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
 	}
 
 	fmt.Println(value)

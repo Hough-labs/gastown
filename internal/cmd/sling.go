@@ -736,6 +736,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		TownRoot:     townRoot,
 		BaseBranch:   slingBaseBranch,
 		ResumeBranch: slingResumeBranch,
+		ReviewOnly:   slingReviewOnly,
 	})
 	if err != nil {
 		return err
@@ -749,7 +750,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		parts := strings.Split(targetAgent, "/")
 		if len(parts) >= 3 {
 			var snapshot polecatCapacitySnapshot
-			admission, snapshot, err = acquirePolecatAdmissionFn(townRoot, parts[0], beadID, "direct-target")
+			admission, snapshot, err = acquirePolecatAdmissionFn(townRoot, parts[0], beadID, "direct-target", slingReviewOnly)
 			if err != nil {
 				return err
 			}

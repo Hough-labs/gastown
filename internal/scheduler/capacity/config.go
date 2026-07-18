@@ -28,6 +28,14 @@ type SchedulerConfig struct {
 	// SpawnDelay is the delay between spawns to prevent Dolt lock contention.
 	// Default: "0s".
 	SpawnDelay string `json:"spawn_delay,omitempty"`
+
+	// ReviewerReserve is the number of slots (out of MaxPolecats) reserved for
+	// reviewer polecats. Worker polecats may occupy at most (MaxPolecats -
+	// ReviewerReserve) slots; reviewer polecats may use the full pool. This
+	// prevents a burst of worker dispatches from starving per-PR reviewer spawn
+	// and deadlocking the merge queue (hq-2b2v).
+	// nil/absent = default (0, no reserve — shared pool, prior behavior).
+	ReviewerReserve *int `json:"reviewer_reserve,omitempty"`
 }
 
 // DefaultSchedulerConfig returns a SchedulerConfig with sensible defaults.
@@ -35,10 +43,12 @@ type SchedulerConfig struct {
 func DefaultSchedulerConfig() *SchedulerConfig {
 	defaultMax := -1
 	defaultBatch := 1
+	defaultReserve := 0
 	return &SchedulerConfig{
-		MaxPolecats: &defaultMax,
-		BatchSize:   &defaultBatch,
-		SpawnDelay:  "0s",
+		MaxPolecats:     &defaultMax,
+		BatchSize:       &defaultBatch,
+		SpawnDelay:      "0s",
+		ReviewerReserve: &defaultReserve,
 	}
 }
 
@@ -70,6 +80,35 @@ func (c *SchedulerConfig) GetSpawnDelay() time.Duration {
 // (max_polecats > 0). Returns false for direct dispatch (-1) and disabled (0).
 func (c *SchedulerConfig) IsDeferred() bool {
 	return c.GetMaxPolecats() > 0
+}
+
+// GetReviewerReserve returns the configured reviewer reserve or the default (0)
+// if unset. This is the raw configured value; use EffectiveReviewerReserve to
+// clamp it against the pool size before applying admission math.
+func (c *SchedulerConfig) GetReviewerReserve() int {
+	if c == nil || c.ReviewerReserve == nil {
+		return 0
+	}
+	if *c.ReviewerReserve < 0 {
+		return 0
+	}
+	return *c.ReviewerReserve
+}
+
+// EffectiveReviewerReserve returns the reviewer reserve clamped against a pool
+// of the given size. When the pool is unbounded/direct (max <= 0) the reserve
+// is meaningless and returns 0. Otherwise the reserve is clamped to [0, max-1]
+// so that at least one slot always remains available to worker polecats — a
+// reserve that swallowed the entire pool would deadlock worker dispatch.
+func (c *SchedulerConfig) EffectiveReviewerReserve(max int) int {
+	if max <= 0 {
+		return 0
+	}
+	reserve := c.GetReviewerReserve()
+	if reserve > max-1 {
+		reserve = max - 1
+	}
+	return reserve
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
