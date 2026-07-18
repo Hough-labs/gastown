@@ -33,16 +33,17 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 	setupPolecatTestRegistry(t)
 	sessions := newPolecatSessionSet([]string{"gt-running"})
 	tests := []struct {
-		name         string
-		polecatName  string
-		fields       *beads.AgentFields
-		activeWork   *beads.Issue
-		wantState    polecat.State
-		wantIssue    string
-		wantVerdict  string
-		wantReusable bool
-		wantRecovery bool
-		wantCapacity bool
+		name            string
+		polecatName     string
+		fields          *beads.AgentFields
+		activeWork      *beads.Issue
+		worktreeMissing bool
+		wantState       polecat.State
+		wantIssue       string
+		wantVerdict     string
+		wantReusable    bool
+		wantRecovery    bool
+		wantCapacity    bool
 	}{
 		{
 			name:         "clean idle reusable",
@@ -125,11 +126,47 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantState:   polecat.StateDone,
 			wantVerdict: polecat.WorkstateVerdictPendingMR,
 		},
+		{
+			// hq-fqap: a nuked polecat with unrecorded cleanup_status has been cleanly
+			// torn down (worktree gone). It is reusable capacity, not a cleanup-unknown
+			// recovery zombie holding a slot.
+			name:            "nuked missing-worktree with missing cleanup_status is reusable",
+			polecatName:     "nuked",
+			fields:          &beads.AgentFields{AgentState: string(beads.AgentStateNuked)},
+			worktreeMissing: true,
+			wantState:       polecat.StateIdle,
+			wantVerdict:     polecat.WorkstateVerdictSafeToNuke,
+			wantReusable:    true,
+			wantRecovery:    false,
+			wantCapacity:    false,
+		},
+		{
+			// hq-fqap: a nuked missing-worktree polecat with a still-open PR must still
+			// report PENDING_MR (bead-level blocker honored).
+			name:            "nuked missing-worktree with open mr remains pending",
+			polecatName:     "nukedpending",
+			fields:          &beads.AgentFields{AgentState: string(beads.AgentStateNuked), ActiveMR: "gt-mr"},
+			worktreeMissing: true,
+			wantState:       polecat.StateIdle,
+			wantVerdict:     polecat.WorkstateVerdictPendingMR,
+		},
+		{
+			// hq-fqap: a polecat whose worktree still EXISTS but has an unrecorded
+			// cleanup_status must stay recovery-blocked — we cannot prove it is safe
+			// without a git check, so fail closed.
+			name:         "present-worktree with missing cleanup_status still needs recovery",
+			polecatName:  "unknown",
+			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateIdle)},
+			wantState:    polecat.StateIdle,
+			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
+			wantRecovery: true,
+			wantCapacity: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			item := buildPolecatInventoryItem("gastown", tt.polecatName, tt.fields, tt.activeWork, sessions)
+			item := buildPolecatInventoryItem("gastown", tt.polecatName, tt.fields, tt.activeWork, sessions, tt.worktreeMissing)
 			if item.State != tt.wantState || item.Issue != tt.wantIssue || item.Disposition.Verdict != tt.wantVerdict || item.Disposition.Reusable != tt.wantReusable || item.Disposition.NeedsRecovery != tt.wantRecovery || item.Disposition.CountsTowardCapacity != tt.wantCapacity {
 				t.Fatalf("item = %+v disposition=%+v", item, item.Disposition)
 			}
@@ -144,6 +181,7 @@ func TestBuildPolecatInventoryItemActiveWorkLookupErrorFailsClosed(t *testing.T)
 		&beads.AgentFields{AgentState: string(beads.AgentStateIdle), CleanupStatus: string(polecat.CleanupClean)},
 		polecatActiveWorkLookupError(errors.New("bd failed")),
 		polecatSessionSet{},
+		false,
 	)
 
 	if item.Disposition.Reusable || item.Disposition.SafeToNuke || !item.Disposition.NeedsRecovery || item.Disposition.CountsTowardCapacity {

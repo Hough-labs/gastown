@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -73,11 +75,29 @@ func polecatSessionKey(rigName, polecatName string) string {
 	return rigName + polecatSessionKeySep + polecatName
 }
 
-func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) polecatInventoryItem {
-	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions)
+func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet, worktreeMissing bool) polecatInventoryItem {
+	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions, worktreeMissing)
 }
 
-func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *beads.AgentFields, activeWorkEvidence polecatActiveWorkEvidence, sessions polecatSessionSet) polecatInventoryItem {
+// polecatWorktreeMissing reports whether a polecat has no git worktree on disk —
+// neither the new polecats/<name>/<rig> layout nor the legacy polecats/<name>
+// layout holds a .git. A cleanly nuked polecat has no worktree (identity persists,
+// worktree removed, branch pushed before nuke). This bulk capacity/inventory path
+// has no git access, so it stats the worktree directly to distinguish a reusable
+// nuked polecat from one with a real cleanup blocker. (hq-fqap)
+func polecatWorktreeMissing(rigPath, rigName, polecatName string) bool {
+	newGit := filepath.Join(rigPath, "polecats", polecatName, rigName, ".git")
+	if _, err := os.Stat(newGit); err == nil {
+		return false
+	}
+	oldGit := filepath.Join(rigPath, "polecats", polecatName, ".git")
+	if _, err := os.Stat(oldGit); err == nil {
+		return false
+	}
+	return true
+}
+
+func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *beads.AgentFields, activeWorkEvidence polecatActiveWorkEvidence, sessions polecatSessionSet, worktreeMissing bool) polecatInventoryItem {
 	sessionName, running := sessions.lookup(rigName, polecatName)
 	item := polecatInventoryItem{
 		Rig:            rigName,
@@ -102,6 +122,15 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		input.Branch = item.Branch
 		input.ActiveMR = item.ActiveMR
 	}
+
+	// A missing worktree means the polecat was cleanly torn down (nuked): identity
+	// persists but the worktree is removed and the branch was pushed before nuke.
+	// Its cleanup_status is often unrecorded (<missing>), which this path would
+	// otherwise read as a cleanup-unknown recovery blocker — leaking a permanent
+	// capacity slot even though the polecat is reusable. No worktree means no work
+	// at risk, so let DecideWorkstate classify it reusable. Bead-level blockers
+	// (hook still set, open MR) set below are still honored. (hq-fqap)
+	input.WorktreeMissing = worktreeMissing
 
 	if !activeWorkEvidence.BlocksCleanup && fields != nil {
 		activeWorkEvidence = assessPolecatAgentStateWork(beads.AgentState(strings.TrimSpace(fields.AgentState)))
