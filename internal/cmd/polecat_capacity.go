@@ -19,6 +19,8 @@ import (
 
 const polecatAdmissionReservationTTL = 30 * time.Minute
 
+// acquirePolecatAdmissionFn is a seam for tests. The isReviewer argument
+// selects reviewer-vs-worker admission math (reviewer reserve, hq-2b2v).
 var acquirePolecatAdmissionFn = acquirePolecatAdmission
 
 type polecatCapacitySnapshot struct {
@@ -29,8 +31,15 @@ type polecatCapacitySnapshot struct {
 	PendingMR       int `json:"pending_mr"`
 	Reservations    int `json:"reservations"`
 	Free            int `json:"free"`
-	ActiveSessions  int `json:"active_sessions"`
-	capacityUsed    int
+	// ReviewerReserve is the number of free slots reserved for reviewer polecats
+	// (scheduler.reviewer_reserve, clamped to the pool). Worker admission is
+	// denied once Free drops to this level so reviewers can always spawn (hq-2b2v).
+	ReviewerReserve int `json:"reviewer_reserve"`
+	// WorkerFree is the free slots available to worker (non-reviewer) polecats:
+	// max(0, Free - ReviewerReserve).
+	WorkerFree     int `json:"worker_free"`
+	ActiveSessions int `json:"active_sessions"`
+	capacityUsed   int
 }
 
 func (s polecatCapacitySnapshot) occupied() int {
@@ -95,7 +104,7 @@ func (e *polecatCapacityAdmissionError) Error() string {
 		return fmt.Sprintf("polecat admission denied: %s", e.Reason)
 	}
 	return fmt.Sprintf(
-		"polecat admission denied: %s (max=%d occupied=%d working=%d recovery_blocked=%d reservations=%d reusable_idle=%d pending_mr=%d free=%d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`",
+		"polecat admission denied: %s (max=%d occupied=%d working=%d recovery_blocked=%d reservations=%d reusable_idle=%d pending_mr=%d free=%d reviewer_reserve=%d worker_free=%d). Resolve recovery-needed polecats or raise scheduler.max_polecats; inspect with `gt scheduler status --json` or `gt polecat list --all --json`",
 		e.Reason,
 		e.Snapshot.Max,
 		e.Snapshot.occupied(),
@@ -105,10 +114,12 @@ func (e *polecatCapacityAdmissionError) Error() string {
 		e.Snapshot.ReusableIdle,
 		e.Snapshot.PendingMR,
 		e.Snapshot.Free,
+		e.Snapshot.ReviewerReserve,
+		e.Snapshot.WorkerFree,
 	)
 }
 
-func acquirePolecatAdmission(townRoot, rigName, beadID, operation string) (*polecatAdmissionHandle, polecatCapacitySnapshot, error) {
+func acquirePolecatAdmission(townRoot, rigName, beadID, operation string, isReviewer bool) (*polecatAdmissionHandle, polecatCapacitySnapshot, error) {
 	max, err := configuredSchedulerMaxPolecats(townRoot)
 	if err != nil {
 		return nil, polecatCapacitySnapshot{}, err
@@ -131,12 +142,23 @@ func acquirePolecatAdmission(townRoot, rigName, beadID, operation string) (*pole
 	if err != nil {
 		return nil, polecatCapacitySnapshot{}, err
 	}
-	if snapshot.Free <= 0 {
+	// Reviewer polecats may claim any free slot; worker polecats must leave the
+	// reviewer reserve untouched. This guarantees a per-PR reviewer can always
+	// spawn even under a worker burst (hq-2b2v).
+	admitThreshold := 0
+	reason := "configured scheduler.max_polecats capacity is full"
+	if !isReviewer {
+		admitThreshold = snapshot.ReviewerReserve
+		if admitThreshold > 0 {
+			reason = fmt.Sprintf("worker capacity is full (%d free slot(s) reserved for reviewers via scheduler.reviewer_reserve)", snapshot.ReviewerReserve)
+		}
+	}
+	if snapshot.Free <= admitThreshold {
 		return nil, snapshot, &polecatCapacityAdmissionError{
 			Snapshot: snapshot,
 			Rig:      rigName,
 			Bead:     beadID,
-			Reason:   "configured scheduler.max_polecats capacity is full",
+			Reason:   reason,
 		}
 	}
 
@@ -149,14 +171,22 @@ func acquirePolecatAdmission(townRoot, rigName, beadID, operation string) (*pole
 	return &polecatAdmissionHandle{townRoot: townRoot, id: reservation.ID, path: path}, snapshot, nil
 }
 
-func configuredSchedulerMaxPolecats(townRoot string) (int, error) {
+func configuredSchedulerConfig(townRoot string) (*capacity.SchedulerConfig, error) {
 	settings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
 	if err != nil {
-		return 0, fmt.Errorf("loading town settings for polecat admission: %w", err)
+		return nil, fmt.Errorf("loading town settings for polecat admission: %w", err)
 	}
 	schedulerCfg := settings.Scheduler
 	if schedulerCfg == nil {
 		schedulerCfg = capacity.DefaultSchedulerConfig()
+	}
+	return schedulerCfg, nil
+}
+
+func configuredSchedulerMaxPolecats(townRoot string) (int, error) {
+	schedulerCfg, err := configuredSchedulerConfig(townRoot)
+	if err != nil {
+		return 0, err
 	}
 	return schedulerCfg.GetMaxPolecats(), nil
 }
@@ -239,6 +269,13 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		snapshot.Free = max - snapshot.occupied()
 		if snapshot.Free < 0 {
 			snapshot.Free = 0
+		}
+		if schedulerCfg, cfgErr := configuredSchedulerConfig(townRoot); cfgErr == nil {
+			snapshot.ReviewerReserve = schedulerCfg.EffectiveReviewerReserve(max)
+		}
+		snapshot.WorkerFree = snapshot.Free - snapshot.ReviewerReserve
+		if snapshot.WorkerFree < 0 {
+			snapshot.WorkerFree = 0
 		}
 	}
 	return snapshot, nil

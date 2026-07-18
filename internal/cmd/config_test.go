@@ -722,6 +722,39 @@ func TestConfigDefaultAgentList(t *testing.T) {
 }
 
 func TestConfigSetGet(t *testing.T) {
+	t.Run("set and get scheduler.reviewer_reserve", func(t *testing.T) {
+		townRoot := setupTestTownForConfig(t)
+		settingsPath := config.TownSettingsPath(townRoot)
+
+		originalWd, _ := os.Getwd()
+		defer os.Chdir(originalWd)
+		if err := os.Chdir(townRoot); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+
+		cmd := &cobra.Command{}
+		if err := runConfigSet(cmd, []string{"scheduler.reviewer_reserve", "2"}); err != nil {
+			t.Fatalf("runConfigSet(reviewer_reserve=2) failed: %v", err)
+		}
+
+		loaded, err := config.LoadOrCreateTownSettings(settingsPath)
+		if err != nil {
+			t.Fatalf("load settings: %v", err)
+		}
+		if loaded.Scheduler == nil || loaded.Scheduler.GetReviewerReserve() != 2 {
+			t.Fatalf("reviewer_reserve not persisted, got %+v", loaded.Scheduler)
+		}
+
+		if err := runConfigGet(cmd, []string{"scheduler.reviewer_reserve"}); err != nil {
+			t.Fatalf("runConfigGet failed: %v", err)
+		}
+
+		// Negative values are rejected.
+		if err := runConfigSet(cmd, []string{"scheduler.reviewer_reserve", "-1"}); err == nil {
+			t.Fatal("runConfigSet(reviewer_reserve=-1) should be rejected")
+		}
+	})
+
 	t.Run("set and get convoy.notify_on_complete", func(t *testing.T) {
 		townRoot := setupTestTownForConfig(t)
 		settingsPath := config.TownSettingsPath(townRoot)

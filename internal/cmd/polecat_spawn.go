@@ -60,6 +60,7 @@ type SlingSpawnOptions struct {
 	BaseBranch    string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
 	ResumeBranch  string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>+<ts>
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
+	ReviewOnly    bool   // Spawning a reviewer polecat: admits against the reviewer reserve (hq-2b2v)
 }
 
 func effectivePolecatDirCap(configured int) int {
@@ -151,7 +152,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 
 	var admission *polecatAdmissionHandle
 	if !opts.SkipAdmission {
-		admission, _, err = acquirePolecatAdmissionFn(townRoot, rigName, opts.HookBead, "spawn-or-reuse")
+		admission, _, err = acquirePolecatAdmissionFn(townRoot, rigName, opts.HookBead, "spawn-or-reuse", opts.ReviewOnly)
 		if err != nil {
 			return nil, err
 		}

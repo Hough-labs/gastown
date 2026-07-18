@@ -38,7 +38,7 @@ func TestPlanDispatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ready := beads(tt.readyCount)
-			plan := PlanDispatch(tt.availableCapacity, tt.batchSize, ready)
+			plan := PlanDispatch(tt.availableCapacity, tt.batchSize, 0, ready)
 
 			if len(plan.ToDispatch) != tt.wantCount {
 				t.Errorf("ToDispatch count: got %d, want %d", len(plan.ToDispatch), tt.wantCount)
@@ -48,6 +48,89 @@ func TestPlanDispatch(t *testing.T) {
 			}
 			if plan.Reason != tt.wantReason {
 				t.Errorf("Reason: got %q, want %q", plan.Reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// mkBead builds a PendingBead; reviewer=true marks it review-only work.
+func mkBead(id string, reviewer bool) PendingBead {
+	return PendingBead{ID: id, WorkBeadID: "w-" + id, Context: &SlingContextFields{ReviewOnly: reviewer}}
+}
+
+func idsOf(beads []PendingBead) []string {
+	out := make([]string, len(beads))
+	for i, b := range beads {
+		out[i] = b.ID
+	}
+	return out
+}
+
+func TestPlanDispatch_ReviewerReserve(t *testing.T) {
+	tests := []struct {
+		name              string
+		availableCapacity int
+		batchSize         int
+		reviewerReserve   int
+		ready             []PendingBead
+		wantDispatch      []string // expected IDs, in order
+		wantReason        string
+	}{
+		{
+			// Core deadlock case: workers must not consume the reserved slot;
+			// a reviewer still dispatches.
+			name:              "reserve keeps a slot for the reviewer under worker burst",
+			availableCapacity: 2, batchSize: 10, reviewerReserve: 1,
+			ready:        []PendingBead{mkBead("w1", false), mkBead("w2", false), mkBead("rev", true)},
+			wantDispatch: []string{"rev", "w1"}, // reviewer first, then 1 worker; w2 stranded by reserve
+			wantReason:   "capacity",
+		},
+		{
+			name:              "reviewer dispatched before workers (priority)",
+			availableCapacity: 10, batchSize: 2, reviewerReserve: 0,
+			ready:        []PendingBead{mkBead("w1", false), mkBead("w2", false), mkBead("rev", true)},
+			wantDispatch: []string{"rev", "w1"}, // reviewer jumps the queue, batch caps at 2
+			wantReason:   "batch",
+		},
+		{
+			name:              "reserve zero preserves shared-pool ordering-by-class",
+			availableCapacity: 10, batchSize: 10, reviewerReserve: 0,
+			ready:        []PendingBead{mkBead("w1", false), mkBead("rev", true)},
+			wantDispatch: []string{"rev", "w1"},
+			wantReason:   "ready",
+		},
+		{
+			name:              "all reviewers may use the full pool including reserve",
+			availableCapacity: 3, batchSize: 10, reviewerReserve: 2,
+			ready:        []PendingBead{mkBead("r1", true), mkBead("r2", true), mkBead("r3", true)},
+			wantDispatch: []string{"r1", "r2", "r3"},
+			wantReason:   "batch",
+		},
+		{
+			name:              "workers capped at capacity minus reserve",
+			availableCapacity: 5, batchSize: 10, reviewerReserve: 2,
+			ready:        []PendingBead{mkBead("w1", false), mkBead("w2", false), mkBead("w3", false), mkBead("w4", false)},
+			wantDispatch: []string{"w1", "w2", "w3"}, // 5 - 2 reserve = 3 worker slots
+			wantReason:   "capacity",
+		},
+		{
+			name:              "reviewers consume shared slots shrinking worker budget",
+			availableCapacity: 4, batchSize: 10, reviewerReserve: 1,
+			ready: []PendingBead{mkBead("w1", false), mkBead("w2", false), mkBead("w3", false), mkBead("rev", true)},
+			// rev takes 1 (free 4->3). worker budget = min(cap-reserve=3, remaining=3) = 3 → all 3 workers.
+			wantDispatch: []string{"rev", "w1", "w2", "w3"},
+			wantReason:   "batch",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := PlanDispatch(tt.availableCapacity, tt.batchSize, tt.reviewerReserve, tt.ready)
+			got := idsOf(plan.ToDispatch)
+			if strings.Join(got, ",") != strings.Join(tt.wantDispatch, ",") {
+				t.Errorf("ToDispatch = %v, want %v", got, tt.wantDispatch)
+			}
+			if plan.Reason != tt.wantReason {
+				t.Errorf("Reason = %q, want %q", plan.Reason, tt.wantReason)
 			}
 		})
 	}
@@ -290,7 +373,7 @@ func TestPlanDispatch_FiltersMessagingBeads(t *testing.T) {
 		{ID: "ctx-4", WorkBeadID: "hq-2", Labels: []string{"gt:handoff"}},
 		{ID: "ctx-5", WorkBeadID: "hq-3", Labels: []string{"gt:merge-request"}},
 	}
-	plan := PlanDispatch(100, 10, candidates)
+	plan := PlanDispatch(100, 10, 0, candidates)
 	if len(plan.ToDispatch) != 2 {
 		t.Errorf("ToDispatch = %d, want 2 (only plain beads)", len(plan.ToDispatch))
 	}
@@ -312,7 +395,7 @@ func TestPlanDispatch_OnlyMessagingBeads(t *testing.T) {
 		{ID: "ctx-1", WorkBeadID: "hq-1", Labels: []string{"gt:message"}},
 		{ID: "ctx-2", WorkBeadID: "hq-2", Labels: []string{"gt:handoff"}},
 	}
-	plan := PlanDispatch(100, 10, candidates)
+	plan := PlanDispatch(100, 10, 0, candidates)
 	if len(plan.ToDispatch) != 0 {
 		t.Errorf("ToDispatch = %d, want 0", len(plan.ToDispatch))
 	}

@@ -241,6 +241,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		Agent:        params.Agent,
 		BaseBranch:   params.BaseBranch,
 		ResumeBranch: params.ResumeBranch,
+		ReviewOnly:   params.ReviewOnly,
 		// Create is always true for rig targets: executeSling only handles
 		// rig-targeted dispatch (batch sling + queue dispatch), where a fresh
 		// polecat must be spawned. The single-sling path (runSling) handles

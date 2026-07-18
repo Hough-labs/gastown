@@ -300,6 +300,10 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	if len(args) > 1 {
 		target = args[1]
 	}
+	// A formula dispatch is a reviewer spawn when --review-only is set or the
+	// formula itself declares review-only (hq-2b2v). Reviewer spawns admit
+	// against the reviewer reserve rather than the worker cap.
+	formulaReviewOnly := slingReviewOnly || formulaDeclaresReviewOnly(formulaName)
 	var admission *polecatAdmissionHandle
 	if !slingDryRun && target != "" {
 		admissionRig := ""
@@ -307,7 +311,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 			admissionRig = rigName
 		}
 		if admissionRig != "" {
-			admission, _, err = acquirePolecatAdmissionFn(townRoot, admissionRig, formulaName, "formula")
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, admissionRig, formulaName, "formula", formulaReviewOnly)
 			if err != nil {
 				return err
 			}
@@ -333,6 +337,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		WorkDesc:             formulaName,
 		TownRoot:             townRoot,
 		SkipPolecatAdmission: admission != nil,
+		ReviewOnly:           formulaReviewOnly,
 	})
 	if err != nil {
 		return err
@@ -450,7 +455,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	if admission == nil && strings.Contains(targetAgent, "/polecats/") {
 		parts := strings.Split(targetAgent, "/")
 		if len(parts) >= 3 {
-			admission, _, err = acquirePolecatAdmissionFn(townRoot, parts[0], formulaName, "formula")
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, parts[0], formulaName, "formula", formulaReviewOnly)
 			if err != nil {
 				return err
 			}
