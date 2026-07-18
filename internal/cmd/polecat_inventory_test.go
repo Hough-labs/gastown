@@ -107,13 +107,16 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantVerdict: polecat.WorkstateVerdictPendingMR,
 		},
 		{
-			name:         "done without active mr is not reusable",
+			// hq-z7j0: a done polecat with a clean tree and no pending MR has
+			// completed — it is reusable capacity, not a recovery-blocked zombie.
+			name:         "done clean without active mr is reusable",
 			polecatName:  "done",
 			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(polecat.CleanupClean)},
 			wantState:    polecat.StateDone,
-			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
-			wantRecovery: true,
-			wantCapacity: true,
+			wantVerdict:  polecat.WorkstateVerdictSafeToNuke,
+			wantReusable: true,
+			wantRecovery: false,
+			wantCapacity: false,
 		},
 		{
 			name:        "done with active mr remains pending",
