@@ -94,6 +94,24 @@ case "${1:-}" in
       exit 0
     fi
     ;;
+  polecat)
+    if [ "${2:-}" = "check-recovery" ]; then
+      target="${3:-}"
+      name="${target##*/}"
+      # Default to NEEDS_RECOVERY with no active_mr so a polecat without explicit
+      # state keeps the pre-existing hook-based restart behavior.
+      verdict="NEEDS_RECOVERY"
+      if [ -f "$TEST_STATE/verdict/$name" ]; then
+        verdict=$(tr -d '\n' < "$TEST_STATE/verdict/$name")
+      fi
+      active_mr=""
+      if [ -f "$TEST_STATE/active_mr/$name" ]; then
+        active_mr=$(tr -d '\n' < "$TEST_STATE/active_mr/$name")
+      fi
+      printf '{"verdict":"%s","active_mr":"%s"}\n' "$verdict" "$active_mr"
+      exit 0
+    fi
+    ;;
   session)
     if [ "${2:-}" = "health" ]; then
       session="${3:-}"
@@ -234,7 +252,7 @@ setup_case() {
   export GT_TOWN_ROOT="$TEST_TMP/town"
   local bin_dir="$TEST_TMP/bin"
 
-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$bin_dir"
+  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
   : > "$TEST_STATE/mail.log"
@@ -324,6 +342,70 @@ test_closed_hook_skips_restart() {
   assert_file_contains "$TEST_STATE/output.log" "bead closed" "closed hook: status checked"
 }
 
+test_pending_mr_skips_restart() {
+  setup_case
+  add_polecat delta session-dead
+  printf 'PENDING_MR\n' > "$TEST_STATE/verdict/delta"
+  run_script
+
+  assert_file_empty "$TEST_STATE/kill.log" "pending MR: no session kill"
+  assert_file_empty "$TEST_STATE/mail.log" "pending MR: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "completed work" "pending MR: recognized as completed, not crashed"
+  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 1 healthy" "pending MR: counted healthy"
+}
+
+test_safe_to_nuke_dead_agent_skips_restart() {
+  setup_case
+  add_polecat epsilon agent-dead
+  printf 'SAFE_TO_NUKE\n' > "$TEST_STATE/verdict/epsilon"
+  run_script
+
+  assert_file_empty "$TEST_STATE/kill.log" "safe-to-nuke: no session kill"
+  assert_file_empty "$TEST_STATE/mail.log" "safe-to-nuke: no restart mail"
+  assert_file_contains "$TEST_STATE/output.log" "completed work" "safe-to-nuke: recognized as completed"
+}
+
+test_needs_recovery_still_restarts() {
+  setup_case
+  add_polecat zeta session-dead
+  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/zeta"
+  run_script
+
+  assert_line_count "$TEST_STATE/mail.log" 1 "needs-recovery: still restarts genuine crash"
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/zeta" "needs-recovery: restart requested"
+}
+
+# The live storm shape (hq-2eqe): the polecat submitted an MR that is still open,
+# but its work bead stays open so the recovery verdict reads NEEDS_RECOVERY
+# (reconciled to stalled). The open active_mr must still be recognized as
+# completed-and-awaiting-merge, NOT a crash.
+test_open_active_mr_skips_restart() {
+  setup_case
+  add_polecat theta session-dead
+  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/theta"
+  printf 'mr-theta\n' > "$TEST_STATE/active_mr/theta"
+  # mr-theta bead status defaults to "open" in the fake bd (pending merge).
+  run_script
+
+  assert_file_empty "$TEST_STATE/kill.log" "open active_mr: no session kill"
+  assert_file_empty "$TEST_STATE/mail.log" "open active_mr: no restart mail (submitted, awaiting merge)"
+  assert_file_contains "$TEST_STATE/output.log" "completed work" "open active_mr: recognized as completed"
+}
+
+# A merged/closed active_mr is no longer pending, so it must NOT suppress a genuine
+# restart — the open-MR skip is scoped to work still awaiting merge.
+test_merged_active_mr_does_not_skip() {
+  setup_case
+  add_polecat kappa session-dead
+  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/kappa"
+  printf 'mr-kappa\n' > "$TEST_STATE/active_mr/kappa"
+  printf 'closed\n' > "$TEST_STATE/status/mr-kappa"
+  run_script
+
+  assert_line_count "$TEST_STATE/mail.log" 1 "merged active_mr: still restarts (MR no longer pending)"
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/kappa" "merged active_mr: restart requested"
+}
+
 test_mass_death_skips_actions() {
   setup_case
   add_polecat alpha agent-dead
@@ -345,6 +427,11 @@ test_long_research_active_pane
 test_dead_agent_restarts_one
 test_dead_session_restarts_one
 test_closed_hook_skips_restart
+test_pending_mr_skips_restart
+test_safe_to_nuke_dead_agent_skips_restart
+test_needs_recovery_still_restarts
+test_open_active_mr_skips_restart
+test_merged_active_mr_does_not_skip
 test_mass_death_skips_actions
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
