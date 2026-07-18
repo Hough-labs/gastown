@@ -136,6 +136,52 @@ bead_restartable() {
   return 1
 }
 
+# polecat_completed_not_crashed returns 0 (true) when the polecat has FINISHED its
+# work, so a dead session is expected rather than a crash:
+#   - PENDING_MR   : work done, MR submitted, waiting to merge (session exits after
+#                    `gt done`; the hook's work bead stays open until the MR merges).
+#   - SAFE_TO_NUKE : reusable/idle slot — nothing to resume.
+# Restarting such a polecat duplicates already-landed work and, for an open MR,
+# races the merge. The dog used to key ONLY on the hook bead status (still open
+# while the MR is pending), so it stormed RESTART_POLECAT at healthy done-polecats
+# (hq-2eqe). Reuse the canonical recovery verdict (DecideWorkstate) so the dog
+# inherits the same "done + open active_mr = healthy" rule as the rest of the
+# lifecycle, instead of re-deriving it from the hook alone. A missing/unknown
+# verdict falls through to the existing hook-based logic (fail toward the old
+# behavior, never toward a spurious restart-skip).
+polecat_completed_not_crashed() {
+  local rig="$1" pcat="$2" dir="" cr_json="" verdict="" active_mr="" mr_status=""
+
+  if ! dir=$(rig_workdir "$rig"); then
+    return 1
+  fi
+
+  cr_json=$( ( cd "$dir" 2>/dev/null && gt polecat check-recovery "$rig/$pcat" --json 2>/dev/null ) || true )
+  [ -n "$cr_json" ] || return 1
+
+  verdict=$(printf '%s' "$cr_json" | jq -r '.verdict // empty' 2>/dev/null || true)
+  case "$verdict" in
+    PENDING_MR|SAFE_TO_NUKE) return 0 ;;
+  esac
+
+  # A submitted MR that is still OPEN means the polecat finished its work and is
+  # waiting for the merge — the dead session is the expected post-`gt done` exit,
+  # not a crash. Its assigned work bead stays open until the MR merges, which is
+  # why the recovery verdict can read NEEDS_RECOVERY (reconciled to stalled) even
+  # though nothing is wrong: the "has open assigned bead + dead session = stalled"
+  # rule fires before the pending MR is considered. Restarting here duplicates
+  # landed work and races the merge, so treat an open active_mr as completed. (hq-2eqe)
+  active_mr=$(printf '%s' "$cr_json" | jq -r '.active_mr // empty' 2>/dev/null || true)
+  if [ -n "$active_mr" ]; then
+    mr_status=$(rig_bead_status "$rig" "$active_mr")
+    case "$mr_status" in
+      open|hooked|in_progress) return 0 ;;
+    esac
+  fi
+
+  return 1
+}
+
 session_health_status() {
   local session_name="$1"
   local health_json=""
@@ -196,10 +242,15 @@ while IFS='|' read -r RIG PREFIX; do
         HEALTHY=$((HEALTHY + 1))
         ;;
       agent-dead|agent_dead)
-        HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
-        if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
-          STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
-          log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
+        if polecat_completed_not_crashed "$RIG" "$PCAT_NAME"; then
+          HEALTHY=$((HEALTHY + 1))
+          log "  SKIP $SESSION_NAME: completed work (MR pending or reusable) — dead runtime expected, not a crash"
+        else
+          HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+          if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+            STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
+            log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
+          fi
         fi
         ;;
       agent-hung|agent_hung)
@@ -209,10 +260,15 @@ while IFS='|' read -r RIG PREFIX; do
         log "  OBSERVE: $SESSION_NAME runtime alive but inactive beyond $POLECAT_MAX_INACTIVITY; not restarting"
         ;;
       session-dead|session_dead)
-        HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
-        if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
-          CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
-          log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
+        if polecat_completed_not_crashed "$RIG" "$PCAT_NAME"; then
+          HEALTHY=$((HEALTHY + 1))
+          log "  SKIP $SESSION_NAME: completed work (MR pending or reusable) — dead session expected, not a crash"
+        else
+          HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+          if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+            CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
+            log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
+          fi
         fi
         ;;
       *)
