@@ -1577,6 +1577,63 @@ func TestReuseIdlePolecat_RunsSetupCommand(t *testing.T) {
 	}
 }
 
+// hq-c899: a cleanly nuked polecat keeps its identity but its worktree is removed.
+// ReuseOrRepairIdlePolecat must re-provision the worktree in place (preserving the
+// name/CV chain) rather than failing closed and stranding the slot.
+func TestReuseOrRepairIdlePolecat_ReprovisionsMissingWorktree(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	// Simulate a nuked polecat: identity (agent bead) persists, worktree removed.
+	repoGit, err := mgr.repoBase()
+	if err != nil {
+		t.Fatalf("repoBase: %v", err)
+	}
+	_ = repoGit.WorktreeRemove(p.ClonePath, true)
+	_ = os.RemoveAll(p.ClonePath)
+	if err := VerifyWorktreeExists(mgr.clonePath("toast")); !IsStructuralWorktreeError(err) {
+		t.Fatalf("precondition: expected structural worktree error, got %v", err)
+	}
+
+	reused, err := mgr.ReuseOrRepairIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
+	if err != nil {
+		t.Fatalf("ReuseOrRepairIdlePolecat: %v", err)
+	}
+	if reused.Name != "toast" {
+		t.Fatalf("identity not preserved: reused name = %q, want toast", reused.Name)
+	}
+	if err := VerifyWorktreeExists(reused.ClonePath); err != nil {
+		t.Fatalf("worktree was not re-provisioned in place: %v", err)
+	}
+	if reused.State != StateWorking {
+		t.Fatalf("reused state = %q, want %q", reused.State, StateWorking)
+	}
+}
+
+// hq-c899: when the worktree is healthy, ReuseOrRepairIdlePolecat must take the fast
+// branch-only reuse path (no worktree churn), keeping the same clone path.
+func TestReuseOrRepairIdlePolecat_HealthyWorktreeReuses(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	_ = git.NewGit(p.ClonePath).CleanForce()
+
+	reused, err := mgr.ReuseOrRepairIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
+	if err != nil {
+		t.Fatalf("ReuseOrRepairIdlePolecat: %v", err)
+	}
+	if reused.ClonePath != p.ClonePath {
+		t.Fatalf("reuse clone path = %q, want %q (branch-only reuse should not move the worktree)", reused.ClonePath, p.ClonePath)
+	}
+}
+
 func TestReuseIdlePolecat_SetupCommandFailureCleansWorktree(t *testing.T) {
 	mgr, _ := setupCanonicalBranchManagerTest(t)
 

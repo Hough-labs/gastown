@@ -1945,6 +1945,32 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	}, nil
 }
 
+// ReuseOrRepairIdlePolecat prepares an idle polecat for new work, choosing the
+// cheapest safe path:
+//
+//   - Worktree present  -> ReuseIdlePolecat (fast, branch-only, no worktree churn).
+//   - Worktree missing   -> RepairWorktreeWithOptions (re-provision in place).
+//
+// A cleanly nuked polecat keeps its identity and CV chain but its worktree/sandbox
+// is removed. Such a polecat is reusable capacity (hq-fqap), but branch-only reuse
+// cannot operate on a missing worktree — ReuseIdlePolecat fails closed on the stat
+// check and the caller would otherwise strand the slot and spawn a fresh identity.
+// Re-provisioning the worktree in place reactivates the persistent identity instead
+// of leaking it. (hq-c899)
+//
+// The worktree check is intentionally lock-free: each delegate acquires the
+// per-polecat lock itself, so calling one of them here does not nest locks. Both
+// delegates re-validate under the lock, so a lost race only downgrades to the other
+// path's own error handling.
+func (m *Manager) ReuseOrRepairIdlePolecat(name string, opts AddOptions) (*Polecat, error) {
+	if err := VerifyWorktreeExists(m.clonePath(name)); IsStructuralWorktreeError(err) {
+		// force=true: a structurally-missing worktree holds no uncommitted work to
+		// guard, and the reuse gate upstream already proved the polecat is reusable.
+		return m.RepairWorktreeWithOptions(name, true, opts)
+	}
+	return m.ReuseIdlePolecat(name, opts)
+}
+
 // killExistingPolecatSession clears an existing tmux session before reusing or
 // repairing its worktree. The next SessionManager.Start call will create a fresh
 // session with the current hook and startup prompt.
