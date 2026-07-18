@@ -72,7 +72,17 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
-	if in.State != StateIdle {
+	// StateDone is deliberately NOT short-circuited to NEEDS_RECOVERY here. A
+	// polecat that called `gt done` may have genuinely completed — PR merged,
+	// tree clean, pushed, work bead terminal — in which case it is reusable/idle,
+	// not recovery-blocked. Blanket-classifying every StateDone as NEEDS_RECOVERY
+	// leaked capacity (zombie done-polecats held pool slots after their PR
+	// merged, e.g. rust after #220), raised false "agent death" alarms, and
+	// blocked auto-reap. A done polecat with at-risk work (dirty tree, unpushed
+	// commits, hook still set, non-terminal bead, unsubmitted MQ work) still
+	// falls to NEEDS_RECOVERY via the blocker/MQ analysis below, which detects
+	// exactly those conditions. (hq-z7j0)
+	if in.State != StateIdle && in.State != StateDone {
 		verdict := WorkstateVerdictNeedsRecovery
 		needsRecovery := true
 		if in.State == StateWorking {
