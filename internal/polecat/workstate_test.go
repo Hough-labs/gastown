@@ -104,9 +104,33 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
 		},
 		{
-			name: "done without mr blocks reuse until cleanup",
+			// hq-z7j0: a done polecat with a clean tree, pushed, and no pending MR
+			// is a completed slot ready for reuse — NOT a recovery-blocked zombie.
+			name: "done clean is reusable, not recovery-blocked",
 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
+		},
+		{
+			// hq-z7j0: the live rust regression — PR merged (source bead terminal, so
+			// the gatherer omits ActiveMRBlocker), branch pushed, tree clean. Must be
+			// reusable, not NEEDS_RECOVERY holding a capacity slot.
+			name: "done with merged pr on preserved branch is reusable",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/rust", ActiveMR: "gt-mr-merged", AssignedBeadTerminal: true, MQCheckRequired: true, MRSubmitted: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
+		},
+		{
+			// hq-z7j0: a done polecat that still has at-risk work (unpushed commits)
+			// is a genuine zombie and must still be recovery-blocked.
+			name: "done with unpushed commits still needs recovery",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/rust", UnpushedCommits: 1},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_unpushed unpushed_commits=1"}},
+		},
+		{
+			// hq-z7j0: a done polecat whose hook was never cleared is incomplete and
+			// must still be recovery-blocked.
+			name: "done with hook still set still needs recovery",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, HookBead: "gt-open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "hook-still-set", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"has work on hook (gt-open)"}},
 		},
 		{
 			name: "working counts as working capacity",
