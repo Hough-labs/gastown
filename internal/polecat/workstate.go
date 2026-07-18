@@ -43,6 +43,15 @@ type WorkstateInput struct {
 	// a coder may have an empty worktree before its first commit. Such a polecat
 	// must never be classified SAFE_TO_NUKE or recovery will reap in-flight work. (hq-zxhx)
 	SessionRunning bool
+	// WorktreeMissing is true when the polecat's clone/worktree directory does not
+	// exist on disk. This is the normal state of a cleanly nuked polecat: identity
+	// persists, the worktree was removed, and the branch was pushed before nuke.
+	// A missing worktree holds no local uncommitted/stashed/unpushed work, so there
+	// is nothing to recover — the git-state checks below cannot run and must NOT be
+	// treated as an unknown-danger GitCheckFailed. Distinguishing this from a real
+	// git failure keeps nuked polecats classified reusable instead of leaking a
+	// capacity slot as a permanent NEEDS_RECOVERY false-positive. (hq-fqap)
+	WorktreeMissing bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -111,6 +120,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			Reason:               "session-running",
 			CountsTowardCapacity: true,
 		}
+	}
+
+	// A missing worktree means the clone directory is gone, so there is no local
+	// uncommitted/stashed/unpushed work that could be lost — nothing to recover.
+	// The git-derived danger facts cannot be trusted (they were gathered against a
+	// path that no longer exists), so clear them and treat the absent git state as
+	// clean. Bead-level blockers (hook still set, active work, open MR) are gathered
+	// independently and are still honored below, so a nuked polecat with a genuinely
+	// open PR still reports PENDING_MR rather than reusable. MQ submission cannot be
+	// re-checked without a worktree and would only raise a false not-submitted alarm,
+	// so skip it — the ActiveMR bead assessment already covers real open PRs. (hq-fqap)
+	if in.WorktreeMissing {
+		in.GitCheckFailed = false
+		in.GitDirty = false
+		in.StashCount = 0
+		in.UnpushedCommits = 0
+		if in.CleanupStatus == CleanupUnknown || in.CleanupStatus == "" {
+			in.CleanupStatus = CleanupClean
+		}
+		in.MQCheckRequired = false
 	}
 
 	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}

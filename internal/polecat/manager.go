@@ -2350,29 +2350,43 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 		}
 	}
 	clonePath := m.clonePath(name)
+	// A cleanly nuked polecat has no worktree on disk. Running git against a path
+	// that does not exist fails, which would otherwise be recorded as an
+	// unknown-danger GitCheckFailed and leak a permanent NEEDS_RECOVERY slot. Detect
+	// the absent worktree explicitly and skip the git-state gathering; DecideWorkstate
+	// treats a missing worktree as no-work-at-risk. (hq-fqap)
+	if _, statErr := os.Stat(clonePath); os.IsNotExist(statErr) {
+		input.WorktreeMissing = true
+	}
 	g := git.NewGit(clonePath)
-	branch, branchErr := g.CurrentBranch()
-	if branchErr != nil {
-		input.GitCheckFailed = true
-	} else {
-		input.Branch = branch
+	var branch string
+	if !input.WorktreeMissing {
+		var branchErr error
+		branch, branchErr = g.CurrentBranch()
+		if branchErr != nil {
+			input.GitCheckFailed = true
+		} else {
+			input.Branch = branch
+		}
 	}
 	targetRefs, targetRefLookupFailed := m.reuseTargetRefs(fields, branch)
 	if targetRefLookupFailed {
 		input.MQLookupFailed = true
 	}
-	if status, err := g.CheckUncommittedWork(); err == nil {
-		input.GitDirty = !status.CleanExcludingRuntime()
-		input.StashCount = status.StashCount
-		input.UnpushedCommits = status.UnpushedCommits
-	} else {
-		input.GitCheckFailed = true
-	}
-	if branch != "" {
-		if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
-			input.UnpushedCommits = preservation.UnpreservedPatchCount
+	if !input.WorktreeMissing {
+		if status, err := g.CheckUncommittedWork(); err == nil {
+			input.GitDirty = !status.CleanExcludingRuntime()
+			input.StashCount = status.StashCount
+			input.UnpushedCommits = status.UnpushedCommits
 		} else {
 			input.GitCheckFailed = true
+		}
+		if branch != "" {
+			if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
+				input.UnpushedCommits = preservation.UnpreservedPatchCount
+			} else {
+				input.GitCheckFailed = true
+			}
 		}
 	}
 	// Legacy/test polecats can lack agent cleanup metadata. If git proves there is

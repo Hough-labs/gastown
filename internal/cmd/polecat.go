@@ -1083,6 +1083,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	workTerminal := beadTerminal
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch, SessionRunning: p.SessionRunning}
+	// A cleanly nuked polecat's worktree is gone; git checks against the absent
+	// clone path fail and would otherwise fail closed to NEEDS_RECOVERY. Flag the
+	// missing worktree so DecideWorkstate treats it as no-work-at-risk. (hq-fqap)
+	if _, statErr := os.Stat(p.ClonePath); os.IsNotExist(statErr) {
+		input.WorktreeMissing = true
+	}
 	var gitState *GitState
 	var gitErr error
 	gitStateLoaded := false

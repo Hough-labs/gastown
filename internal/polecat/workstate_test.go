@@ -149,6 +149,35 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/review", SessionRunning: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-running", CountsTowardCapacity: true},
 		},
+		{
+			// hq-fqap: a nuked polecat's worktree is gone (cleanup_status unrecorded,
+			// git checks fail). No worktree means no work at risk — it is reusable
+			// capacity, not a permanent NEEDS_RECOVERY zombie holding a slot.
+			name: "missing worktree with unknown state is reusable",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-preserved"},
+		},
+		{
+			// hq-fqap: a missing worktree must not let the MQ check raise a false
+			// not-submitted alarm — there is no worktree to submit from.
+			name: "missing worktree suppresses mq not-submitted false alarm",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, MQCheckRequired: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-preserved"},
+		},
+		{
+			// hq-fqap: bead-level blockers are gathered independently of the worktree,
+			// so a nuked polecat with a genuinely open PR still reports PENDING_MR.
+			name: "missing worktree still honors open active mr",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
+		},
+		{
+			// hq-fqap: a missing worktree does not excuse a hook that was never
+			// cleared — that is a genuine incomplete-handoff needing recovery.
+			name: "missing worktree still honors hook still set",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, HookBead: "gt-open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "hook-still-set", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"has work on hook (gt-open)"}},
+		},
 	}
 
 	for _, tt := range tests {
