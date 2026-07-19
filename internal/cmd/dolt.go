@@ -276,9 +276,16 @@ renamed databases, or failed migrations.
 
 Use --dry-run to preview what would be removed without making changes.
 
+Use --processes to instead reap orphaned dolt sql-server *processes*
+system-wide (e.g. leaked test/scratchpad servers on random ports) rather than
+orphaned databases. This never touches the bastion/production server on the
+default port, or any server with a live client connection — see
+doltserver.ReapOrphanedDoltProcesses.
+
 Examples:
   gt dolt cleanup             # Remove all orphaned databases
-  gt dolt cleanup --dry-run   # Preview what would be removed`,
+  gt dolt cleanup --dry-run   # Preview what would be removed
+  gt dolt cleanup --processes # Reap orphaned dolt sql-server processes`,
 	RunE: runDoltCleanup,
 }
 
@@ -323,11 +330,12 @@ After migration, 'bd mol wisp list' will work and agent lifecycle
 }
 
 var (
-	doltLogLines     int
-	doltLogFollow    bool
-	doltMigrateDry   bool
-	doltCleanupDry   bool
-	doltCleanupForce bool
+	doltLogLines         int
+	doltLogFollow        bool
+	doltMigrateDry       bool
+	doltCleanupDry       bool
+	doltCleanupForce     bool
+	doltCleanupProcesses bool
 
 	doltMigrateWispsDry bool
 	doltMigrateWispsDB  string
@@ -366,6 +374,7 @@ func init() {
 
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupDry, "dry-run", false, "Preview what would be removed without making changes")
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupForce, "force", false, "Remove databases even if they have user tables")
+	doltCleanupCmd.Flags().BoolVar(&doltCleanupProcesses, "processes", false, "Reap orphaned dolt sql-server processes instead of orphaned databases")
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
 
@@ -1160,6 +1169,10 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 }
 
 func runDoltCleanup(cmd *cobra.Command, args []string) error {
+	if doltCleanupProcesses {
+		return runDoltCleanupProcesses()
+	}
+
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -1256,6 +1269,26 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n",
 		style.Bold.Render("✓"), removed, len(orphans))
 
+	return nil
+}
+
+// runDoltCleanupProcesses reaps orphaned dolt sql-server processes system-wide
+// (test/scratchpad servers reparented to init or rooted in a known ephemeral
+// data dir, with no live client connections). It never requires a Gas Town
+// workspace since it scans machine-wide, and it never touches the
+// bastion/production server — see doltserver.ReapOrphanedDoltProcesses.
+func runDoltCleanupProcesses() error {
+	stopped, err := doltserver.ReapOrphanedDoltProcesses()
+	if err != nil {
+		return fmt.Errorf("reaping orphaned Dolt processes: %w", err)
+	}
+
+	if stopped == 0 {
+		fmt.Printf("%s No orphaned Dolt processes found\n", style.Bold.Render("✓"))
+		return nil
+	}
+
+	fmt.Printf("%s Reaped %d orphaned Dolt process(es)\n", style.Bold.Render("✓"), stopped)
 	return nil
 }
 
