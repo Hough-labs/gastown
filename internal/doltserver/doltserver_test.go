@@ -508,11 +508,18 @@ func TestIsEphemeralDataDir(t *testing.T) {
 	}
 }
 
-// TestReapOrphanedDoltProcesses_ReapsCrashedEmbeddedServer starts a real
-// embedded dolt sql-server rooted at a t.TempDir() (as a crashed test would
-// leave one behind — no Stop() call, simulating a subtest that never reached
-// its own cleanup) and asserts ReapOrphanedDoltProcesses finds and terminates
-// it. This is the end-to-end complement to TestShouldReapOrphanCandidate's
+// TestReapOrphanedDoltProcesses_ReapsCrashedEmbeddedServer reproduces the
+// gfork-d5h incident end-to-end: a helper subprocess starts a real embedded
+// dolt sql-server and then exits immediately without stopping it (exactly
+// what a crashed test process does), which the OS reparents to PID 1 —
+// the "orphaned parent" class of leak seen in the wild (26 leaked servers,
+// e.g. TestCreateStagedConvoy_* data dirs under os.TempDir(), all ppid 1).
+// Asserts ReapOrphanedDoltProcesses finds and terminates it. Spawning via a
+// helper subprocess (rather than calling Start() in this test's own process)
+// is deliberate: a server started in-process becomes a zombie once killed,
+// since nothing in this test binary calls Wait() on it, which would mask the
+// real orphan-detection behavior under test with an unrelated PID-liveness
+// quirk. This is the end-to-end complement to TestShouldReapOrphanCandidate's
 // pure-function coverage (gfork-d5h acceptance: "go test ./... leaves zero
 // orphaned dolt servers afterward, including after a deliberately crashed
 // subtest").
@@ -529,39 +536,72 @@ func TestReapOrphanedDoltProcesses_ReapsCrashedEmbeddedServer(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatalf("close free port listener: %v", err)
 	}
-	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
 
 	townRoot := t.TempDir()
-	if err := Start(townRoot); err != nil {
-		t.Fatalf("Start: %v", err)
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReapOrphanedDoltProcessesOrphanHelper$")
+	cmd.Env = append(
+		os.Environ(),
+		"GT_DOLT_REAP_ORPHAN_HELPER=1",
+		"GT_DOLT_REAP_ORPHAN_HELPER_TOWNROOT="+townRoot,
+		"GT_DOLT_PORT="+strconv.Itoa(port),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper process: %v\n%s", err, out)
 	}
 
-	running, pid, err := IsRunning(townRoot)
-	if err != nil || !running || pid <= 0 {
-		t.Fatalf("server did not start: running=%v pid=%d err=%v", running, pid, err)
+	config := DefaultConfig(townRoot)
+	data, err := os.ReadFile(config.PidFile)
+	if err != nil {
+		t.Fatalf("reading PID file left by helper: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid PID in PID file %q: %v", data, err)
 	}
 	// Safety net in case the reap assertion below fails for an unrelated
 	// reason — never leave a real server running past this test.
 	t.Cleanup(func() {
 		if processIsAlive(pid) {
-			_ = Stop(townRoot)
+			if proc, findErr := os.FindProcess(pid); findErr == nil {
+				_ = proc.Kill()
+			}
 		}
 	})
+	if !processIsAlive(pid) {
+		t.Fatalf("helper's dolt server (PID %d) is not alive after the helper exited", pid)
+	}
 
-	// No Stop() call here: this stands in for a crashed subtest that never
-	// reached its own cleanup. The data dir is under t.TempDir() (ephemeral),
-	// so ReapOrphanedDoltProcesses must catch it even though its parent is
-	// this live test process, not PID 1.
 	stopped, err := ReapOrphanedDoltProcesses()
 	if err != nil {
 		t.Fatalf("ReapOrphanedDoltProcesses: %v", err)
 	}
 	if stopped < 1 {
-		t.Fatalf("stopped = %d, want >= 1 (expected the crashed server on port %d to be reaped)", stopped, port)
+		t.Fatalf("stopped = %d, want >= 1 (expected the orphaned server on port %d to be reaped)", stopped, port)
+	}
+	for i := 0; i < 20 && processIsAlive(pid); i++ {
+		time.Sleep(100 * time.Millisecond)
 	}
 	if processIsAlive(pid) {
 		t.Fatalf("PID %d still alive after ReapOrphanedDoltProcesses", pid)
 	}
+}
+
+// TestReapOrphanedDoltProcessesOrphanHelper is not a real test: it is
+// re-invoked as a subprocess by TestReapOrphanedDoltProcesses_ReapsCrashedEmbeddedServer
+// via `-test.run`, guarded by an env var so it is a no-op under normal `go
+// test`. It starts a real dolt sql-server and exits without stopping it,
+// orphaning the server to PID 1 exactly as a crashed test process would.
+func TestReapOrphanedDoltProcessesOrphanHelper(t *testing.T) {
+	if os.Getenv("GT_DOLT_REAP_ORPHAN_HELPER") != "1" {
+		return
+	}
+	townRoot := os.Getenv("GT_DOLT_REAP_ORPHAN_HELPER_TOWNROOT")
+	if err := Start(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "helper Start: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 func TestDoltProcessOwnerPathFromEvidence(t *testing.T) {

@@ -1599,16 +1599,11 @@ func countEstablishedConnections(pid, port int) int {
 	return count
 }
 
-// ReapOrphanedDoltProcesses terminates operationally-orphaned dolt sql-server
-// processes system-wide: servers reparented to PID 1, or rooted in a known
-// ephemeral data dir, that hold zero established client connections. This is
-// the operational (production) counterpart to ReapOwnedTestServers, which is
-// scoped to a single test-owned townRoot. Unlike that helper, this scans every
-// dolt listener on the machine — but the bastion/3307 production server and
-// any server with live connections are always skipped; see
-// shouldReapOrphanCandidate, the single safety gate every candidate passes
-// through before a signal is sent.
-func ReapOrphanedDoltProcesses() (stopped int, err error) {
+// FindOrphanedDoltProcesses discovers operationally-orphaned dolt sql-server
+// candidates system-wide, without terminating anything — the read-only
+// counterpart to ReapOrphanedDoltProcesses, used for --dry-run previews.
+func FindOrphanedDoltProcesses() []OrphanProcessCandidate {
+	var candidates []OrphanProcessCandidate
 	for _, listener := range FindAllDoltListeners() {
 		if listener.PID <= 0 || !processIsAlive(listener.PID) {
 			continue
@@ -1621,27 +1616,41 @@ func ReapOrphanedDoltProcesses() (stopped int, err error) {
 			ParentPID:            getParentPID(listener.PID),
 			Port:                 listener.Port,
 			DataDir:              resolveDataDirFromProcess(listener.PID),
-			EstablishedConnCount: countEstablishedConnections(listener.PID),
+			EstablishedConnCount: countEstablishedConnections(listener.PID, listener.Port),
 		}
-		if !shouldReapOrphanCandidate(candidate) {
-			continue
+		if shouldReapOrphanCandidate(candidate) {
+			candidates = append(candidates, candidate)
 		}
+	}
+	return candidates
+}
 
-		proc, findErr := os.FindProcess(listener.PID)
+// ReapOrphanedDoltProcesses terminates operationally-orphaned dolt sql-server
+// processes system-wide: servers reparented to PID 1, or rooted in a known
+// ephemeral data dir, that hold zero established client connections. This is
+// the operational (production) counterpart to ReapOwnedTestServers, which is
+// scoped to a single test-owned townRoot. Unlike that helper, this scans every
+// dolt listener on the machine — but the bastion/3307 production server and
+// any server with live connections are always skipped; see
+// shouldReapOrphanCandidate, the single safety gate every candidate passes
+// through before a signal is sent.
+func ReapOrphanedDoltProcesses() (stopped int, err error) {
+	for _, candidate := range FindOrphanedDoltProcesses() {
+		proc, findErr := os.FindProcess(candidate.PID)
 		if findErr != nil {
 			continue
 		}
 		if err := gracefulTerminate(proc); err != nil {
-			return stopped, fmt.Errorf("terminating orphaned Dolt PID %d: %w", listener.PID, err)
+			return stopped, fmt.Errorf("terminating orphaned Dolt PID %d: %w", candidate.PID, err)
 		}
 		for i := 0; i < 20; i++ {
 			time.Sleep(100 * time.Millisecond)
-			if !processIsAlive(listener.PID) {
+			if !processIsAlive(candidate.PID) {
 				stopped++
 				break
 			}
 		}
-		if processIsAlive(listener.PID) {
+		if processIsAlive(candidate.PID) {
 			_ = proc.Kill()
 			time.Sleep(100 * time.Millisecond)
 			stopped++

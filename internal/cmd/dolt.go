@@ -1278,6 +1278,21 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 // workspace since it scans machine-wide, and it never touches the
 // bastion/production server — see doltserver.ReapOrphanedDoltProcesses.
 func runDoltCleanupProcesses() error {
+	if doltCleanupDry {
+		candidates := doltserver.FindOrphanedDoltProcesses()
+		if len(candidates) == 0 {
+			fmt.Printf("%s No orphaned Dolt processes found\n", style.Bold.Render("✓"))
+			return nil
+		}
+		fmt.Printf("Found %d orphaned Dolt process(es):\n\n", len(candidates))
+		for _, c := range candidates {
+			fmt.Printf("  %s PID %d on port %d\n", style.Bold.Render("!"), c.PID, c.Port)
+			fmt.Printf("    %s\n", style.Dim.Render(c.DataDir))
+		}
+		fmt.Println("\nDry run: no changes made.")
+		return nil
+	}
+
 	stopped, err := doltserver.ReapOrphanedDoltProcesses()
 	if err != nil {
 		return fmt.Errorf("reaping orphaned Dolt processes: %w", err)
