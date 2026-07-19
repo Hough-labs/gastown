@@ -508,6 +508,29 @@ func TestIsEphemeralDataDir(t *testing.T) {
 	}
 }
 
+// TestIsEphemeralDataDir_SymlinkResolvedTempDir covers the actual bug behind
+// gfork-d5h's crash-safety wiring silently no-op'ing: on macOS, os.TempDir()
+// returns a symlinked path (/var/folders/...) while ps/lsof report a live
+// process's cwd/data-dir in its fully resolved form (/private/var/folders/...
+// — confirmed against real leaked orphans on this machine during
+// development), and test helpers that pre-resolve their temp dir via
+// filepath.EvalSymlinks (e.g. internal/cmd's resolveSymlinks, used by several
+// integration tests) see that same resolved form too. Comparing only the raw
+// form let both classes slip through unrecognized as ephemeral.
+func TestIsEphemeralDataDir_SymlinkResolvedTempDir(t *testing.T) {
+	resolvedTemp, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Skipf("EvalSymlinks(os.TempDir()): %v", err)
+	}
+	if resolvedTemp == filepath.Clean(os.TempDir()) {
+		t.Skip("os.TempDir() is not behind a symlink on this platform/environment")
+	}
+	dataDir := filepath.Join(resolvedTemp, "TestSomething12345", ".beads", "dolt")
+	if !isEphemeralDataDir(dataDir) {
+		t.Fatalf("isEphemeralDataDir(%q) = false, want true (symlink-resolved os.TempDir() path)", dataDir)
+	}
+}
+
 // TestReapOrphanedDoltProcesses_ReapsCrashedEmbeddedServer reproduces the
 // gfork-d5h incident end-to-end: a helper subprocess starts a real embedded
 // dolt sql-server and then exits immediately without stopping it (exactly

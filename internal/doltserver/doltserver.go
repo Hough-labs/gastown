@@ -1438,12 +1438,11 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("resolving town root: %w", err)
 	}
-	absTemp, err := filepath.Abs(os.TempDir())
-	if err != nil {
-		return 0, fmt.Errorf("resolving temp dir: %w", err)
-	}
-	rel, err := filepath.Rel(absTemp, absRoot)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+	// Checked against both the raw and symlink-resolved forms of os.TempDir()
+	// (see isUnderTempDir): callers that pre-resolve their temp dir (e.g. via
+	// filepath.EvalSymlinks, common on macOS where t.TempDir() sits behind a
+	// /var -> /private/var symlink) would otherwise be wrongly refused here.
+	if !isUnderTempDir(absRoot) {
 		return 0, fmt.Errorf("refusing to reap Dolt outside temp dir: %s", absRoot)
 	}
 
@@ -1542,13 +1541,35 @@ func isEphemeralDataDir(dataDir string) bool {
 	if err != nil {
 		return false
 	}
-	if absTemp, err := filepath.Abs(os.TempDir()); err == nil {
-		if rel, err := filepath.Rel(absTemp, absDataDir); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-			return true
-		}
+	if isUnderTempDir(absDataDir) {
+		return true
 	}
 	for _, root := range []string{"/private/tmp/claude-", "/tmp/claude-"} {
 		if strings.HasPrefix(absDataDir, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnderTempDir reports whether absPath sits under os.TempDir(), checking
+// both the raw path and its symlink-resolved form. On macOS, os.TempDir()
+// returns a symlinked path (/var/folders/...) while live processes report
+// (via ps/lsof cwd) and test helpers that call filepath.EvalSymlinks see the
+// resolved form (/private/var/folders/...) — comparing against only one form
+// misclassifies genuinely temp-dir-rooted paths as outside it.
+func isUnderTempDir(absPath string) bool {
+	temp := os.TempDir()
+	candidates := []string{temp}
+	if resolved, err := filepath.EvalSymlinks(temp); err == nil {
+		candidates = append(candidates, resolved)
+	}
+	for _, candidate := range candidates {
+		absTemp, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if rel, err := filepath.Rel(absTemp, absPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
 			return true
 		}
 	}
