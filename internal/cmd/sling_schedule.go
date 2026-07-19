@@ -114,6 +114,22 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return nil
 	}
 
+	// gfork-uf2: per-PR review dedup. Review dispatches (mol-polecat-review-pr)
+	// carry a pr_url formula var. The idempotency check above is keyed on the
+	// WORK bead ID, but each review of a PR gets a fresh work bead — so two
+	// reviews of the same PR slip past it and spawn duplicate reviewers. Also
+	// dedup on pr_url: if an open sling context already targets this pr_url,
+	// no-op. (hq-6wd2 surfaces pr_url on polecats; this consumes it at the
+	// dispatch chokepoint.) A query error fails OPEN — dispatch degrades to the
+	// work-bead idempotency above rather than blocking.
+	if prURL := extractSlingVar(opts.Vars, "pr_url"); prURL != "" {
+		if ctxID := findOpenReviewContextForPR(rigBeads, beadID, prURL); ctxID != "" {
+			fmt.Printf("%s PR %s is already under review (context: %s), no-op\n",
+				style.Dim.Render("○"), prURL, ctxID)
+			return nil
+		}
+	}
+
 	// Guard against scheduling closed/tombstone beads (defense-in-depth, hq-ki2).
 	// Mirrors the closed-bead guards in runSling (sling.go) and executeSling
 	// (sling_dispatch.go). The daemon's stranded scan can route closed cross-prefix
@@ -411,6 +427,53 @@ func detectSchedulerIDType(id string) (string, error) {
 var schedulerTaskOnlyFlagNames = []string{
 	"account", "agent", "ralph", "args", "var",
 	"merge", "base-branch", "no-convoy", "owned", "no-merge", "review-only",
+}
+
+// extractSlingVar returns the value of key from a []string of "key=value"
+// formula vars (gt sling --var), or "" if absent.
+func extractSlingVar(vars []string, key string) string {
+	for _, v := range vars {
+		if k, val, ok := strings.Cut(v, "="); ok && k == key {
+			return val
+		}
+	}
+	return ""
+}
+
+// findOpenReviewContextForPR returns the ID of an open sling context (other than
+// the one for excludeBeadID) whose pr_url formula var equals prURL, or "" if
+// none — the per-PR review dedup for gfork-uf2. Query failures return "" so
+// dispatch fails open.
+func findOpenReviewContextForPR(rigBeads *beads.Beads, excludeBeadID, prURL string) string {
+	if prURL == "" {
+		return ""
+	}
+	contexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		return ""
+	}
+	return matchOpenReviewContext(contexts, excludeBeadID, prURL)
+}
+
+// matchOpenReviewContext is the pure per-PR dedup matcher: it returns the ID of
+// the first context (other than excludeBeadID's) whose pr_url var equals prURL.
+func matchOpenReviewContext(contexts []*beads.Issue, excludeBeadID, prURL string) string {
+	if prURL == "" {
+		return ""
+	}
+	for _, ctx := range contexts {
+		if ctx == nil {
+			continue
+		}
+		f := beads.ParseSlingContextFields(ctx.Description)
+		if f == nil || f.WorkBeadID == excludeBeadID {
+			continue
+		}
+		if extractFormulaVar(f.Vars, "pr_url") == prURL {
+			return ctx.ID
+		}
+	}
+	return ""
 }
 
 // validateNoTaskOnlySchedulerFlags checks that no task-only flags were set.

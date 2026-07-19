@@ -5,8 +5,56 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/wisp"
 )
+
+func reviewCtxIssue(id, workBead, vars string) *beads.Issue {
+	desc := beads.FormatSlingContextDescription(&capacity.SlingContextFields{
+		WorkBeadID: workBead,
+		Vars:       vars,
+	})
+	return &beads.Issue{ID: id, Description: desc}
+}
+
+func TestExtractSlingVar(t *testing.T) {
+	vars := []string{"base_branch=main", "pr_url=https://x/pull/238", "account=a"}
+	if got := extractSlingVar(vars, "pr_url"); got != "https://x/pull/238" {
+		t.Fatalf("pr_url = %q", got)
+	}
+	if got := extractSlingVar(vars, "missing"); got != "" {
+		t.Fatalf("missing var = %q, want empty", got)
+	}
+	if got := extractSlingVar(nil, "pr_url"); got != "" {
+		t.Fatalf("nil vars = %q, want empty", got)
+	}
+}
+
+func TestMatchOpenReviewContext(t *testing.T) {
+	pr := "https://github.com/x/y/pull/238"
+	ctxs := []*beads.Issue{
+		reviewCtxIssue("ctx-a", "gt-work-a", "pr_url="+pr),
+		reviewCtxIssue("ctx-b", "gt-work-b", "pr_url=https://github.com/x/y/pull/999"),
+	}
+
+	// A different work bead reviewing the same PR is a duplicate → matched.
+	if got := matchOpenReviewContext(ctxs, "gt-work-new", pr); got != "ctx-a" {
+		t.Fatalf("duplicate PR review = %q, want ctx-a", got)
+	}
+	// The bead's own context must not count as a duplicate of itself.
+	if got := matchOpenReviewContext(ctxs, "gt-work-a", pr); got != "" {
+		t.Fatalf("self context = %q, want empty (excluded)", got)
+	}
+	// No open review for this PR → no match.
+	if got := matchOpenReviewContext(ctxs, "gt-work-new", "https://github.com/x/y/pull/1"); got != "" {
+		t.Fatalf("unmatched PR = %q, want empty", got)
+	}
+	// Empty pr_url never matches.
+	if got := matchOpenReviewContext(ctxs, "gt-work-new", ""); got != "" {
+		t.Fatalf("empty prURL = %q, want empty", got)
+	}
+}
 
 // TestAreScheduledFailClosed verifies that areScheduled fails closed when
 // running outside a town root — all requested IDs should be treated as scheduled.
