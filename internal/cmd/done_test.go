@@ -222,38 +222,70 @@ func TestReviewOnlyCloseRejectsStaleComment(t *testing.T) {
 	}
 }
 
-func TestReviewOnlyCloseRejectsWrongAuthorOrHead(t *testing.T) {
+func TestReviewOnlyCloseRejectsWrongAuthor(t *testing.T) {
+	// gfork-2cw: the worktree-HEAD equality gate was dropped (review evidence is
+	// not anchored to the worktree HEAD), so only the author guard remains here.
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/toast",
+		Comments: []beads.Comment{{
+			Author:    "gastown/polecats/other",
+			CreatedAt: "2026-07-01T12:05:00Z",
+			Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+		}},
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("wrong-author evidence should fail closed: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+// gfork-2cw: review-only evidence recorded a different (PR) head than the
+// worktree HEAD where gt done runs. This used to fail closed and loop the
+// review polecat forever; it must now be accepted.
+func TestReviewOnlyCloseAllowsMismatchedOrMissingHead(t *testing.T) {
 	tests := []struct {
-		name    string
-		author  string
-		head    string
-		current string
+		name string
+		text string
 	}{
-		{name: "wrong author", author: "gastown/polecats/other", head: "abc123", current: "abc123"},
-		{name: "wrong head", author: "gastown/polecats/toast", head: "def456", current: "abc123"},
-		{name: "missing head", author: "gastown/polecats/toast", head: "", current: "abc123"},
+		{name: "mismatched head", text: "PR-SHERIFF-EVIDENCE: pass\nhead_sha: def456"},
+		{name: "missing head", text: "PR-SHERIFF-EVIDENCE: pass"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			text := "PR-SHERIFF-EVIDENCE: pass"
-			if tt.head != "" {
-				text += "\nhead_sha: " + tt.head
-			}
 			issue := &beads.Issue{
 				ID:          "gt-review",
 				Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
 				Assignee:    "gastown/polecats/toast",
 				Comments: []beads.Comment{{
-					Author:    tt.author,
+					Author:    "gastown/polecats/toast",
 					CreatedAt: "2026-07-01T12:05:00Z",
-					Text:      text,
+					Text:      tt.text,
 				}},
 			}
-			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, tt.current)
-			if reason == "" || !fatal {
-				t.Fatalf("invalid evidence should fail closed: reason=%q fatal=%v", reason, fatal)
+			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+			if reason != "" || fatal {
+				t.Fatalf("head-mismatched evidence should be allowed: reason=%q fatal=%v", reason, fatal)
 			}
 		})
+	}
+}
+
+// gfork-2cw: --skip-verify is the operator override for audit/test-only
+// completion and must bypass the review-only evidence gate entirely.
+func TestReviewOnlySkipVerifyBypassesEvidenceGate(t *testing.T) {
+	prev := doneSkipVerify
+	doneSkipVerify = true
+	defer func() { doneSkipVerify = prev }()
+
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\n", // no attached_at, no evidence
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason != "" || fatal {
+		t.Fatalf("--skip-verify should bypass review-only gate: reason=%q fatal=%v", reason, fatal)
 	}
 }
 
