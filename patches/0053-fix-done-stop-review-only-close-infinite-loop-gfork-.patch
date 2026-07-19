@@ -1,0 +1,258 @@
+From 7840bdc992175e01bb0b2a9766674c3a3ff7e983 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 16:44:38 -0400
+Subject: [PATCH 53/56] fix(done): stop review-only close infinite loop
+ (gfork-2cw)
+
+Review-only work is not anchored to the worktree HEAD, but the done
+close gate required the evidence comment's head_sha to equal the current
+worktree HEAD. Every legitimate review-only close therefore failed
+closed, the hook was never cleared, and the review polecat re-dispatched
+forever.
+
+- Drop the worktree-HEAD equality gate in hasFreshReviewEvidenceComment;
+  keep the author + post-assignment-timestamp guards (and remove the now
+  dead reviewEvidenceHeadSHA helper).
+- Honor --skip-verify as an operator override that bypasses the
+  review-only evidence gate for audit/test-only completion.
+- On a review-only FATAL close skip, escalate (witness + mayor) and clear
+  the hook instead of hard-returning, so a residual gate failure can no
+  longer strand the hook and loop.
+
+Update TestReviewOnlyCloseRejectsWrongAuthorOrHead -> WrongAuthor (head
+gate dropped) and add tests for mismatched/missing head acceptance and
+the --skip-verify bypass.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/done.go      | 83 +++++++++++++++++++++++++++++----------
+ internal/cmd/done_test.go | 66 +++++++++++++++++++++++--------
+ 2 files changed, 112 insertions(+), 37 deletions(-)
+
+diff --git a/internal/cmd/done.go b/internal/cmd/done.go
+index dba98ef8..5824401d 100644
+--- a/internal/cmd/done.go
++++ b/internal/cmd/done.go
+@@ -249,6 +249,13 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
+ 	if attachment == nil || !attachment.ReviewOnly {
+ 		return "", false
+ 	}
++	// gfork-2cw: --skip-verify is the operator's explicit "close this, I've
++	// verified it out of band" override for audit/test-only completion. Honor
++	// it here so a review-only bead can be force-closed without a fresh
++	// evidence comment instead of hard-failing the evidence gate.
++	if doneSkipVerify {
++		return "", false
++	}
+ 	assignmentAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(attachment.AttachedAt))
+ 	if err != nil {
+ 		return fmt.Sprintf("review-only issue %s has no fresh assignment timestamp — re-sling it or add evidence after a fresh assignment", issueID), true
+@@ -332,9 +339,12 @@ func hasFreshReviewEvidenceComment(comments []beads.Comment, assignmentAt time.T
+ 		if isGeneratedReviewComment(comment.Text) || !isReviewEvidenceText(comment.Text) {
+ 			continue
+ 		}
+-		if reviewEvidenceHeadSHA(comment.Text) != currentHead {
+-			continue
+-		}
++		// gfork-2cw: review-only evidence is NOT anchored to the worktree HEAD.
++		// The reviewer records the PR head they reviewed, which is unrelated to
++		// wherever `gt done` happens to run. Gating on worktree-HEAD equality
++		// made every legitimate review-only close fail closed -> the hook was
++		// never cleared -> the review polecat re-dispatched forever. Author +
++		// post-assignment-timestamp guards above are sufficient proof.
+ 		return true
+ 	}
+ 	return false
+@@ -355,22 +365,6 @@ func isGeneratedReviewComment(text string) bool {
+ 	return false
+ }
+ 
+-func reviewEvidenceHeadSHA(text string) string {
+-	for _, line := range strings.Split(text, "\n") {
+-		trimmed := strings.TrimSpace(line)
+-		lower := strings.ToLower(trimmed)
+-		for _, key := range []string{"head_sha", "target_head_sha", "head"} {
+-			for _, sep := range []string{":", "="} {
+-				prefix := key + sep
+-				if strings.HasPrefix(lower, prefix) {
+-					return strings.TrimSpace(trimmed[len(prefix):])
+-				}
+-			}
+-		}
+-	}
+-	return ""
+-}
+-
+ func isReviewEvidenceText(text string) bool {
+ 	for _, line := range strings.Split(text, "\n") {
+ 		trimmed := strings.TrimSpace(line)
+@@ -936,7 +930,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
+ 					fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+ 					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+ 					if fatal {
+-						return fmt.Errorf("cannot complete review-only/no-MR work: %s", skipReason)
++						reviewOnly := false
++						if srcIssue, _ := bd.Show(issueID); srcIssue != nil {
++							if att := beads.ParseAttachmentFields(srcIssue); att != nil && att.ReviewOnly {
++								reviewOnly = true
++							}
++						}
++						if !reviewOnly {
++							return fmt.Errorf("cannot complete review-only/no-MR work: %s", skipReason)
++						}
++						// gfork-2cw: don't hard-return on a review-only fatal —
++						// that strands the hook and loops the review polecat.
++						// Escalate and fall through (skipClose) so the hook still
++						// clears; the bead stays open for review.
++						escalateReviewOnlyCloseLoop(townRoot, rigName, issueID, skipReason)
+ 					}
+ 					skipClose = true
+ 				}
+@@ -1967,6 +1974,34 @@ func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
+ 	}
+ }
+ 
++// escalateReviewOnlyCloseLoop fires when a review-only bead still fails the
++// gt done close gate *fatally*. The root-cause fixes (gfork-2cw a/b) should
++// prevent that, but a hard return here is the exact bug we're killing: it
++// leaves the hook set, so the review polecat is re-dispatched and loops
++// forever. Instead we notify witness+mayor and let the caller clear the hook,
++// leaving the bead OPEN for a human to confirm and close.
++func escalateReviewOnlyCloseLoop(townRoot, rigName, issueID, reason string) {
++	if townRoot == "" || issueID == "" {
++		return
++	}
++	from := fmt.Sprintf("%s/polecat", rigName)
++	body := fmt.Sprintf("ESCALATE: review-only bead %s failed the gt done close gate but the hook is being force-cleared to break a re-dispatch loop (gfork-2cw).\n\nReason: %s\n\nThe bead is left OPEN. A human/mayor should confirm the review evidence and close it manually.",
++		issueID, reason)
++	router := mail.NewRouter(townRoot)
++	defer router.WaitPendingNotifications()
++	for _, to := range []string{fmt.Sprintf("%s/witness", rigName), "mayor/"} {
++		msg := &mail.Message{
++			To:      to,
++			From:    from,
++			Subject: fmt.Sprintf("ESCALATE: review-only close loop %s", issueID),
++			Body:    body,
++		}
++		if err := router.Send(msg); err != nil {
++			style.PrintWarning("could not send review-only close escalation to %s: %v", to, err)
++		}
++	}
++}
++
+ func noteVerifiedPushFailure(cwd, issueID, branch, commit string, verifyErr error) {
+ 	if issueID == "" || cwd == "" {
+ 		return
+@@ -2295,6 +2330,14 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
+ 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
+ 				notifyDoneCloseSkipped(townRoot, ctx.Rig, detectSender(), hookedBeadID, skipReason)
+ 				if fatal {
++					// gfork-2cw: a review-only bead that fails the close gate
++					// must not hard-return — returning leaves the hook set, so
++					// the review polecat is re-dispatched and loops forever.
++					// Escalate and clear the hook (doneStateUpdate) instead.
++					if att := beads.ParseAttachmentFields(hookedBead); att != nil && att.ReviewOnly {
++						escalateReviewOnlyCloseLoop(townRoot, ctx.Rig, hookedBeadID, skipReason)
++						goto doneStateUpdate
++					}
+ 					return fmt.Errorf("cannot complete hooked work: %s", skipReason)
+ 				}
+ 				goto doneStateUpdate
+diff --git a/internal/cmd/done_test.go b/internal/cmd/done_test.go
+index 5341c222..a609bdcc 100644
+--- a/internal/cmd/done_test.go
++++ b/internal/cmd/done_test.go
+@@ -222,41 +222,73 @@ func TestReviewOnlyCloseRejectsStaleComment(t *testing.T) {
+ 	}
+ }
+ 
+-func TestReviewOnlyCloseRejectsWrongAuthorOrHead(t *testing.T) {
++func TestReviewOnlyCloseRejectsWrongAuthor(t *testing.T) {
++	// gfork-2cw: the worktree-HEAD equality gate was dropped (review evidence is
++	// not anchored to the worktree HEAD), so only the author guard remains here.
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
++		Assignee:    "gastown/polecats/toast",
++		Comments: []beads.Comment{{
++			Author:    "gastown/polecats/other",
++			CreatedAt: "2026-07-01T12:05:00Z",
++			Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
++		}},
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason == "" || !fatal {
++		t.Fatalf("wrong-author evidence should fail closed: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
++// gfork-2cw: review-only evidence recorded a different (PR) head than the
++// worktree HEAD where gt done runs. This used to fail closed and loop the
++// review polecat forever; it must now be accepted.
++func TestReviewOnlyCloseAllowsMismatchedOrMissingHead(t *testing.T) {
+ 	tests := []struct {
+-		name    string
+-		author  string
+-		head    string
+-		current string
++		name string
++		text string
+ 	}{
+-		{name: "wrong author", author: "gastown/polecats/other", head: "abc123", current: "abc123"},
+-		{name: "wrong head", author: "gastown/polecats/toast", head: "def456", current: "abc123"},
+-		{name: "missing head", author: "gastown/polecats/toast", head: "", current: "abc123"},
++		{name: "mismatched head", text: "PR-SHERIFF-EVIDENCE: pass\nhead_sha: def456"},
++		{name: "missing head", text: "PR-SHERIFF-EVIDENCE: pass"},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			text := "PR-SHERIFF-EVIDENCE: pass"
+-			if tt.head != "" {
+-				text += "\nhead_sha: " + tt.head
+-			}
+ 			issue := &beads.Issue{
+ 				ID:          "gt-review",
+ 				Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+ 				Assignee:    "gastown/polecats/toast",
+ 				Comments: []beads.Comment{{
+-					Author:    tt.author,
++					Author:    "gastown/polecats/toast",
+ 					CreatedAt: "2026-07-01T12:05:00Z",
+-					Text:      text,
++					Text:      tt.text,
+ 				}},
+ 			}
+-			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, tt.current)
+-			if reason == "" || !fatal {
+-				t.Fatalf("invalid evidence should fail closed: reason=%q fatal=%v", reason, fatal)
++			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++			if reason != "" || fatal {
++				t.Fatalf("head-mismatched evidence should be allowed: reason=%q fatal=%v", reason, fatal)
+ 			}
+ 		})
+ 	}
+ }
+ 
++// gfork-2cw: --skip-verify is the operator override for audit/test-only
++// completion and must bypass the review-only evidence gate entirely.
++func TestReviewOnlySkipVerifyBypassesEvidenceGate(t *testing.T) {
++	prev := doneSkipVerify
++	doneSkipVerify = true
++	defer func() { doneSkipVerify = prev }()
++
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		Description: "review_only: true\n", // no attached_at, no evidence
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason != "" || fatal {
++		t.Fatalf("--skip-verify should bypass review-only gate: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
+ func TestReviewOnlyCloseRejectsMissingAssigneeOrInvalidCommentTime(t *testing.T) {
+ 	tests := []struct {
+ 		name      string
+-- 
+2.50.1 (Apple Git-155)
+

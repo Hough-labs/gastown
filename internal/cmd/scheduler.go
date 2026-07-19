@@ -427,15 +427,24 @@ func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFie
 func beadsSearchDirs(townRoot string) ([]string, error) {
 	dirs := []string{townRoot}
 	seen := map[string]bool{townRoot: true}
-	entries, err := os.ReadDir(townRoot)
+
+	// Scan HQ (townRoot) plus each REGISTERED rig — not every top-level dir that
+	// happens to carry a .beads. The town root is shared with unrelated projects
+	// (cass, smelt, mill, deacon, …) that use beads for their own tracking, and
+	// with stale pre-rename orphans (e.g. gastown-fork → gfork). Blindly scanning
+	// those meant a single missing or dirty-schema project DB made
+	// ListOpenSlingContexts fail, and the scheduler fails closed on any scan
+	// error — so one unrelated broken DB wedged ALL town-wide dispatch. Sling
+	// contexts only ever live in a target rig's beads dir (GH#3468), so
+	// restricting the scan to registered rigs is both correct and robust.
+	rigs, err := discoverRigsForTownRoot(townRoot)
 	if err != nil {
-		return nil, fmt.Errorf("discovering scheduler beads search dirs: %w", err)
+		// No/unreadable registry: fall back to town root only. HQ-level contexts
+		// still schedule; better than aborting all dispatch.
+		return dirs, nil
 	}
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "mayor" || e.Name() == "settings" {
-			continue
-		}
-		rigDir := filepath.Join(townRoot, e.Name())
+	for _, r := range rigs {
+		rigDir := r.Path
 		beadsDir := filepath.Join(rigDir, ".beads")
 		if _, err := os.Stat(beadsDir); err == nil && !seen[rigDir] {
 			dirs = append(dirs, rigDir)

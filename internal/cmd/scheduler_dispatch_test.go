@@ -36,6 +36,14 @@ func setupSchedulerScanFailureTown(t *testing.T) string {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
+	// Register "rig" so beadsSearchDirs scans it: the scheduler only scans
+	// registered rigs, so fail-closed behavior is exercised on a real rig dir.
+	writeJSONFile(t, filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"rig": {BeadsConfig: &config.BeadsConfig{Prefix: "gt"}},
+		},
+	})
 	installFakeBD(t, `#!/bin/sh
 case "$BEADS_DIR" in
   */rig/.beads) echo "scan failed" >&2; exit 7 ;;
@@ -99,6 +107,49 @@ func TestListAllSlingContextRecordsFailsOnPartialScanFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listing sling contexts") || !strings.Contains(err.Error(), filepath.Join("rig", ".beads")) {
 		t.Fatalf("error = %q, want explicit context scan failure", err.Error())
+	}
+}
+
+// TestBeadsSearchDirsSkipsUnregisteredDirs is the regression test for a
+// town-wide dispatch wedge: an unrelated project dir (or stale pre-rename
+// orphan like gastown-fork) sitting in the town root with a .beads pointing at
+// a missing/dirty DB must NOT be scanned, so it can't fail the scheduler.
+func TestBeadsSearchDirsSkipsUnregisteredDirs(t *testing.T) {
+	townRoot := t.TempDir()
+	for _, dir := range []string{
+		filepath.Join(townRoot, "mayor"),
+		filepath.Join(townRoot, ".beads"),
+		filepath.Join(townRoot, "feryn", ".beads"),        // registered rig
+		filepath.Join(townRoot, "gastown-fork", ".beads"), // orphan, must be skipped
+		filepath.Join(townRoot, "smelt", ".beads"),        // unrelated project, must be skipped
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	writeJSONFile(t, filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"feryn": {BeadsConfig: &config.BeadsConfig{Prefix: "feryn"}},
+		},
+	})
+
+	dirs, err := beadsSearchDirs(townRoot)
+	if err != nil {
+		t.Fatalf("beadsSearchDirs: %v", err)
+	}
+	got := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		got[d] = true
+	}
+	if !got[townRoot] || !got[filepath.Join(townRoot, "feryn")] {
+		t.Fatalf("dirs = %v, want townRoot and registered rig feryn", dirs)
+	}
+	if got[filepath.Join(townRoot, "gastown-fork")] {
+		t.Fatalf("dirs = %v, must not include unregistered orphan gastown-fork", dirs)
+	}
+	if got[filepath.Join(townRoot, "smelt")] {
+		t.Fatalf("dirs = %v, must not include unrelated project smelt", dirs)
 	}
 }
 

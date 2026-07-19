@@ -1,0 +1,25 @@
+From 4ad3dc0315a1c4d5043bbd7be1bc0ed4661b33d2 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Mon, 6 Apr 2026 05:56:30 -0400
+Subject: [PATCH 02/56] chore: gitignore handoffs/
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+(cherry picked from commit 7e6dede42a54c11c6c0fd6d97d60cd146c0d14e0)
+---
+ .gitignore | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index 92c8d434..e9b33ed1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -103,3 +103,6 @@ GEMINI.md
+ # Mantle-compiled agent config (generated, do not commit)
+ .agents/
+ .pi/
++
++# Handoff docs (ephemeral agent notes — local only)
++handoffs/
+-- 
+2.50.1 (Apple Git-155)
+

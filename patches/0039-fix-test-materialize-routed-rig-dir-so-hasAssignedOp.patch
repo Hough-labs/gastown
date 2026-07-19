@@ -1,0 +1,67 @@
+From 90c7b1e6ff124bb515731c54b8cf6d00df8eaf56 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 10 Jul 2026 00:05:14 -0400
+Subject: [PATCH 39/56] fix(test): materialize routed rig dir so
+ hasAssignedOpenWork test is macOS-hermetic (gfork-1bw)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag failed on macOS
+(and on pure base 81233d36 — inherited-upstream, not a fork regression). It writes
+a route {prefix:gt-, path:gastown/mayor/rig} into townRoot/.beads/routes.jsonl but
+never creates the gastown/mayor/rig dir on disk, then asserts hasAssignedOpenWork
+pins BEADS_DIR to townRoot/gastown/mayor/rig/.beads.
+
+Root cause is a symlink asymmetry in beads.pathWithin (internal/beads/routes.go),
+reached via GetRigDirForName. pathWithin runs filepath.EvalSymlinks on both root
+(townRoot) and path (the candidate rig dir), keeping the original on error. On
+macOS t.TempDir() lives under /var, a symlink to /private/var: townRoot resolves to
+/private/var/... but the absent rig dir fails EvalSymlinks and stays /var/..., so
+filepath.Rel sees divergent prefixes, pathWithin returns false, GetRigDirForName
+returns "", and hasAssignedOpenWork falls back to the ROUTING branch. BEADS_DIR
+then points at townRoot/.beads instead of the pinned rig dir, the fake bd exits 1
+on its BEADS_DIR guard, the lookup returns false, and the test fails at line 62.
+
+This is a test-hermeticity defect, not a production bug: real towns keep the rig
+dir on disk (so EvalSymlinks resolves both paths symmetrically) and do not live
+under /var. Fix is test-only — os.MkdirAll(expectedBeadsDir) before the lookup,
+which materializes the routed rig dir, keeps EvalSymlinks symmetric, and makes the
+test exercise the pinned branch it was written to verify (previously it was
+silently testing the routing fallback). Empirically confirmed: pathWithin flips
+false->true and GetRigDirForName resolves correctly once the dir exists. Target
+test fail->PASS (0.37s); full internal/daemon package green under -race (159.9s,
+0 findings). No upstream PR per fork directive; the latent pathWithin robustness
+gap is documented in the gfork-1bw bead.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/daemon/has_assigned_work_test.go | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/internal/daemon/has_assigned_work_test.go b/internal/daemon/has_assigned_work_test.go
+index a2cdd5ad..7e0334fc 100644
+--- a/internal/daemon/has_assigned_work_test.go
++++ b/internal/daemon/has_assigned_work_test.go
+@@ -28,6 +28,18 @@ func TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag(t *testing
+ 	binDir := t.TempDir()
+ 	logPath := filepath.Join(binDir, "bd.log")
+ 	expectedBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
++	// Materialize the routed rig dir on disk before the lookup. hasAssignedOpenWork
++	// resolves the pinned dir via GetRigDirForName -> pathWithin, which runs
++	// filepath.EvalSymlinks on both townRoot and the candidate rig dir. On macOS
++	// t.TempDir() lives under /var (a symlink to /private/var): a rig dir that does
++	// not exist on disk stays unresolved while townRoot resolves, so the two paths
++	// diverge (/var vs /private/var), pathWithin returns false, and the daemon falls
++	// back to the routing branch instead of the pinned branch this test exercises.
++	// Creating it keeps EvalSymlinks symmetric and mirrors a real town, where the
++	// rig dir always exists on disk.
++	if err := os.MkdirAll(expectedBeadsDir, 0o755); err != nil {
++		t.Fatalf("mkdir rig beads: %v", err)
++	}
+ 	script := `#!/bin/sh
+ for arg in "$@"; do
+   case "$arg" in
+-- 
+2.50.1 (Apple Git-155)
+

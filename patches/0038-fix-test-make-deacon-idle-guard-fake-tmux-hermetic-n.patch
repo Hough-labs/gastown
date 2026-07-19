@@ -1,0 +1,64 @@
+From 30e971c19688036f3b1cd519dfeec0e73c187e1e Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 9 Jul 2026 23:43:35 -0400
+Subject: [PATCH 38/56] =?UTF-8?q?fix(test):=20make=20deacon=20idle-guard?=
+ =?UTF-8?q?=20fake=20tmux=20hermetic=20=E2=80=94=20no=20180s=20WaitForComm?=
+ =?UTF-8?q?and=20hang=20(gfork-g0d)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TestCheckDeaconHeartbeat_IdleGuard's "very stale" subtest drives the escalation
+path: checkDeaconHeartbeat -> restartStuckDeacon -> ensureDeaconRunning ->
+deacon.Manager.Start -> tmux.WaitForCommand. WaitForCommand polls display-message
+for the pane's foreground command until it is no longer a shell (Claude started)
+or ClaudeStartTimeout (180s) elapses. The fake tmux returned empty output for
+#{pane_current_command}, so GetPaneCommand errored every poll and the loop ran the
+full 180s, timing out the whole daemon package under `go test -race`.
+
+Teach the fake tmux to answer the two display-message queries WaitForCommand/
+isPaneDead issue: #{pane_current_command} -> "claude" (a non-shell command, so
+WaitForCommand returns on the first poll) and #{pane_dead} -> "0". The very-stale
+subtest now completes in ~2.3s (the 2s restart sleep) instead of hanging 180s;
+all 5 subtests pass under -race with no race findings.
+
+This is a fork patch on an upstream test file (deacon_idle_guard_test.go is in
+base, untouched by any other fork patch) — fork-tax that keeps the mandated
+`go test -race ./internal/daemon/...` loop usable on hammer. Scope-verified: only
+this one test hung; every boot/crashloop spawn test already passed. Separately,
+the package carries one inherited-upstream failure (TestHasAssignedOpenWork...,
+fails on pure base 81233d36) tracked as gfork-1bw — out of scope here.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/daemon/deacon_idle_guard_test.go | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/internal/daemon/deacon_idle_guard_test.go b/internal/daemon/deacon_idle_guard_test.go
+index 81f482cd..f92596a6 100644
+--- a/internal/daemon/deacon_idle_guard_test.go
++++ b/internal/daemon/deacon_idle_guard_test.go
+@@ -53,6 +53,20 @@ if [[ "$cmd" == "has-session" ]]; then
+   exit 0
+ fi
+ 
++# The very-stale escalation subtest drives restartStuckDeacon ->
++# ensureDeaconRunning -> deacon.Manager.Start -> WaitForCommand, which polls
++# display-message for the pane's foreground command until it is no longer a
++# shell (Claude started) or ClaudeStartTimeout (180s) elapses. Report a live
++# pane already running a non-shell command so WaitForCommand returns on the
++# first poll instead of hanging for the full timeout (gfork-g0d).
++if [[ "$cmd" == "display-message" ]]; then
++  case "$*" in
++    *pane_current_command*) echo "claude" ;;
++    *pane_dead*)            echo "0" ;;
++  esac
++  exit 0
++fi
++
+ exit 0
+ `
+ 	path := filepath.Join(dir, "tmux")
+-- 
+2.50.1 (Apple Git-155)
+

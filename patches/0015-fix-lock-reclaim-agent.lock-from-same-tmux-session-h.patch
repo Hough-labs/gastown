@@ -1,0 +1,175 @@
+From c9c4132c8db34caadf0a3be184d4fabd315d80b2 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 12 May 2026 14:46:58 -0400
+Subject: [PATCH 15/56] fix(lock): reclaim agent.lock from same tmux session
+ (hq-uus)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Multi-bead parallel sling (3+ polecats at once) reliably trips the
+SessionStart hook with "cannot claim identity: worker is locked by
+another agent". The lock-holder PID has already exited but its
+agent.lock JSON still names a PID that ps reports alive at the moment
+of acquisition — typically the gt sling bootstrap helper that briefly
+held the lock from within the polecat's own tmux pane.
+
+The existing IsStale path catches dead-PID locks after the predecessor
+has fully exited; the in-pane race squeezes between acquisition and
+the predecessor's exit, so the new claimer sees a live foreign PID
+and errors. The hook is non-blocking and the polecat later reclaims,
+but the noise is reproducible on every batch sling.
+
+Refine Acquire so that an existing lock whose SessionID matches the
+claimer's sessionID is treated as our own bootstrap predecessor and
+reclaimed (write a fresh lock under our PID). Locks held in a
+different tmux session by an alive process still return ErrLocked.
+
+Adds two tests: same-session reclaim succeeds; cross-session active
+lock still rejects.
+
+(cherry picked from commit 7054c0323241c8d7ec9ad599541ad2b30320146f)
+---
+ internal/lock/lock.go      | 14 ++++++-
+ internal/lock/lock_test.go | 86 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/internal/lock/lock.go b/internal/lock/lock.go
+index d4b5e8d2..c843067b 100644
+--- a/internal/lock/lock.go
++++ b/internal/lock/lock.go
+@@ -56,8 +56,11 @@ func New(workerDir string) *Lock {
+ }
+ 
+ // Acquire attempts to acquire the lock for this worker.
+-// Returns ErrLocked if another live process holds the lock.
+-// Automatically cleans up stale locks.
++// Returns ErrLocked if another live process in a different tmux session
++// holds the lock. Automatically cleans up stale locks, and reclaims locks
++// held by an earlier process in the same tmux session (e.g. a sling
++// bootstrap process that briefly held the lock before the polecat itself
++// began claiming identity).
+ //
+ // Uses OS-level advisory locking (flock) to prevent TOCTOU races
+ // where two processes could both see no lock and both write one.
+@@ -91,6 +94,13 @@ func (l *Lock) Acquire(sessionID string) error {
+ 				// We already hold it - refresh
+ 				return l.write(sessionID)
+ 			}
++			// Same tmux session = same logical worker. A bootstrap process
++			// (e.g. gt sling's spawn helper) may briefly hold the lock from
++			// within our pane before the polecat's own claim runs; treat
++			// that case as our own and reclaim instead of erroring.
++			if sessionID != "" && info.SessionID == sessionID {
++				return l.write(sessionID)
++			}
+ 			// Another process holds it
+ 			return fmt.Errorf("%w: PID %d (session: %s, acquired: %s)",
+ 				ErrLocked, info.PID, info.SessionID, info.AcquiredAt.Format(time.RFC3339))
+diff --git a/internal/lock/lock_test.go b/internal/lock/lock_test.go
+index 9c9baf20..1159d308 100644
+--- a/internal/lock/lock_test.go
++++ b/internal/lock/lock_test.go
+@@ -2,6 +2,7 @@ package lock
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -159,6 +160,91 @@ func TestLock_AcquireStaleLock(t *testing.T) {
+ 	l.Release()
+ }
+ 
++// TestLock_AcquireReclaimsFromSameSession exercises the in-pane bootstrap race:
++// a setup process (e.g. gt sling's spawn helper) writes the lock under its own
++// PID and SessionID, exits or is still alive when the polecat's own Acquire
++// runs. Same SessionID means same logical worker, so the polecat should reclaim
++// rather than fail with ErrLocked.
++func TestLock_AcquireReclaimsFromSameSession(t *testing.T) {
++	tmpDir := t.TempDir()
++	workerDir := filepath.Join(tmpDir, "worker")
++	runtimeDir := filepath.Join(workerDir, ".runtime")
++	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	// Plant a lock held by an alive foreign PID (the parent process is
++	// virtually always alive during test execution) with our tmux session.
++	foreignPID := os.Getppid()
++	if foreignPID == os.Getpid() || !processExists(foreignPID) {
++		t.Skipf("parent pid %d unsuitable for test", foreignPID)
++	}
++	planted := LockInfo{
++		PID:        foreignPID,
++		AcquiredAt: time.Now(),
++		SessionID:  "%pane-shared",
++	}
++	data, _ := json.Marshal(planted)
++	lockPath := filepath.Join(runtimeDir, "agent.lock")
++	if err := os.WriteFile(lockPath, data, 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	l := New(workerDir)
++	if err := l.Acquire("%pane-shared"); err != nil {
++		t.Fatalf("Acquire() with same-session lock should reclaim, got %v", err)
++	}
++
++	info, err := l.Read()
++	if err != nil {
++		t.Fatalf("Read() error = %v", err)
++	}
++	if info.PID != os.Getpid() {
++		t.Errorf("after same-session reclaim, PID = %d, want %d", info.PID, os.Getpid())
++	}
++	if info.SessionID != "%pane-shared" {
++		t.Errorf("SessionID = %q, want %q", info.SessionID, "%pane-shared")
++	}
++
++	l.Release()
++}
++
++// TestLock_AcquireRejectsDifferentSession guards against the reclaim path
++// becoming too liberal: an alive foreign PID in a different tmux session must
++// still produce ErrLocked.
++func TestLock_AcquireRejectsDifferentSession(t *testing.T) {
++	tmpDir := t.TempDir()
++	workerDir := filepath.Join(tmpDir, "worker")
++	runtimeDir := filepath.Join(workerDir, ".runtime")
++	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	foreignPID := os.Getppid()
++	if foreignPID == os.Getpid() || !processExists(foreignPID) {
++		t.Skipf("parent pid %d unsuitable for test", foreignPID)
++	}
++	planted := LockInfo{
++		PID:        foreignPID,
++		AcquiredAt: time.Now(),
++		SessionID:  "%other-pane",
++	}
++	data, _ := json.Marshal(planted)
++	lockPath := filepath.Join(runtimeDir, "agent.lock")
++	if err := os.WriteFile(lockPath, data, 0644); err != nil {
++		t.Fatal(err)
++	}
++
++	l := New(workerDir)
++	err := l.Acquire("%my-pane")
++	if err == nil {
++		t.Fatal("Acquire() across distinct sessions should return ErrLocked, got nil")
++	}
++	if !errors.Is(err, ErrLocked) {
++		t.Errorf("Acquire() across distinct sessions: error = %v, want errors.Is(.., ErrLocked)", err)
++	}
++}
++
+ func TestLock_Read(t *testing.T) {
+ 	tmpDir := t.TempDir()
+ 	workerDir := filepath.Join(tmpDir, "worker")
+-- 
+2.50.1 (Apple Git-155)
+

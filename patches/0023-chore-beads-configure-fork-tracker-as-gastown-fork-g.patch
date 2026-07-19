@@ -1,0 +1,112 @@
+From bac230df3c3edcfdd975a1aa39ccf90034ec70a3 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 3 Jul 2026 18:53:08 -0400
+Subject: [PATCH 23/56] chore(beads): configure fork tracker as
+ gastown-fork/gfork
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Point the fork's beads tracker at a dedicated Dolt DB 'gastown-fork'
+(prefix 'gfork') on the hammer:3307 server, mirroring ~/code/gauntlet.
+This is a normal project tracker, separate from the ~/gt hq town (DB
+'hq'). Fixes the prior mis-setup where an empty/ambiguous 'gastown' DB
+with no prefix, plus a bd-init ~/.beads-planning route, silently
+swallowed writes.
+
+- config.yaml: dolt.database gastown-fork, issue-prefix gfork, server mode
+- .beads/.gitignore: keep interactions.jsonl ignored (matches gauntlet);
+  add proxieddb/, proxied_server_client_info.json, dolt-pprof/
+- .gitignore: ignore .beads/proxieddb/
+
+Do NOT run 'bd init' in this repo — it clobbers AGENTS.md, creates
+.codex/, and re-injects the ~/.beads-planning route.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .beads/.gitignore  |  6 ++++++
+ .beads/config.yaml | 21 ++++++++++++++-------
+ .gitignore         |  3 +++
+ 3 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/.beads/.gitignore b/.beads/.gitignore
+index df4911d4..729fe1b3 100644
+--- a/.beads/.gitignore
++++ b/.beads/.gitignore
+@@ -1,6 +1,7 @@
+ # Dolt database (managed by Dolt, not git)
+ dolt/
+ embeddeddolt/
++proxieddb/
+ 
+ # Runtime files
+ bd.sock
+@@ -27,6 +28,8 @@ push-state.json
+ # Local version tracking (prevents upgrade notification spam after git ops)
+ .local_version
+ 
++proxied_server_client_info.json
++
+ # Worktree redirect file (contains relative path to main repo's .beads/)
+ # Must not be committed as paths would be wrong in other clones
+ redirect
+@@ -50,6 +53,9 @@ dolt-server.lock
+ dolt-server.port
+ dolt-server.activity
+ 
++# Debug-mode pprof artifacts (written when dolt.debug: true in config.yaml)
++dolt-pprof/
++
+ # Corrupt backup directories (created by bd doctor --fix recovery)
+ *.corrupt.backup/
+ 
+diff --git a/.beads/config.yaml b/.beads/config.yaml
+index 57f8e509..a84521b3 100644
+--- a/.beads/config.yaml
++++ b/.beads/config.yaml
+@@ -38,17 +38,24 @@
+ # Format: external:<project>:<capability> in bd dep commands
+ external_projects:
+   beads: ../../../beads/mayor/rig
+-
+ # Custom issue types for Gas Town (fallback when database is unavailable)
+ types.custom: "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+-
+-prefix:
+-issue-prefix:
++prefix: gfork
++issue-prefix: gfork
+ dolt.idle-timeout: "0"
+-
+ # Molecules are internal GT scaffolding (patrol instances etc.) and must never
+ # reach the GitHub issue tracker. Disabling auto-export prevents silent
+ # regressions when the bd binary is upgraded. (gt-b48)
+ export.auto: "false"
+-
+-sync.remote: "git+https://github.com/steveyegge/gastown.git"
++# Fork-local tracker — a normal project, SEPARATE from the gastown hq/~/gt town
++# (whose DB is 'hq'/prefix 'hq'). Prefix 'gfork', database 'gastown-fork' on the
++# hammer:3307 Dolt server (bastion-backed), mirroring ~/code/gauntlet's setup.
++# The prior 677-issue 'gt-*' history is preserved on Hough-labs/gastown
++# refs/dolt/data + .beads/backup/; not imported into this fresh tracker.
++dolt.mode: "server"
++dolt.host: 127.0.0.1
++dolt.port: 3307
++dolt.database: "gastown-fork"
++dolt.auto-start: false
++dolt.auto-push: "off"
++sync.remote: "git+ssh://git@github.com/Hough-labs/gastown.git"
+diff --git a/.gitignore b/.gitignore
+index f85344c2..68b16a6d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -107,3 +107,6 @@ GEMINI.md
+ # Handoff docs (ephemeral agent notes — local only)
+ handoffs/
+ .handoffs/
++
++# Beads / Dolt files (added by bd init)
++.beads/proxieddb/
+-- 
+2.50.1 (Apple Git-155)
+

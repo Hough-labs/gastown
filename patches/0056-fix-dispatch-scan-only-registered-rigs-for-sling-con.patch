@@ -1,0 +1,134 @@
+From 17ebe93030fcfaf7af01e40346be63b7794ec5e8 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 17:13:17 -0400
+Subject: [PATCH 56/56] fix(dispatch): scan only registered rigs for sling
+ contexts
+
+beadsSearchDirs scanned every top-level town dir with a .beads subdir,
+including unrelated projects (cass, smelt, mill, ...) and stale
+pre-rename orphans (gastown-fork -> gfork). Because the scheduler fails
+closed on any sling-context scan error, a single missing or dirty-schema
+project DB wedged ALL town-wide dispatch:
+
+  planning dispatch: listing sling contexts in .../gastown-fork/.beads:
+  issue not found
+
+Sling contexts only ever live in a target rig's beads dir (GH#3468), so
+restrict the scan to registered rigs (via discoverRigsForTownRoot) plus
+HQ. Fail-closed on a scanned rig is preserved; unregistered dirs are no
+longer scanned and can't wedge dispatch.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/scheduler.go               | 23 +++++++----
+ internal/cmd/scheduler_dispatch_test.go | 51 +++++++++++++++++++++++++
+ 2 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/internal/cmd/scheduler.go b/internal/cmd/scheduler.go
+index cb30556a..083f6095 100644
+--- a/internal/cmd/scheduler.go
++++ b/internal/cmd/scheduler.go
+@@ -427,15 +427,24 @@ func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFie
+ func beadsSearchDirs(townRoot string) ([]string, error) {
+ 	dirs := []string{townRoot}
+ 	seen := map[string]bool{townRoot: true}
+-	entries, err := os.ReadDir(townRoot)
++
++	// Scan HQ (townRoot) plus each REGISTERED rig — not every top-level dir that
++	// happens to carry a .beads. The town root is shared with unrelated projects
++	// (cass, smelt, mill, deacon, …) that use beads for their own tracking, and
++	// with stale pre-rename orphans (e.g. gastown-fork → gfork). Blindly scanning
++	// those meant a single missing or dirty-schema project DB made
++	// ListOpenSlingContexts fail, and the scheduler fails closed on any scan
++	// error — so one unrelated broken DB wedged ALL town-wide dispatch. Sling
++	// contexts only ever live in a target rig's beads dir (GH#3468), so
++	// restricting the scan to registered rigs is both correct and robust.
++	rigs, err := discoverRigsForTownRoot(townRoot)
+ 	if err != nil {
+-		return nil, fmt.Errorf("discovering scheduler beads search dirs: %w", err)
++		// No/unreadable registry: fall back to town root only. HQ-level contexts
++		// still schedule; better than aborting all dispatch.
++		return dirs, nil
+ 	}
+-	for _, e := range entries {
+-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "mayor" || e.Name() == "settings" {
+-			continue
+-		}
+-		rigDir := filepath.Join(townRoot, e.Name())
++	for _, r := range rigs {
++		rigDir := r.Path
+ 		beadsDir := filepath.Join(rigDir, ".beads")
+ 		if _, err := os.Stat(beadsDir); err == nil && !seen[rigDir] {
+ 			dirs = append(dirs, rigDir)
+diff --git a/internal/cmd/scheduler_dispatch_test.go b/internal/cmd/scheduler_dispatch_test.go
+index f3de3563..83b45de0 100644
+--- a/internal/cmd/scheduler_dispatch_test.go
++++ b/internal/cmd/scheduler_dispatch_test.go
+@@ -36,6 +36,14 @@ func setupSchedulerScanFailureTown(t *testing.T) string {
+ 			t.Fatalf("mkdir %s: %v", dir, err)
+ 		}
+ 	}
++	// Register "rig" so beadsSearchDirs scans it: the scheduler only scans
++	// registered rigs, so fail-closed behavior is exercised on a real rig dir.
++	writeJSONFile(t, filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
++		Version: config.CurrentRigsVersion,
++		Rigs: map[string]config.RigEntry{
++			"rig": {BeadsConfig: &config.BeadsConfig{Prefix: "gt"}},
++		},
++	})
+ 	installFakeBD(t, `#!/bin/sh
+ case "$BEADS_DIR" in
+   */rig/.beads) echo "scan failed" >&2; exit 7 ;;
+@@ -102,6 +110,49 @@ func TestListAllSlingContextRecordsFailsOnPartialScanFailure(t *testing.T) {
+ 	}
+ }
+ 
++// TestBeadsSearchDirsSkipsUnregisteredDirs is the regression test for a
++// town-wide dispatch wedge: an unrelated project dir (or stale pre-rename
++// orphan like gastown-fork) sitting in the town root with a .beads pointing at
++// a missing/dirty DB must NOT be scanned, so it can't fail the scheduler.
++func TestBeadsSearchDirsSkipsUnregisteredDirs(t *testing.T) {
++	townRoot := t.TempDir()
++	for _, dir := range []string{
++		filepath.Join(townRoot, "mayor"),
++		filepath.Join(townRoot, ".beads"),
++		filepath.Join(townRoot, "feryn", ".beads"),        // registered rig
++		filepath.Join(townRoot, "gastown-fork", ".beads"), // orphan, must be skipped
++		filepath.Join(townRoot, "smelt", ".beads"),        // unrelated project, must be skipped
++	} {
++		if err := os.MkdirAll(dir, 0755); err != nil {
++			t.Fatalf("mkdir %s: %v", dir, err)
++		}
++	}
++	writeJSONFile(t, filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
++		Version: config.CurrentRigsVersion,
++		Rigs: map[string]config.RigEntry{
++			"feryn": {BeadsConfig: &config.BeadsConfig{Prefix: "feryn"}},
++		},
++	})
++
++	dirs, err := beadsSearchDirs(townRoot)
++	if err != nil {
++		t.Fatalf("beadsSearchDirs: %v", err)
++	}
++	got := make(map[string]bool, len(dirs))
++	for _, d := range dirs {
++		got[d] = true
++	}
++	if !got[townRoot] || !got[filepath.Join(townRoot, "feryn")] {
++		t.Fatalf("dirs = %v, want townRoot and registered rig feryn", dirs)
++	}
++	if got[filepath.Join(townRoot, "gastown-fork")] {
++		t.Fatalf("dirs = %v, must not include unregistered orphan gastown-fork", dirs)
++	}
++	if got[filepath.Join(townRoot, "smelt")] {
++		t.Fatalf("dirs = %v, must not include unrelated project smelt", dirs)
++	}
++}
++
+ func TestAreScheduledFailsClosedOnContextScanFailure(t *testing.T) {
+ 	townRoot := setupSchedulerScanFailureTown(t)
+ 	oldCWD, err := os.Getwd()
+-- 
+2.50.1 (Apple Git-155)
+

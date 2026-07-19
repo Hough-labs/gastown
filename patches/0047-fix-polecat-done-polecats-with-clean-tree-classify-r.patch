@@ -1,0 +1,128 @@
+From 4a1cbcc85c0173314aeeb10bd66084d4a13e68e4 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sat, 18 Jul 2026 16:00:01 -0400
+Subject: [PATCH 47/56] fix(polecat): done polecats with clean tree classify
+ reusable, not NEEDS_RECOVERY (hq-z7j0)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DecideWorkstate short-circuited every non-idle, non-working polecat to
+NEEDS_RECOVERY / CountsTowardCapacity=true. That swept in StateDone
+polecats whose work had genuinely completed — PR merged (so the gatherer
+omits ActiveMRBlocker), tree clean, pushed, bead terminal — classifying
+them as recovery-blocked zombies. They leaked pool capacity over a run
+(observed: rust after PR #220 merged), raised false "agent death" alarms,
+and blocked auto-reap.
+
+Exclude StateDone from the blanket short-circuit so it flows through the
+existing blocker/MQ analysis. A done polecat with at-risk work (dirty
+tree, unpushed commits, hook still set, non-terminal bead, unsubmitted MQ
+work) still classifies NEEDS_RECOVERY via those checks; only a genuinely
+clean, completed one becomes reusable/idle.
+
+StateWorking still short-circuits to WORKING. The PENDING_MR path for a
+done polecat with an open PR is unchanged (handled earlier in the func).
+
+Tests: add done-clean / done-merged-pr reusable cases plus done-unpushed
+and done-hook-set recovery cases to workstate_test; update the inventory
+test that encoded the old buggy expectation.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/polecat_inventory_test.go | 11 ++++++----
+ internal/polecat/workstate.go          | 12 ++++++++++-
+ internal/polecat/workstate_test.go     | 28 ++++++++++++++++++++++++--
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/internal/cmd/polecat_inventory_test.go b/internal/cmd/polecat_inventory_test.go
+index 366c59a8..aa35569c 100644
+--- a/internal/cmd/polecat_inventory_test.go
++++ b/internal/cmd/polecat_inventory_test.go
+@@ -107,13 +107,16 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
+ 			wantVerdict: polecat.WorkstateVerdictPendingMR,
+ 		},
+ 		{
+-			name:         "done without active mr is not reusable",
++			// hq-z7j0: a done polecat with a clean tree and no pending MR has
++			// completed — it is reusable capacity, not a recovery-blocked zombie.
++			name:         "done clean without active mr is reusable",
+ 			polecatName:  "done",
+ 			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(polecat.CleanupClean)},
+ 			wantState:    polecat.StateDone,
+-			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
+-			wantRecovery: true,
+-			wantCapacity: true,
++			wantVerdict:  polecat.WorkstateVerdictSafeToNuke,
++			wantReusable: true,
++			wantRecovery: false,
++			wantCapacity: false,
+ 		},
+ 		{
+ 			name:        "done with active mr remains pending",
+diff --git a/internal/polecat/workstate.go b/internal/polecat/workstate.go
+index 0ae3df70..5df6fa59 100644
+--- a/internal/polecat/workstate.go
++++ b/internal/polecat/workstate.go
+@@ -72,7 +72,17 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
+ 		}
+ 	}
+ 
+-	if in.State != StateIdle {
++	// StateDone is deliberately NOT short-circuited to NEEDS_RECOVERY here. A
++	// polecat that called `gt done` may have genuinely completed — PR merged,
++	// tree clean, pushed, work bead terminal — in which case it is reusable/idle,
++	// not recovery-blocked. Blanket-classifying every StateDone as NEEDS_RECOVERY
++	// leaked capacity (zombie done-polecats held pool slots after their PR
++	// merged, e.g. rust after #220), raised false "agent death" alarms, and
++	// blocked auto-reap. A done polecat with at-risk work (dirty tree, unpushed
++	// commits, hook still set, non-terminal bead, unsubmitted MQ work) still
++	// falls to NEEDS_RECOVERY via the blocker/MQ analysis below, which detects
++	// exactly those conditions. (hq-z7j0)
++	if in.State != StateIdle && in.State != StateDone {
+ 		verdict := WorkstateVerdictNeedsRecovery
+ 		needsRecovery := true
+ 		if in.State == StateWorking {
+diff --git a/internal/polecat/workstate_test.go b/internal/polecat/workstate_test.go
+index 357027cd..f6036386 100644
+--- a/internal/polecat/workstate_test.go
++++ b/internal/polecat/workstate_test.go
+@@ -104,9 +104,33 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
+ 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
+ 		},
+ 		{
+-			name: "done without mr blocks reuse until cleanup",
++			// hq-z7j0: a done polecat with a clean tree, pushed, and no pending MR
++			// is a completed slot ready for reuse — NOT a recovery-blocked zombie.
++			name: "done clean is reusable, not recovery-blocked",
+ 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean},
+-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
++		},
++		{
++			// hq-z7j0: the live rust regression — PR merged (source bead terminal, so
++			// the gatherer omits ActiveMRBlocker), branch pushed, tree clean. Must be
++			// reusable, not NEEDS_RECOVERY holding a capacity slot.
++			name: "done with merged pr on preserved branch is reusable",
++			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/rust", ActiveMR: "gt-mr-merged", AssignedBeadTerminal: true, MQCheckRequired: true, MRSubmitted: true, HasSubmittableWork: true},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
++		},
++		{
++			// hq-z7j0: a done polecat that still has at-risk work (unpushed commits)
++			// is a genuine zombie and must still be recovery-blocked.
++			name: "done with unpushed commits still needs recovery",
++			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/rust", UnpushedCommits: 1},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_unpushed unpushed_commits=1"}},
++		},
++		{
++			// hq-z7j0: a done polecat whose hook was never cleared is incomplete and
++			// must still be recovery-blocked.
++			name: "done with hook still set still needs recovery",
++			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, HookBead: "gt-open"},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "hook-still-set", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"has work on hook (gt-open)"}},
+ 		},
+ 		{
+ 			name: "working counts as working capacity",
+-- 
+2.50.1 (Apple Git-155)
+

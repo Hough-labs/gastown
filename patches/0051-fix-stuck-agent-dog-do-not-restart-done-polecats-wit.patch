@@ -1,0 +1,257 @@
+From 0bd5f4cb235a8d4c9a780413a91aa32b411c5fc6 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sat, 18 Jul 2026 17:19:47 -0400
+Subject: [PATCH 51/56] fix(stuck-agent-dog): do not restart done polecats with
+ an open MR (hq-2eqe)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The stuck-agent-dog decided restart-eligibility from the HOOK bead status
+alone (open/hooked/in_progress -> restartable). A polecat that finished its
+work and submitted an MR then exits its session, but its work bead stays
+open until the MR merges — so the dog saw "dead session + open hook" and
+stormed RESTART_POLECAT every cycle across bravo/charlie/delta at healthy
+done-polecats (feryn/dust, feryn/guzzle), flooding the witness inbox and
+masking real signals. Restarting duplicates landed work and races the merge.
+
+Add polecat_completed_not_crashed: before flagging an agent-dead/session-dead
+polecat, consult the canonical recovery signal (gt polecat check-recovery):
+skip restart when the verdict is PENDING_MR or SAFE_TO_NUKE, OR when the
+polecat has an active_mr whose bead is still open (submitted work awaiting
+merge). This reconciles to stalled -> NEEDS_RECOVERY, which is why the open
+active_mr check is needed in addition to the verdict. A missing/unknown
+verdict and no open MR fall through to the existing hook-based logic, so
+genuine crashes still restart.
+
+Tests: PENDING_MR / SAFE_TO_NUKE skip restart; open active_mr with a
+NEEDS_RECOVERY verdict skips (the live storm shape); merged/closed active_mr
+and plain NEEDS_RECOVERY still restart.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/stuck-agent-dog/run.sh      | 72 ++++++++++++++++++++---
+ plugins/stuck-agent-dog/run_test.sh | 89 ++++++++++++++++++++++++++++-
+ 2 files changed, 152 insertions(+), 9 deletions(-)
+
+diff --git a/plugins/stuck-agent-dog/run.sh b/plugins/stuck-agent-dog/run.sh
+index 091479f6..f0e53451 100755
+--- a/plugins/stuck-agent-dog/run.sh
++++ b/plugins/stuck-agent-dog/run.sh
+@@ -136,6 +136,52 @@ bead_restartable() {
+   return 1
+ }
+ 
++# polecat_completed_not_crashed returns 0 (true) when the polecat has FINISHED its
++# work, so a dead session is expected rather than a crash:
++#   - PENDING_MR   : work done, MR submitted, waiting to merge (session exits after
++#                    `gt done`; the hook's work bead stays open until the MR merges).
++#   - SAFE_TO_NUKE : reusable/idle slot — nothing to resume.
++# Restarting such a polecat duplicates already-landed work and, for an open MR,
++# races the merge. The dog used to key ONLY on the hook bead status (still open
++# while the MR is pending), so it stormed RESTART_POLECAT at healthy done-polecats
++# (hq-2eqe). Reuse the canonical recovery verdict (DecideWorkstate) so the dog
++# inherits the same "done + open active_mr = healthy" rule as the rest of the
++# lifecycle, instead of re-deriving it from the hook alone. A missing/unknown
++# verdict falls through to the existing hook-based logic (fail toward the old
++# behavior, never toward a spurious restart-skip).
++polecat_completed_not_crashed() {
++  local rig="$1" pcat="$2" dir="" cr_json="" verdict="" active_mr="" mr_status=""
++
++  if ! dir=$(rig_workdir "$rig"); then
++    return 1
++  fi
++
++  cr_json=$( ( cd "$dir" 2>/dev/null && gt polecat check-recovery "$rig/$pcat" --json 2>/dev/null ) || true )
++  [ -n "$cr_json" ] || return 1
++
++  verdict=$(printf '%s' "$cr_json" | jq -r '.verdict // empty' 2>/dev/null || true)
++  case "$verdict" in
++    PENDING_MR|SAFE_TO_NUKE) return 0 ;;
++  esac
++
++  # A submitted MR that is still OPEN means the polecat finished its work and is
++  # waiting for the merge — the dead session is the expected post-`gt done` exit,
++  # not a crash. Its assigned work bead stays open until the MR merges, which is
++  # why the recovery verdict can read NEEDS_RECOVERY (reconciled to stalled) even
++  # though nothing is wrong: the "has open assigned bead + dead session = stalled"
++  # rule fires before the pending MR is considered. Restarting here duplicates
++  # landed work and races the merge, so treat an open active_mr as completed. (hq-2eqe)
++  active_mr=$(printf '%s' "$cr_json" | jq -r '.active_mr // empty' 2>/dev/null || true)
++  if [ -n "$active_mr" ]; then
++    mr_status=$(rig_bead_status "$rig" "$active_mr")
++    case "$mr_status" in
++      open|hooked|in_progress) return 0 ;;
++    esac
++  fi
++
++  return 1
++}
++
+ session_health_status() {
+   local session_name="$1"
+   local health_json=""
+@@ -196,10 +242,15 @@ while IFS='|' read -r RIG PREFIX; do
+         HEALTHY=$((HEALTHY + 1))
+         ;;
+       agent-dead|agent_dead)
+-        HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+-        if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+-          STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
+-          log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
++        if polecat_completed_not_crashed "$RIG" "$PCAT_NAME"; then
++          HEALTHY=$((HEALTHY + 1))
++          log "  SKIP $SESSION_NAME: completed work (MR pending or reusable) — dead runtime expected, not a crash"
++        else
++          HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
++          if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
++            STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
++            log "  ZOMBIE: $SESSION_NAME (agent runtime dead, hook=$HOOK_BEAD)"
++          fi
+         fi
+         ;;
+       agent-hung|agent_hung)
+@@ -209,10 +260,15 @@ while IFS='|' read -r RIG PREFIX; do
+         log "  OBSERVE: $SESSION_NAME runtime alive but inactive beyond $POLECAT_MAX_INACTIVITY; not restarting"
+         ;;
+       session-dead|session_dead)
+-        HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+-        if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+-          CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
+-          log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
++        if polecat_completed_not_crashed "$RIG" "$PCAT_NAME"; then
++          HEALTHY=$((HEALTHY + 1))
++          log "  SKIP $SESSION_NAME: completed work (MR pending or reusable) — dead session expected, not a crash"
++        else
++          HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
++          if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
++            CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
++            log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
++          fi
+         fi
+         ;;
+       *)
+diff --git a/plugins/stuck-agent-dog/run_test.sh b/plugins/stuck-agent-dog/run_test.sh
+index 95d4f013..20e1af81 100644
+--- a/plugins/stuck-agent-dog/run_test.sh
++++ b/plugins/stuck-agent-dog/run_test.sh
+@@ -94,6 +94,24 @@ case "${1:-}" in
+       exit 0
+     fi
+     ;;
++  polecat)
++    if [ "${2:-}" = "check-recovery" ]; then
++      target="${3:-}"
++      name="${target##*/}"
++      # Default to NEEDS_RECOVERY with no active_mr so a polecat without explicit
++      # state keeps the pre-existing hook-based restart behavior.
++      verdict="NEEDS_RECOVERY"
++      if [ -f "$TEST_STATE/verdict/$name" ]; then
++        verdict=$(tr -d '\n' < "$TEST_STATE/verdict/$name")
++      fi
++      active_mr=""
++      if [ -f "$TEST_STATE/active_mr/$name" ]; then
++        active_mr=$(tr -d '\n' < "$TEST_STATE/active_mr/$name")
++      fi
++      printf '{"verdict":"%s","active_mr":"%s"}\n' "$verdict" "$active_mr"
++      exit 0
++    fi
++    ;;
+   session)
+     if [ "${2:-}" = "health" ]; then
+       session="${3:-}"
+@@ -234,7 +252,7 @@ setup_case() {
+   export GT_TOWN_ROOT="$TEST_TMP/town"
+   local bin_dir="$TEST_TMP/bin"
+ 
+-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$bin_dir"
++  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
+   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
+   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
+   : > "$TEST_STATE/mail.log"
+@@ -324,6 +342,70 @@ test_closed_hook_skips_restart() {
+   assert_file_contains "$TEST_STATE/output.log" "bead closed" "closed hook: status checked"
+ }
+ 
++test_pending_mr_skips_restart() {
++  setup_case
++  add_polecat delta session-dead
++  printf 'PENDING_MR\n' > "$TEST_STATE/verdict/delta"
++  run_script
++
++  assert_file_empty "$TEST_STATE/kill.log" "pending MR: no session kill"
++  assert_file_empty "$TEST_STATE/mail.log" "pending MR: no restart mail"
++  assert_file_contains "$TEST_STATE/output.log" "completed work" "pending MR: recognized as completed, not crashed"
++  assert_file_contains "$TEST_STATE/output.log" "0 crashed, 0 stuck, 1 healthy" "pending MR: counted healthy"
++}
++
++test_safe_to_nuke_dead_agent_skips_restart() {
++  setup_case
++  add_polecat epsilon agent-dead
++  printf 'SAFE_TO_NUKE\n' > "$TEST_STATE/verdict/epsilon"
++  run_script
++
++  assert_file_empty "$TEST_STATE/kill.log" "safe-to-nuke: no session kill"
++  assert_file_empty "$TEST_STATE/mail.log" "safe-to-nuke: no restart mail"
++  assert_file_contains "$TEST_STATE/output.log" "completed work" "safe-to-nuke: recognized as completed"
++}
++
++test_needs_recovery_still_restarts() {
++  setup_case
++  add_polecat zeta session-dead
++  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/zeta"
++  run_script
++
++  assert_line_count "$TEST_STATE/mail.log" 1 "needs-recovery: still restarts genuine crash"
++  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/zeta" "needs-recovery: restart requested"
++}
++
++# The live storm shape (hq-2eqe): the polecat submitted an MR that is still open,
++# but its work bead stays open so the recovery verdict reads NEEDS_RECOVERY
++# (reconciled to stalled). The open active_mr must still be recognized as
++# completed-and-awaiting-merge, NOT a crash.
++test_open_active_mr_skips_restart() {
++  setup_case
++  add_polecat theta session-dead
++  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/theta"
++  printf 'mr-theta\n' > "$TEST_STATE/active_mr/theta"
++  # mr-theta bead status defaults to "open" in the fake bd (pending merge).
++  run_script
++
++  assert_file_empty "$TEST_STATE/kill.log" "open active_mr: no session kill"
++  assert_file_empty "$TEST_STATE/mail.log" "open active_mr: no restart mail (submitted, awaiting merge)"
++  assert_file_contains "$TEST_STATE/output.log" "completed work" "open active_mr: recognized as completed"
++}
++
++# A merged/closed active_mr is no longer pending, so it must NOT suppress a genuine
++# restart — the open-MR skip is scoped to work still awaiting merge.
++test_merged_active_mr_does_not_skip() {
++  setup_case
++  add_polecat kappa session-dead
++  printf 'NEEDS_RECOVERY\n' > "$TEST_STATE/verdict/kappa"
++  printf 'mr-kappa\n' > "$TEST_STATE/active_mr/kappa"
++  printf 'closed\n' > "$TEST_STATE/status/mr-kappa"
++  run_script
++
++  assert_line_count "$TEST_STATE/mail.log" 1 "merged active_mr: still restarts (MR no longer pending)"
++  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/kappa" "merged active_mr: restart requested"
++}
++
+ test_mass_death_skips_actions() {
+   setup_case
+   add_polecat alpha agent-dead
+@@ -345,6 +427,11 @@ test_long_research_active_pane
+ test_dead_agent_restarts_one
+ test_dead_session_restarts_one
+ test_closed_hook_skips_restart
++test_pending_mr_skips_restart
++test_safe_to_nuke_dead_agent_skips_restart
++test_needs_recovery_still_restarts
++test_open_active_mr_skips_restart
++test_merged_active_mr_does_not_skip
+ test_mass_death_skips_actions
+ 
+ printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+-- 
+2.50.1 (Apple Git-155)
+

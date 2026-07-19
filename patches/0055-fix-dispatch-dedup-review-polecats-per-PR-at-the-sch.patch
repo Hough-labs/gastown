@@ -1,0 +1,173 @@
+From 22a6bdd390985545faf62c46529c2767d58e8d01 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 16:56:02 -0400
+Subject: [PATCH 55/56] fix(dispatch): dedup review polecats per-PR at the
+ schedule chokepoint (gfork-uf2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review dispatches (mol-polecat-review-pr) carry a pr_url formula var, but
+scheduleBead's idempotency check is keyed on the WORK bead ID. Each review
+of a PR gets a fresh work bead, so two reviews of the same PR both pass the
+guard and spawn duplicate reviewers — the per-PR analogue of the gfork-dk6
+re-dispatch race.
+
+Consume the pr_url that hq-6wd2 already surfaces: after the work-bead
+idempotency check, also no-op the dispatch when an open sling context in the
+rig already targets the same pr_url (excluding the bead's own context).
+Query failures fail OPEN, degrading to work-bead idempotency. Pure matcher
+matchOpenReviewContext + extractSlingVar are unit-tested.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/sling_schedule.go      | 63 +++++++++++++++++++++++++++++
+ internal/cmd/sling_schedule_test.go | 48 ++++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/internal/cmd/sling_schedule.go b/internal/cmd/sling_schedule.go
+index f4b99994..58b74479 100644
+--- a/internal/cmd/sling_schedule.go
++++ b/internal/cmd/sling_schedule.go
+@@ -114,6 +114,22 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
+ 		return nil
+ 	}
+ 
++	// gfork-uf2: per-PR review dedup. Review dispatches (mol-polecat-review-pr)
++	// carry a pr_url formula var. The idempotency check above is keyed on the
++	// WORK bead ID, but each review of a PR gets a fresh work bead — so two
++	// reviews of the same PR slip past it and spawn duplicate reviewers. Also
++	// dedup on pr_url: if an open sling context already targets this pr_url,
++	// no-op. (hq-6wd2 surfaces pr_url on polecats; this consumes it at the
++	// dispatch chokepoint.) A query error fails OPEN — dispatch degrades to the
++	// work-bead idempotency above rather than blocking.
++	if prURL := extractSlingVar(opts.Vars, "pr_url"); prURL != "" {
++		if ctxID := findOpenReviewContextForPR(rigBeads, beadID, prURL); ctxID != "" {
++			fmt.Printf("%s PR %s is already under review (context: %s), no-op\n",
++				style.Dim.Render("○"), prURL, ctxID)
++			return nil
++		}
++	}
++
+ 	// Guard against scheduling closed/tombstone beads (defense-in-depth, hq-ki2).
+ 	// Mirrors the closed-bead guards in runSling (sling.go) and executeSling
+ 	// (sling_dispatch.go). The daemon's stranded scan can route closed cross-prefix
+@@ -413,6 +429,53 @@ var schedulerTaskOnlyFlagNames = []string{
+ 	"merge", "base-branch", "no-convoy", "owned", "no-merge", "review-only",
+ }
+ 
++// extractSlingVar returns the value of key from a []string of "key=value"
++// formula vars (gt sling --var), or "" if absent.
++func extractSlingVar(vars []string, key string) string {
++	for _, v := range vars {
++		if k, val, ok := strings.Cut(v, "="); ok && k == key {
++			return val
++		}
++	}
++	return ""
++}
++
++// findOpenReviewContextForPR returns the ID of an open sling context (other than
++// the one for excludeBeadID) whose pr_url formula var equals prURL, or "" if
++// none — the per-PR review dedup for gfork-uf2. Query failures return "" so
++// dispatch fails open.
++func findOpenReviewContextForPR(rigBeads *beads.Beads, excludeBeadID, prURL string) string {
++	if prURL == "" {
++		return ""
++	}
++	contexts, err := rigBeads.ListOpenSlingContexts()
++	if err != nil {
++		return ""
++	}
++	return matchOpenReviewContext(contexts, excludeBeadID, prURL)
++}
++
++// matchOpenReviewContext is the pure per-PR dedup matcher: it returns the ID of
++// the first context (other than excludeBeadID's) whose pr_url var equals prURL.
++func matchOpenReviewContext(contexts []*beads.Issue, excludeBeadID, prURL string) string {
++	if prURL == "" {
++		return ""
++	}
++	for _, ctx := range contexts {
++		if ctx == nil {
++			continue
++		}
++		f := beads.ParseSlingContextFields(ctx.Description)
++		if f == nil || f.WorkBeadID == excludeBeadID {
++			continue
++		}
++		if extractFormulaVar(f.Vars, "pr_url") == prURL {
++			return ctx.ID
++		}
++	}
++	return ""
++}
++
+ // validateNoTaskOnlySchedulerFlags checks that no task-only flags were set.
+ func validateNoTaskOnlySchedulerFlags(cmd *cobra.Command, mode string) error {
+ 	var used []string
+diff --git a/internal/cmd/sling_schedule_test.go b/internal/cmd/sling_schedule_test.go
+index 43bf3e3f..7f040499 100644
+--- a/internal/cmd/sling_schedule_test.go
++++ b/internal/cmd/sling_schedule_test.go
+@@ -5,9 +5,57 @@ import (
+ 	"path/filepath"
+ 	"testing"
+ 
++	"github.com/steveyegge/gastown/internal/beads"
++	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+ 	"github.com/steveyegge/gastown/internal/wisp"
+ )
+ 
++func reviewCtxIssue(id, workBead, vars string) *beads.Issue {
++	desc := beads.FormatSlingContextDescription(&capacity.SlingContextFields{
++		WorkBeadID: workBead,
++		Vars:       vars,
++	})
++	return &beads.Issue{ID: id, Description: desc}
++}
++
++func TestExtractSlingVar(t *testing.T) {
++	vars := []string{"base_branch=main", "pr_url=https://x/pull/238", "account=a"}
++	if got := extractSlingVar(vars, "pr_url"); got != "https://x/pull/238" {
++		t.Fatalf("pr_url = %q", got)
++	}
++	if got := extractSlingVar(vars, "missing"); got != "" {
++		t.Fatalf("missing var = %q, want empty", got)
++	}
++	if got := extractSlingVar(nil, "pr_url"); got != "" {
++		t.Fatalf("nil vars = %q, want empty", got)
++	}
++}
++
++func TestMatchOpenReviewContext(t *testing.T) {
++	pr := "https://github.com/x/y/pull/238"
++	ctxs := []*beads.Issue{
++		reviewCtxIssue("ctx-a", "gt-work-a", "pr_url="+pr),
++		reviewCtxIssue("ctx-b", "gt-work-b", "pr_url=https://github.com/x/y/pull/999"),
++	}
++
++	// A different work bead reviewing the same PR is a duplicate → matched.
++	if got := matchOpenReviewContext(ctxs, "gt-work-new", pr); got != "ctx-a" {
++		t.Fatalf("duplicate PR review = %q, want ctx-a", got)
++	}
++	// The bead's own context must not count as a duplicate of itself.
++	if got := matchOpenReviewContext(ctxs, "gt-work-a", pr); got != "" {
++		t.Fatalf("self context = %q, want empty (excluded)", got)
++	}
++	// No open review for this PR → no match.
++	if got := matchOpenReviewContext(ctxs, "gt-work-new", "https://github.com/x/y/pull/1"); got != "" {
++		t.Fatalf("unmatched PR = %q, want empty", got)
++	}
++	// Empty pr_url never matches.
++	if got := matchOpenReviewContext(ctxs, "gt-work-new", ""); got != "" {
++		t.Fatalf("empty prURL = %q, want empty", got)
++	}
++}
++
+ // TestAreScheduledFailClosed verifies that areScheduled fails closed when
+ // running outside a town root — all requested IDs should be treated as scheduled.
+ // This prevents false stranded detection and duplicate scheduling on transient errors.
+-- 
+2.50.1 (Apple Git-155)
+

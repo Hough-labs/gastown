@@ -1,0 +1,189 @@
+From acd167500e7ae628aa7b17799be046c2bb67b40a Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sat, 18 Jul 2026 17:07:47 -0400
+Subject: [PATCH 50/56] fix(polecat): re-provision nuked polecats instead of
+ stranding them as free capacity (hq-c899)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hq-fqap made nuked polecats (identity kept, worktree removed) count as
+reusable/free capacity. But the allocator could not actually use them:
+FindIdlePolecat now returns them, ReuseIdlePolecat then fails closed on
+its worktree stat, and reclaimBrokenIdlePolecatForSling refuses to reclaim
+them (agent_state=nuked guard protects the CV chain) -> the slot fell
+through to a fresh spawn under a NEW name, losing the identity, and every
+sling cycle logged "not safe to reclaim: agent_state=nuked".
+
+Add Manager.ReuseOrRepairIdlePolecat: a lock-free dispatcher that stats
+the worktree and routes to fast branch-only reuse when it exists, or to
+RepairWorktreeWithOptions (re-provision in place, force=true) when it is
+structurally missing. A nuked polecat is thus reactivated under its own
+identity/CV chain instead of stranded. The check is lock-free so it does
+not nest the per-polecat lock the delegates take.
+
+SpawnPolecatForSling now calls ReuseOrRepairIdlePolecat, and
+reclaimBrokenIdlePolecatForSling skips reusable (nuked) polecats — leaving
+them for the repair path — so only genuinely non-reusable broken polecats
+are removed for a fresh spawn. This also silences the per-cycle reclaim
+warning storm.
+
+Tests: ReuseOrRepairIdlePolecat re-provisions a missing worktree preserving
+identity + working state; healthy worktree takes branch-only reuse without
+moving the clone.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/polecat_spawn.go    | 18 ++++++++--
+ internal/polecat/manager.go      | 26 +++++++++++++++
+ internal/polecat/manager_test.go | 57 ++++++++++++++++++++++++++++++++
+ 3 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/internal/cmd/polecat_spawn.go b/internal/cmd/polecat_spawn.go
+index 3c701c34..76bd9035 100644
+--- a/internal/cmd/polecat_spawn.go
++++ b/internal/cmd/polecat_spawn.go
+@@ -84,6 +84,16 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
+ 			continue
+ 		}
+ 
++		// A reusable idle polecat with a structurally-missing worktree is a cleanly
++		// nuked polecat whose identity/CV chain is intact. Leave it for the
++		// reuse/repair path (ReuseOrRepairIdlePolecat), which re-provisions its
++		// worktree in place — do NOT reclaim(remove) it and destroy its identity.
++		// Only genuinely non-reusable broken polecats are removed here so a fresh
++		// one can take the slot. (hq-c899)
++		if polecatMgr.ReuseDecisionForPolecat(candidate.Name, candidate.State).Reusable {
++			continue
++		}
++
+ 		fmt.Printf("  Reclaiming broken idle polecat %s before allocation: %v\n", candidate.Name, verifyErr)
+ 		if err := polecatMgr.ReclaimBrokenIdlePolecat(candidate.Name); err != nil {
+ 			fmt.Printf("  Broken idle polecat %s was not safe to reclaim: %v\n", candidate.Name, err)
+@@ -225,12 +235,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
+ 			BaseBranch:   baseBranch,
+ 			ResumeBranch: opts.ResumeBranch,
+ 		}
++		// ReuseOrRepairIdlePolecat fast-paths a healthy worktree (branch-only reuse)
++		// and re-provisions a missing one in place (a cleanly nuked polecat), so a
++		// nuked-but-reusable slot is reactivated under its own identity instead of
++		// stranded. (hq-c899)
+ 		reuseOK := false
+-		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
++		if _, err := polecatMgr.ReuseOrRepairIdlePolecat(polecatName, addOpts); err != nil {
+ 			if errors.Is(err, polecat.ErrPolecatNeedsRecovery) {
+ 				fmt.Printf("  Idle polecat %s needs recovery before reuse: %v; allocating new...\n", polecatName, err)
+ 			} else {
+-				fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
++				fmt.Printf("  Reuse/repair failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
+ 			}
+ 		} else {
+ 			reuseOK = true
+diff --git a/internal/polecat/manager.go b/internal/polecat/manager.go
+index ed8a5091..b25686af 100644
+--- a/internal/polecat/manager.go
++++ b/internal/polecat/manager.go
+@@ -1945,6 +1945,32 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
+ 	}, nil
+ }
+ 
++// ReuseOrRepairIdlePolecat prepares an idle polecat for new work, choosing the
++// cheapest safe path:
++//
++//   - Worktree present  -> ReuseIdlePolecat (fast, branch-only, no worktree churn).
++//   - Worktree missing   -> RepairWorktreeWithOptions (re-provision in place).
++//
++// A cleanly nuked polecat keeps its identity and CV chain but its worktree/sandbox
++// is removed. Such a polecat is reusable capacity (hq-fqap), but branch-only reuse
++// cannot operate on a missing worktree — ReuseIdlePolecat fails closed on the stat
++// check and the caller would otherwise strand the slot and spawn a fresh identity.
++// Re-provisioning the worktree in place reactivates the persistent identity instead
++// of leaking it. (hq-c899)
++//
++// The worktree check is intentionally lock-free: each delegate acquires the
++// per-polecat lock itself, so calling one of them here does not nest locks. Both
++// delegates re-validate under the lock, so a lost race only downgrades to the other
++// path's own error handling.
++func (m *Manager) ReuseOrRepairIdlePolecat(name string, opts AddOptions) (*Polecat, error) {
++	if err := VerifyWorktreeExists(m.clonePath(name)); IsStructuralWorktreeError(err) {
++		// force=true: a structurally-missing worktree holds no uncommitted work to
++		// guard, and the reuse gate upstream already proved the polecat is reusable.
++		return m.RepairWorktreeWithOptions(name, true, opts)
++	}
++	return m.ReuseIdlePolecat(name, opts)
++}
++
+ // killExistingPolecatSession clears an existing tmux session before reusing or
+ // repairing its worktree. The next SessionManager.Start call will create a fresh
+ // session with the current hook and startup prompt.
+diff --git a/internal/polecat/manager_test.go b/internal/polecat/manager_test.go
+index f5104917..dd27cc4b 100644
+--- a/internal/polecat/manager_test.go
++++ b/internal/polecat/manager_test.go
+@@ -1577,6 +1577,63 @@ func TestReuseIdlePolecat_RunsSetupCommand(t *testing.T) {
+ 	}
+ }
+ 
++// hq-c899: a cleanly nuked polecat keeps its identity but its worktree is removed.
++// ReuseOrRepairIdlePolecat must re-provision the worktree in place (preserving the
++// name/CV chain) rather than failing closed and stranding the slot.
++func TestReuseOrRepairIdlePolecat_ReprovisionsMissingWorktree(t *testing.T) {
++	mgr, _ := setupCanonicalBranchManagerTest(t)
++
++	p, err := mgr.AddWithOptions("toast", AddOptions{})
++	if err != nil {
++		t.Fatalf("AddWithOptions: %v", err)
++	}
++
++	// Simulate a nuked polecat: identity (agent bead) persists, worktree removed.
++	repoGit, err := mgr.repoBase()
++	if err != nil {
++		t.Fatalf("repoBase: %v", err)
++	}
++	_ = repoGit.WorktreeRemove(p.ClonePath, true)
++	_ = os.RemoveAll(p.ClonePath)
++	if err := VerifyWorktreeExists(mgr.clonePath("toast")); !IsStructuralWorktreeError(err) {
++		t.Fatalf("precondition: expected structural worktree error, got %v", err)
++	}
++
++	reused, err := mgr.ReuseOrRepairIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
++	if err != nil {
++		t.Fatalf("ReuseOrRepairIdlePolecat: %v", err)
++	}
++	if reused.Name != "toast" {
++		t.Fatalf("identity not preserved: reused name = %q, want toast", reused.Name)
++	}
++	if err := VerifyWorktreeExists(reused.ClonePath); err != nil {
++		t.Fatalf("worktree was not re-provisioned in place: %v", err)
++	}
++	if reused.State != StateWorking {
++		t.Fatalf("reused state = %q, want %q", reused.State, StateWorking)
++	}
++}
++
++// hq-c899: when the worktree is healthy, ReuseOrRepairIdlePolecat must take the fast
++// branch-only reuse path (no worktree churn), keeping the same clone path.
++func TestReuseOrRepairIdlePolecat_HealthyWorktreeReuses(t *testing.T) {
++	mgr, _ := setupCanonicalBranchManagerTest(t)
++
++	p, err := mgr.AddWithOptions("toast", AddOptions{})
++	if err != nil {
++		t.Fatalf("AddWithOptions: %v", err)
++	}
++	_ = git.NewGit(p.ClonePath).CleanForce()
++
++	reused, err := mgr.ReuseOrRepairIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
++	if err != nil {
++		t.Fatalf("ReuseOrRepairIdlePolecat: %v", err)
++	}
++	if reused.ClonePath != p.ClonePath {
++		t.Fatalf("reuse clone path = %q, want %q (branch-only reuse should not move the worktree)", reused.ClonePath, p.ClonePath)
++	}
++}
++
+ func TestReuseIdlePolecat_SetupCommandFailureCleansWorktree(t *testing.T) {
+ 	mgr, _ := setupCanonicalBranchManagerTest(t)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

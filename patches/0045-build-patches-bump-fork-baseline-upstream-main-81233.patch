@@ -1,0 +1,47 @@
+From d57497cd2d0b7c642368d8105ecdaa254e2974f2 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 16:03:50 -0400
+Subject: [PATCH 45/56] build(patches): bump fork baseline upstream/main
+ 81233d36 -> 5ffa55a2
+
+Picks up 24 upstream fixes (Jul 9 -> Jul 17) that supersede local
+whack-a-mole patches: #4520 scheduler authoritative dispatch plan,
+#4510 sling routed Beads authority, 0b0259ff done route source validation,
+#4490 scheduler queued context readiness, #4491 polecat stale-heartbeat
+liveness, #4488 underscored bead prefixes. Still beads v1.0.5 (no regression).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .githooks/pre-push | 2 +-
+ Makefile           | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index 276de4e2..5b604576 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -9,7 +9,7 @@
+ # ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
+ # Baseline this fork tracks (an upstream/main SHA — no tag exists past v1.2.1).
+ # Keep in sync with UPSTREAM_BASE in the Makefile; bump both on every upstream upgrade.
+-UPSTREAM_BASE="81233d36f27465fcae83944f78bdea1674d7143e"
++UPSTREAM_BASE="5ffa55a2bc03fa1110ea0b1495bfa26bbe6b66f3"
+ BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+ if [ "$BRANCH_NAME" = "anvil" ]; then
+     PATCH_TMPDIR=$(mktemp -d)
+diff --git a/Makefile b/Makefile
+index 6df32caf..16d80699 100644
+--- a/Makefile
++++ b/Makefile
+@@ -195,7 +195,7 @@ check-version-tag:
+ # it to pick up the beads v1.0.5 dependency-schema migration). Bump this on every
+ # upstream upgrade (and the matching ref in .githooks/pre-push), then rebase
+ # patches onto it. The SHA must be fetched/reachable for `make patches`.
+-UPSTREAM_BASE := 81233d36f27465fcae83944f78bdea1674d7143e
++UPSTREAM_BASE := 5ffa55a2bc03fa1110ea0b1495bfa26bbe6b66f3
+ 
+ # Export current local commits (UPSTREAM_BASE..HEAD divergence) to patches/.
+ # Run this after adding or editing a local patch commit.
+-- 
+2.50.1 (Apple Git-155)
+

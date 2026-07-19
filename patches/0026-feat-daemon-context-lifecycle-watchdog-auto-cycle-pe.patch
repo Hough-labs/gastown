@@ -1,0 +1,1843 @@
+From 03c9f668e1a16d1a3990bdb108cb190edbdd960d Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 4 Jul 2026 13:39:35 -0400
+Subject: [PATCH 26/56] =?UTF-8?q?feat(daemon):=20context-lifecycle=20watch?=
+ =?UTF-8?q?dog=20=E2=80=94=20auto-cycle=20persistent=20agents=20before=20c?=
+ =?UTF-8?q?ontext=20RED?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gfork-47p.2: new daemon heartbeat step (checkContextPressure) that snapshots each persistent agent's (witness/refinery/deacon) current context from its Claude Code JSONL and, at a YELLOW threshold, nudges 'gt handoff --cycle'; at RED (idle + crash-loop/backoff/usage-limit guards clear) force-cycles via executeLifecycleAction. Token accounting is a SNAPSHOT of the newest main-chain non-sidechain assistant usage event (input+output+cache_read+cache_creation), never a sum (cache_read grows monotonically). New internal/agentlog/context.go (ProjectDirFor + CurrentContextTokens) resolves each role's own CLAUDE_CONFIG_DIR; DaemonThresholds config + operational.go accessors clamp red>yellow and floor yellow. F2: handoff --cycle fresh-starts patrol roles (ContinueSession = !isPatrolRole), bridged through ExtractSimpleRole for the compound GT_ROLE.
+
+Validated this session: gofumpt/vet/build green; agentlog/config/daemon/cmd test-race green (forced, no cache). Hermetic golden-number fixtures prove snapshot-not-sum. E2E/hammer soak pending (lead gate).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/agentlog/claudecode.go          |  28 +-
+ internal/agentlog/context.go             | 147 ++++++++
+ internal/agentlog/context_test.go        | 211 +++++++++++
+ internal/cmd/handoff.go                  |  49 ++-
+ internal/cmd/handoff_test.go             | 110 ++++--
+ internal/config/operational.go           | 124 +++++--
+ internal/config/types.go                 |  26 ++
+ internal/daemon/context_watchdog.go      | 270 ++++++++++++++
+ internal/daemon/context_watchdog_test.go | 441 +++++++++++++++++++++++
+ internal/daemon/daemon.go                |  27 +-
+ 10 files changed, 1333 insertions(+), 100 deletions(-)
+ create mode 100644 internal/agentlog/context.go
+ create mode 100644 internal/agentlog/context_test.go
+ create mode 100644 internal/daemon/context_watchdog.go
+ create mode 100644 internal/daemon/context_watchdog_test.go
+
+diff --git a/internal/agentlog/claudecode.go b/internal/agentlog/claudecode.go
+index ccdb4228..eafc59a7 100644
+--- a/internal/agentlog/claudecode.go
++++ b/internal/agentlog/claudecode.go
+@@ -94,29 +94,23 @@ func (a *ClaudeCodeAdapter) Watch(ctx context.Context, sessionID, workDir string
+ 	return ch, nil
+ }
+ 
+-// claudeProjectDirFor returns the Claude Code project directory for workDir.
+-// Formula: $HOME/.claude/projects/<hash> where hash = workDir with '/' → '-'.
+-// On Windows, backslashes are converted to forward slashes and the drive
+-// letter (e.g. "C:") is stripped before hashing, matching Claude Code's
++// claudeProjectDirFor returns the Claude Code project directory for workDir
++// under the default CLAUDE_CONFIG_DIR ($HOME/.claude). Formula:
++// $HOME/.claude/projects/<hash> where hash = workDir with '/' → '-'. On
++// Windows, backslashes are converted to forward slashes and the drive letter
++// (e.g. "C:") is stripped before hashing, matching Claude Code's
+ // cross-platform behavior.
++//
++// Delegates to ProjectDirFor, which also accepts a non-default config dir —
++// every Gas Town role other than a bare user session runs Claude Code under
++// its own CLAUDE_CONFIG_DIR, so the context watchdog (gfork-47p.2) resolves
++// per-role project dirs via ProjectDirFor directly instead of this function.
+ func claudeProjectDirFor(workDir string) (string, error) {
+-	abs, err := filepath.Abs(workDir)
+-	if err != nil {
+-		return "", fmt.Errorf("resolving absolute path: %w", err)
+-	}
+-	// Normalize to forward slashes (no-op on Unix).
+-	normalized := filepath.ToSlash(abs)
+-	// Strip Windows drive letter prefix (e.g. "C:") so the hash matches
+-	// what Claude Code stores on Windows (hash starts with '-', not 'C:').
+-	if len(normalized) >= 2 && normalized[1] == ':' {
+-		normalized = normalized[2:]
+-	}
+-	hash := strings.ReplaceAll(normalized, "/", "-")
+ 	home, err := os.UserHomeDir()
+ 	if err != nil {
+ 		return "", fmt.Errorf("getting home dir: %w", err)
+ 	}
+-	return filepath.Join(home, claudeProjectsDir, hash), nil
++	return ProjectDirFor(filepath.Join(home, ".claude"), workDir)
+ }
+ 
+ // waitForNewestJSONL polls projectDir until a qualifying .jsonl file appears.
+diff --git a/internal/agentlog/context.go b/internal/agentlog/context.go
+new file mode 100644
+index 00000000..34dabd93
+--- /dev/null
++++ b/internal/agentlog/context.go
+@@ -0,0 +1,147 @@
++package agentlog
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// contextReadWindow bounds how many trailing bytes of a session's newest
++// JSONL file CurrentContextTokens reads to find the most recent usage
++// snapshot — one seek + one bounded read per agent per heartbeat tick, not a
++// full-file scan. Var (not const) so tests can shrink it to exercise the
++// mid-file seek path without constructing multi-hundred-KB fixtures.
++var contextReadWindow int64 = 256 * 1024
++
++// contextEntry is the subset of a Claude Code JSONL line needed to find the
++// newest main-chain assistant usage snapshot. Distinct from ccEntry in
++// claudecode.go: this needs IsSidechain, which ccEntry does not carry
++// (parseClaudeCodeLine has no need to distinguish sidechain turns).
++type contextEntry struct {
++	Type        string     `json:"type"`
++	IsSidechain bool       `json:"isSidechain"`
++	Message     *ccMessage `json:"message,omitempty"`
++}
++
++// ProjectDirFor returns the Claude Code project directory for workDir under
++// the given Claude config directory: <configDir>/projects/<hash>, where hash
++// is the absolute workDir with '/' replaced by '-' (matching Claude Code's
++// own scheme; see claudeProjectDirFor for the Windows drive-letter handling
++// this shares).
++//
++// configDir defaults to "$HOME/.claude" when empty — Claude Code's own
++// default CLAUDE_CONFIG_DIR. Every Gas Town role runs Claude Code under its
++// own config dir (deacon -> ~/.claude-deacon, witness -> ~/.claude-witness,
++// ...), so callers monitoring a specific role's session must pass that
++// role's resolved CLAUDE_CONFIG_DIR rather than relying on the default.
++func ProjectDirFor(configDir, workDir string) (string, error) {
++	if configDir == "" {
++		home, err := os.UserHomeDir()
++		if err != nil {
++			return "", fmt.Errorf("getting home dir: %w", err)
++		}
++		configDir = filepath.Join(home, ".claude")
++	}
++
++	abs, err := filepath.Abs(workDir)
++	if err != nil {
++		return "", fmt.Errorf("resolving absolute path: %w", err)
++	}
++	// Normalize to forward slashes and strip a Windows drive letter, matching
++	// claudeProjectDirFor's cross-platform handling.
++	normalized := filepath.ToSlash(abs)
++	if len(normalized) >= 2 && normalized[1] == ':' {
++		normalized = normalized[2:]
++	}
++	hash := strings.ReplaceAll(normalized, "/", "-")
++	return filepath.Join(configDir, "projects", hash), nil
++}
++
++// CurrentContextTokens returns a SNAPSHOT of the current context size for
++// the Claude Code session in projectDir: the token accounting
++// (input + output + cache_read + cache_creation) of the newest main-chain
++// (non-sidechain) assistant turn's usage block.
++//
++// This is deliberately a snapshot, not a running sum. cache_read_input_tokens
++// grows monotonically because every turn re-reads the entire conversation
++// cache — the newest usage event already reflects the full current context,
++// so summing across events wildly overcounts. Two corrections on top of the
++// raw JSONL:
++//  1. Claude Code writes one JSONL line per content block; a turn with
++//     multiple content blocks duplicates the same usage object across those
++//     lines. Harmless here since we take the newest matching line, not a
++//     sum — but fatal to a naive per-line sum.
++//  2. Task-tool subagents append "isSidechain":true entries to the same
++//     file. These must be skipped, or a subagent turn's (usually much
++//     smaller) usage masks the parent session's real context size.
++//
++// since filters to the newest *.jsonl file modified at or after since — pass
++// the owning tmux session's creation time so a stale pre-respawn file is
++// never read; after a respawn, the newest file self-corrects to the fresh
++// session's small context.
++//
++// Returns an error if no qualifying file exists or no matching usage event
++// is found. Callers should skip the tick on error, not treat it as zero —
++// zero would misreport an unreadable session as safely under threshold.
++func CurrentContextTokens(projectDir string, since time.Time) (int, error) {
++	path, ok := newestJSONLIn(projectDir, since)
++	if !ok {
++		return 0, fmt.Errorf("no JSONL file in %s modified since %s", projectDir, since)
++	}
++
++	f, err := os.Open(path)
++	if err != nil {
++		return 0, fmt.Errorf("opening %s: %w", path, err)
++	}
++	defer f.Close()
++
++	info, err := f.Stat()
++	if err != nil {
++		return 0, fmt.Errorf("stat %s: %w", path, err)
++	}
++
++	var offset int64
++	if info.Size() > contextReadWindow {
++		offset = info.Size() - contextReadWindow
++	}
++	if _, err := f.Seek(offset, io.SeekStart); err != nil {
++		return 0, fmt.Errorf("seeking %s: %w", path, err)
++	}
++	data, err := io.ReadAll(f)
++	if err != nil {
++		return 0, fmt.Errorf("reading %s: %w", path, err)
++	}
++
++	lines := strings.Split(string(data), "\n")
++	if offset > 0 && len(lines) > 0 {
++		// The read window started mid-file, so the first line is a
++		// fragment (we seeked into the middle of it) — discard it.
++		lines = lines[1:]
++	}
++
++	// Scan backward: the newest matching entry IS the current context — see
++	// the snapshot-not-sum rationale above. A parse failure (e.g. the final
++	// line was mid-write when we read it) or a non-matching entry (wrong
++	// type, sidechain, no usage) just falls through to the next older line.
++	for i := len(lines) - 1; i >= 0; i-- {
++		line := strings.TrimSpace(lines[i])
++		if line == "" {
++			continue
++		}
++		var entry contextEntry
++		if err := json.Unmarshal([]byte(line), &entry); err != nil {
++			continue
++		}
++		if entry.Type != "assistant" || entry.IsSidechain || entry.Message == nil || entry.Message.Usage == nil {
++			continue
++		}
++		u := entry.Message.Usage
++		return u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens, nil
++	}
++
++	return 0, fmt.Errorf("no main-chain assistant usage event found in %s", path)
++}
+diff --git a/internal/agentlog/context_test.go b/internal/agentlog/context_test.go
+new file mode 100644
+index 00000000..8ff82c91
+--- /dev/null
++++ b/internal/agentlog/context_test.go
+@@ -0,0 +1,211 @@
++package agentlog
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestProjectDirFor(t *testing.T) {
++	tests := []struct {
++		name      string
++		configDir string
++		workDir   string
++	}{
++		{"explicit config dir", "/home/x/.claude-witness", "/Users/pa/gt/rig"},
++		{"empty config dir falls back to $HOME/.claude", "", "/some/work/dir"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := ProjectDirFor(tt.configDir, tt.workDir)
++			if err != nil {
++				t.Fatalf("ProjectDirFor: %v", err)
++			}
++			configDir := tt.configDir
++			if configDir == "" {
++				home, err := os.UserHomeDir()
++				if err != nil {
++					t.Fatalf("getting home dir: %v", err)
++				}
++				configDir = filepath.Join(home, ".claude")
++			}
++			abs, _ := filepath.Abs(tt.workDir)
++			hash := strings.ReplaceAll(filepath.ToSlash(abs), "/", "-")
++			want := filepath.Join(configDir, "projects", hash)
++			if got != want {
++				t.Errorf("ProjectDirFor(%q, %q) = %q, want %q", tt.configDir, tt.workDir, got, want)
++			}
++		})
++	}
++}
++
++// ccUsageLine builds one assistant JSONL entry with the given usage fields.
++// mtime is not set here — writeJSONLFixture controls file mtime separately.
++func ccUsageLine(isSidechain bool, input, output, cacheRead, cacheCreation int) string {
++	return fmt.Sprintf(
++		`{"type":"assistant","isSidechain":%t,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":%d,"output_tokens":%d,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}}`,
++		isSidechain, input, output, cacheRead, cacheCreation,
++	)
++}
++
++// writeJSONLFixture writes lines (already-serialized JSONL, newline-joined)
++// to <dir>/<name>.jsonl and sets its mtime, returning the file path.
++func writeJSONLFixture(t *testing.T, dir, name string, lines []string, mtime time.Time) string {
++	t.Helper()
++	path := filepath.Join(dir, name+".jsonl")
++	content := strings.Join(lines, "\n") + "\n"
++	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
++		t.Fatalf("write fixture %s: %v", path, err)
++	}
++	if err := os.Chtimes(path, mtime, mtime); err != nil {
++		t.Fatalf("chtimes %s: %v", path, err)
++	}
++	return path
++}
++
++func TestCurrentContextTokens(t *testing.T) {
++	sessionStart := time.Now().Add(-time.Hour)
++
++	t.Run("duplicated usage rows: snapshot not sum", func(t *testing.T) {
++		dir := t.TempDir()
++		// Same turn's content blocks each write a duplicate usage object;
++		// the golden answer is that ONE turn's total, not 3x it.
++		lines := []string{
++			ccUsageLine(false, 10, 50, 20000, 5000),
++			ccUsageLine(false, 10, 50, 20000, 5000),
++			ccUsageLine(false, 10, 50, 20000, 5000),
++		}
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 10 + 50 + 20000 + 5000 // one turn's usage, NOT summed across the 3 duplicate lines
++		if got != want {
++			t.Errorf("got %d, want %d (must be snapshot of newest turn, not sum across duplicate lines)", got, want)
++		}
++	})
++
++	t.Run("sidechain skip: subagent turn must not mask parent context", func(t *testing.T) {
++		dir := t.TempDir()
++		lines := []string{
++			ccUsageLine(false, 10, 50, 130000, 5000), // parent's real context — the golden answer
++			ccUsageLine(true, 5, 20, 2000, 500),      // Task-tool subagent sidechain, appended after
++		}
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 10 + 50 + 130000 + 5000
++		if got != want {
++			t.Errorf("got %d, want %d (sidechain entry must be skipped)", got, want)
++		}
++	})
++
++	t.Run("cache-only turn: zero input/output must still count cache tokens", func(t *testing.T) {
++		dir := t.TempDir()
++		lines := []string{
++			ccUsageLine(false, 0, 0, 64979, 0), // pure cache-read turn
++		}
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		if got != 64979 {
++			t.Errorf("got %d, want %d", got, 64979)
++		}
++	})
++
++	t.Run("truncated last line: falls back to newest complete line", func(t *testing.T) {
++		dir := t.TempDir()
++		good := ccUsageLine(false, 10, 50, 40000, 1000)
++		lines := []string{
++			good,
++			`{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tex`, // mid-write truncation
++		}
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 10 + 50 + 40000 + 1000
++		if got != want {
++			t.Errorf("got %d, want %d (truncated final line must be skipped, not fatal)", got, want)
++		}
++	})
++
++	t.Run("mtime filtering: stale pre-respawn file excluded", func(t *testing.T) {
++		dir := t.TempDir()
++		// Old session file, modified BEFORE `since` (the current tmux
++		// session's start time) — must be ignored even though it's the only
++		// other file present.
++		writeJSONLFixture(t, dir, "old-session",
++			[]string{ccUsageLine(false, 1, 1, 999999, 999999)},
++			sessionStart.Add(-time.Hour))
++		// New session file, modified AFTER `since` — this is the one that
++		// must be read.
++		writeJSONLFixture(t, dir, "new-session",
++			[]string{ccUsageLine(false, 10, 50, 30000, 2000)},
++			sessionStart.Add(time.Minute))
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 10 + 50 + 30000 + 2000
++		if got != want {
++			t.Errorf("got %d, want %d (must read newest file after `since`, not the stale one)", got, want)
++		}
++	})
++
++	t.Run("tail-only: newest usage still found when file exceeds the read window", func(t *testing.T) {
++		orig := contextReadWindow
++		contextReadWindow = 512 // shrink so a small fixture still exercises the seek path
++		t.Cleanup(func() { contextReadWindow = orig })
++
++		dir := t.TempDir()
++		var lines []string
++		// Pad with filler lines (non-matching type) so the file exceeds the
++		// shrunk read window; only the LAST line's usage is the golden answer.
++		for i := 0; i < 40; i++ {
++			lines = append(lines, fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"filler line %d filler line %d filler"}]}}`, i, i))
++		}
++		lines = append(lines, ccUsageLine(false, 10, 50, 45000, 3000))
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 10 + 50 + 45000 + 3000
++		if got != want {
++			t.Errorf("got %d, want %d (must find newest usage within the tail read window)", got, want)
++		}
++	})
++
++	t.Run("empty directory: error, not zero", func(t *testing.T) {
++		dir := t.TempDir()
++		if _, err := CurrentContextTokens(dir, sessionStart); err == nil {
++			t.Error("expected error for directory with no JSONL files, got nil")
++		}
++	})
++
++	t.Run("no usage event in file: error, not zero", func(t *testing.T) {
++		dir := t.TempDir()
++		writeJSONLFixture(t, dir, "session",
++			[]string{`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}`},
++			time.Now())
++		if _, err := CurrentContextTokens(dir, sessionStart); err == nil {
++			t.Error("expected error when no assistant usage event exists, got nil")
++		}
++	})
++}
+diff --git a/internal/cmd/handoff.go b/internal/cmd/handoff.go
+index 6fd18a9d..c510889f 100644
+--- a/internal/cmd/handoff.go
++++ b/internal/cmd/handoff.go
+@@ -331,9 +331,9 @@ func runHandoff(cmd *cobra.Command, args []string) error {
+ 	// This tells the new session "you're post-handoff, don't re-run /handoff"
+ 	if cwd, err := os.Getwd(); err == nil {
+ 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+-		_ = os.MkdirAll(runtimeDir, 0755)
++		_ = os.MkdirAll(runtimeDir, 0o755)
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+-		_ = os.WriteFile(markerPath, []byte(currentSession), 0644)
++		_ = os.WriteFile(markerPath, []byte(currentSession), 0o644)
+ 	}
+ 
+ 	// Record handoff time for cooldown enforcement (gt-058d).
+@@ -413,7 +413,7 @@ func runHandoffAuto() error {
+ 	// Write handoff marker so post-compact prime knows it's post-handoff
+ 	if cwd, err := os.Getwd(); err == nil {
+ 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+-		_ = os.MkdirAll(runtimeDir, 0755)
++		_ = os.MkdirAll(runtimeDir, 0o755)
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+ 		sessionName := "auto-handoff"
+ 		if tmux.IsInsideTmux() {
+@@ -421,7 +421,7 @@ func runHandoffAuto() error {
+ 				sessionName = name
+ 			}
+ 		}
+-		_ = os.WriteFile(markerPath, []byte(sessionName), 0644)
++		_ = os.WriteFile(markerPath, []byte(sessionName), 0o644)
+ 	}
+ 
+ 	// Log handoff event
+@@ -532,13 +532,13 @@ func runHandoffCycle() error {
+ 	// directive instead of full re-initialization. (GH#1965)
+ 	if cwd, err := os.Getwd(); err == nil {
+ 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+-		_ = os.MkdirAll(runtimeDir, 0755)
++		_ = os.MkdirAll(runtimeDir, 0o755)
+ 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+ 		markerContent := currentSession
+ 		if handoffReason != "" {
+ 			markerContent += "\n" + handoffReason
+ 		}
+-		_ = os.WriteFile(markerPath, []byte(markerContent), 0644)
++		_ = os.WriteFile(markerPath, []byte(markerContent), 0o644)
+ 	}
+ 
+ 	// Record handoff time for cooldown enforcement (gt-058d).
+@@ -554,12 +554,15 @@ func runHandoffCycle() error {
+ 		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(subject, true))
+ 	}
+ 
+-	// Build restart command with --continue so the new session resumes
+-	// the previous conversation (preserves context across compaction cycles).
+-	restartCmd, err := buildRestartCommandWithOpts(currentSession, buildRestartCommandOpts{
+-		ContinueSession: true,
+-		ContinuePrompt:  "Context compacted. Continue your previous task.",
+-	})
++	// Build restart command. Crew/polecats get --continue so the new session
++	// resumes the previous conversation (preserves context across compaction
++	// cycles). Patrol roles (refinery, witness, deacon) fresh-start instead:
++	// each patrol cycle is independent, so --continue would just reload the
++	// same fat conversation that crossed the context-cycle threshold in the
++	// first place (gfork-47p.2). buildRestartCommandWithOpts already falls
++	// back to the patrol-loop beacon when ContinueSession is false and the
++	// role is a patrol role.
++	restartCmd, err := buildRestartCommandWithOpts(currentSession, cycleRestartOpts(currentSession))
+ 	if err != nil {
+ 		fmt.Fprintf(os.Stderr, "handoff --cycle: could not build restart command: %v\n", err)
+ 		return err
+@@ -1726,9 +1729,9 @@ func recordHandoffTime() {
+ 	}
+ 
+ 	runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+-	_ = os.MkdirAll(runtimeDir, 0755)
++	_ = os.MkdirAll(runtimeDir, 0o755)
+ 	tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+-	_ = os.WriteFile(tsPath, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
++	_ = os.WriteFile(tsPath, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0o644)
+ }
+ 
+ // isPatrolRole returns true if the role runs a patrol loop (refinery, witness, deacon).
+@@ -1741,3 +1744,21 @@ func isPatrolRole(role string) bool {
+ 	}
+ 	return false
+ }
++
++// cycleRestartOpts computes the buildRestartCommandOpts for `gt handoff
++// --cycle` respawning currentSession. Patrol roles fresh-start (no
++// --continue) so each cycle is independent instead of reloading the same
++// fat conversation that triggered the cycle; crew/polecats keep --continue
++// to preserve task context across compaction. (gfork-47p.2)
++//
++// sessionToGTRole returns the compound GT_ROLE form ("<rig>/witness"), not
++// the bare role name isPatrolRole expects — ExtractSimpleRole bridges that,
++// same as buildRestartCommandWithOpts does internally for its own beacon
++// choice.
++func cycleRestartOpts(currentSession string) buildRestartCommandOpts {
++	simpleRole := config.ExtractSimpleRole(sessionToGTRole(currentSession))
++	return buildRestartCommandOpts{
++		ContinueSession: !isPatrolRole(simpleRole),
++		ContinuePrompt:  "Context compacted. Continue your previous task.",
++	}
++}
+diff --git a/internal/cmd/handoff_test.go b/internal/cmd/handoff_test.go
+index 3b54c7d4..263f43c0 100644
+--- a/internal/cmd/handoff_test.go
++++ b/internal/cmd/handoff_test.go
+@@ -135,13 +135,13 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
+ 	rigPath := filepath.Join(townRoot, "gastown")
+ 	witnessDir := filepath.Join(rigPath, "witness")
+ 
+-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir mayor: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
+ 		t.Fatalf("write town.json: %v", err)
+ 	}
+-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
++	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir witness dir: %v", err)
+ 	}
+ 
+@@ -209,13 +209,13 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
+ 	rigPath := filepath.Join(townRoot, "gastown")
+ 	witnessDir := filepath.Join(rigPath, "witness")
+ 
+-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir mayor: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
+ 		t.Fatalf("write town.json: %v", err)
+ 	}
+-	if err := os.MkdirAll(witnessDir, 0755); err != nil {
++	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir witness dir: %v", err)
+ 	}
+ 
+@@ -285,13 +285,13 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+ 	rigPath := filepath.Join(townRoot, "gastown")
+ 	crewDir := filepath.Join(rigPath, "crew", "bear")
+ 
+-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
++	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+ 		t.Fatalf("mkdir mayor: %v", err)
+ 	}
+-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
++	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
+ 		t.Fatalf("write town.json: %v", err)
+ 	}
+-	if err := os.MkdirAll(crewDir, 0755); err != nil {
++	if err := os.MkdirAll(crewDir, 0o755); err != nil {
+ 		t.Fatalf("mkdir crew dir: %v", err)
+ 	}
+ 
+@@ -353,6 +353,44 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+ 	})
+ }
+ 
++// TestCycleRestartOpts covers gfork-47p.2's F2: `gt handoff --cycle` must
++// fresh-start patrol roles (refinery, witness, deacon) instead of reloading
++// their prior conversation via --continue, while crew/polecats keep
++// --continue. sessionToGTRole returns the COMPOUND GT_ROLE form
++// ("<rig>/witness"), not the bare name isPatrolRole expects — this test
++// pins that ExtractSimpleRole bridges it correctly (the "GT_ROLE is
++// compound" pitfall: a naive isPatrolRole(sessionToGTRole(...)) would never
++// match a rig-scoped role).
++func TestCycleRestartOpts(t *testing.T) {
++	setupHandoffTestRegistry(t)
++
++	tests := []struct {
++		name            string
++		session         string
++		wantContinue    bool
++		wantDescription string
++	}{
++		{"witness: patrol role fresh-starts", "gt-witness", false, "rig-scoped compound GT_ROLE must still resolve to patrol"},
++		{"refinery: patrol role fresh-starts", "gt-refinery", false, "rig-scoped compound GT_ROLE must still resolve to patrol"},
++		{"deacon: patrol role fresh-starts", "hq-deacon", false, "town-level simple GT_ROLE"},
++		{"crew: keeps --continue", "gt-crew-bear", true, "non-patrol role preserves context"},
++		{"polecat: keeps --continue", "gt-toast", true, "non-patrol role preserves context"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			opts := cycleRestartOpts(tt.session)
++			if opts.ContinueSession != tt.wantContinue {
++				t.Errorf("cycleRestartOpts(%q).ContinueSession = %v, want %v (%s)",
++					tt.session, opts.ContinueSession, tt.wantContinue, tt.wantDescription)
++			}
++			if opts.ContinuePrompt == "" {
++				t.Error("expected a non-empty ContinuePrompt regardless of ContinueSession")
++			}
++		})
++	}
++}
++
+ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+ 	// Save original env vars and restore after test
+ 	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+@@ -365,11 +403,11 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+ 	// Create a temp directory that looks like a valid town
+ 	tmpTown := t.TempDir()
+ 	mayorDir := filepath.Join(tmpTown, "mayor")
+-	if err := os.MkdirAll(mayorDir, 0755); err != nil {
++	if err := os.MkdirAll(mayorDir, 0o755); err != nil {
+ 		t.Fatalf("creating mayor dir: %v", err)
+ 	}
+ 	townJSON := filepath.Join(mayorDir, "town.json")
+-	if err := os.WriteFile(townJSON, []byte(`{"name": "test-town"}`), 0644); err != nil {
++	if err := os.WriteFile(townJSON, []byte(`{"name": "test-town"}`), 0o644); err != nil {
+ 		t.Fatalf("creating town.json: %v", err)
+ 	}
+ 
+@@ -413,8 +451,8 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+ 		// Create another temp town for GT_ROOT
+ 		anotherTown := t.TempDir()
+ 		anotherMayor := filepath.Join(anotherTown, "mayor")
+-		os.MkdirAll(anotherMayor, 0755)
+-		os.WriteFile(filepath.Join(anotherMayor, "town.json"), []byte(`{"name": "other-town"}`), 0644)
++		os.MkdirAll(anotherMayor, 0o755)
++		os.WriteFile(filepath.Join(anotherMayor, "town.json"), []byte(`{"name": "other-town"}`), 0o644)
+ 
+ 		// Set both env vars
+ 		os.Setenv("GT_TOWN_ROOT", tmpTown)
+@@ -451,7 +489,7 @@ func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
+ 		// Create a temp town with only mayor/ directory (no town.json)
+ 		secondaryTown := t.TempDir()
+ 		mayorOnlyDir := filepath.Join(secondaryTown, workspace.SecondaryMarker)
+-		os.MkdirAll(mayorOnlyDir, 0755)
++		os.MkdirAll(mayorOnlyDir, 0o755)
+ 
+ 		os.Setenv("GT_TOWN_ROOT", secondaryTown)
+ 		os.Setenv("GT_ROOT", "")
+@@ -556,11 +594,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
+ 			gtLog := filepath.Join(t.TempDir(), "gt.log")
+ 			_ = writeBDStub(t, binDir, "#!/bin/sh\nexit 0\n", "@echo off\r\nexit /b 0\r\n")
+ 			gtStub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + gtLog + "\"\nprintf 'stub gt %s\\n' \"$*\"\nexit 0\n"
+-			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0755); err != nil {
++			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0o755); err != nil {
+ 				t.Fatalf("write gt stub: %v", err)
+ 			}
+ 			gtCmdStub := "@echo off\r\necho %* >> \"" + gtLog + "\"\r\necho stub gt %*\r\nexit /b 0\r\n"
+-			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0644); err != nil {
++			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0o644); err != nil {
+ 				t.Fatalf("write gt.cmd stub: %v", err)
+ 			}
+ 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+@@ -637,7 +675,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+ 
+ 	t.Run("warns on untracked file", func(t *testing.T) {
+ 		dir := makeTestGitRepo(t)
+-		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0644)
++		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0o644)
+ 		os.Chdir(dir)
+ 		t.Cleanup(func() { os.Chdir(origCwd) })
+ 		output := captureStderr(t, func() {
+@@ -655,11 +693,11 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+ 		dir := makeTestGitRepo(t)
+ 		// Create and commit a file
+ 		fpath := filepath.Join(dir, "tracked.txt")
+-		os.WriteFile(fpath, []byte("original"), 0644)
++		os.WriteFile(fpath, []byte("original"), 0o644)
+ 		exec.Command("git", "-C", dir, "add", ".").Run()
+ 		exec.Command("git", "-C", dir, "commit", "-m", "add file").Run()
+ 		// Now modify it
+-		os.WriteFile(fpath, []byte("modified"), 0644)
++		os.WriteFile(fpath, []byte("modified"), 0o644)
+ 		os.Chdir(dir)
+ 		t.Cleanup(func() { os.Chdir(origCwd) })
+ 		output := captureStderr(t, func() {
+@@ -676,8 +714,8 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+ 	t.Run("no warning for .beads-only changes", func(t *testing.T) {
+ 		dir := makeTestGitRepo(t)
+ 		// Only .beads/ untracked files — should be clean (excluded)
+-		os.MkdirAll(filepath.Join(dir, ".beads"), 0755)
+-		os.WriteFile(filepath.Join(dir, ".beads", "somefile.db"), []byte("db"), 0644)
++		os.MkdirAll(filepath.Join(dir, ".beads"), 0o755)
++		os.WriteFile(filepath.Join(dir, ".beads", "somefile.db"), []byte("db"), 0o644)
+ 		os.Chdir(dir)
+ 		t.Cleanup(func() { os.Chdir(origCwd) })
+ 		output := captureStderr(t, func() {
+@@ -700,7 +738,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
+ 
+ 	t.Run("no-git-check flag suppresses warning", func(t *testing.T) {
+ 		dir := makeTestGitRepo(t)
+-		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0644)
++		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0o644)
+ 		os.Chdir(dir)
+ 		t.Cleanup(func() { os.Chdir(origCwd) })
+ 		// Simulate --no-git-check by setting the flag
+@@ -724,8 +762,8 @@ func TestHandoffProcessNames(t *testing.T) {
+ 
+ 		tmpTown := t.TempDir()
+ 		mayorDir := filepath.Join(tmpTown, "mayor")
+-		os.MkdirAll(mayorDir, 0755)
+-		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
++		os.MkdirAll(mayorDir, 0o755)
++		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0o644)
+ 
+ 		t.Setenv("GT_ROOT", tmpTown)
+ 		t.Setenv("GT_AGENT", "claude")
+@@ -749,8 +787,8 @@ func TestHandoffProcessNames(t *testing.T) {
+ 
+ 		tmpTown := t.TempDir()
+ 		mayorDir := filepath.Join(tmpTown, "mayor")
+-		os.MkdirAll(mayorDir, 0755)
+-		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
++		os.MkdirAll(mayorDir, 0o755)
++		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0o644)
+ 
+ 		t.Setenv("GT_ROOT", tmpTown)
+ 		t.Setenv("GT_AGENT", "claude")
+@@ -792,7 +830,7 @@ func TestCollectGitState(t *testing.T) {
+ 		}
+ 
+ 		// Create a file and commit
+-		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("hello"), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("hello"), 0o644); err != nil {
+ 			t.Fatalf("write: %v", err)
+ 		}
+ 		for _, args := range [][]string{
+@@ -807,7 +845,7 @@ func TestCollectGitState(t *testing.T) {
+ 		}
+ 
+ 		// Modify a file to create uncommitted changes
+-		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("modified"), 0644); err != nil {
++		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("modified"), 0o644); err != nil {
+ 			t.Fatalf("write: %v", err)
+ 		}
+ 
+@@ -886,9 +924,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+ 
+ 		// Create a last_handoff_ts file with old mtime
+ 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+-		os.MkdirAll(runtimeDir, 0755)
++		os.MkdirAll(runtimeDir, 0o755)
+ 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+-		os.WriteFile(tsPath, []byte("1000000000"), 0644)
++		os.WriteFile(tsPath, []byte("1000000000"), 0o644)
+ 		// Set mtime to well in the past
+ 		oldTime := time.Now().Add(-10 * time.Minute)
+ 		os.Chtimes(tsPath, oldTime, oldTime)
+@@ -910,9 +948,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+ 
+ 		// Create a last_handoff_ts file with very recent mtime
+ 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+-		os.MkdirAll(runtimeDir, 0755)
++		os.MkdirAll(runtimeDir, 0o755)
+ 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+-		os.WriteFile(tsPath, []byte("now"), 0644)
++		os.WriteFile(tsPath, []byte("now"), 0o644)
+ 		// Set mtime to (MinHandoffCooldown - 1s) ago so remaining is ~1s
+ 		recentTime := time.Now().Add(-(constants.MinHandoffCooldown - 1*time.Second))
+ 		os.Chtimes(tsPath, recentTime, recentTime)
+@@ -937,9 +975,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+ 
+ 		// Create a recent handoff file that would normally trigger cooldown
+ 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+-		os.MkdirAll(runtimeDir, 0755)
++		os.MkdirAll(runtimeDir, 0o755)
+ 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+-		os.WriteFile(tsPath, []byte("now"), 0644)
++		os.WriteFile(tsPath, []byte("now"), 0o644)
+ 
+ 		start := time.Now()
+ 		enforceHandoffCooldown()
+@@ -957,9 +995,9 @@ func TestEnforceHandoffCooldown(t *testing.T) {
+ 
+ 		// Create a recent handoff file that would normally trigger cooldown
+ 		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+-		os.MkdirAll(runtimeDir, 0755)
++		os.MkdirAll(runtimeDir, 0o755)
+ 		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+-		os.WriteFile(tsPath, []byte("now"), 0644)
++		os.WriteFile(tsPath, []byte("now"), 0o644)
+ 
+ 		start := time.Now()
+ 		enforceHandoffCooldown()
+diff --git a/internal/config/operational.go b/internal/config/operational.go
+index c821e313..39774aec 100644
+--- a/internal/config/operational.go
++++ b/internal/config/operational.go
+@@ -3,6 +3,8 @@ package config
+ import (
+ 	"path/filepath"
+ 	"time"
++
++	"github.com/steveyegge/gastown/internal/constants"
+ )
+ 
+ // Compiled-in defaults for operational thresholds.
+@@ -35,20 +37,20 @@ const (
+ 
+ // Daemon defaults.
+ const (
+-	DefaultMassDeathWindow                 = 30 * time.Second
+-	DefaultMassDeathThreshold              = 3
+-	DefaultDogIdleSessionTimeout           = 1 * time.Hour
+-	DefaultPolecatIdleSessionTimeout       = 15 * time.Minute
+-	DefaultDogIdleRemoveTimeout            = 4 * time.Hour
+-	DefaultStaleWorkingTimeout             = 2 * time.Hour
+-	DefaultMaxDogPoolSize                  = 4
+-	DefaultMaxLifecycleMessageAge          = 6 * time.Hour
+-	DefaultSyncFailureEscalationThreshold  = 3
+-	DefaultDoctorMolCooldown               = 5 * time.Minute
+-	DefaultRecoveryHeartbeatInterval       = 3 * time.Minute
+-	DefaultBootSpawnCooldown               = 2 * time.Minute
+-	DefaultBootIdleSuppression             = 15 * time.Minute
+-	DefaultDeaconGracePeriod               = 5 * time.Minute
++	DefaultMassDeathWindow                = 30 * time.Second
++	DefaultMassDeathThreshold             = 3
++	DefaultDogIdleSessionTimeout          = 1 * time.Hour
++	DefaultPolecatIdleSessionTimeout      = 15 * time.Minute
++	DefaultDogIdleRemoveTimeout           = 4 * time.Hour
++	DefaultStaleWorkingTimeout            = 2 * time.Hour
++	DefaultMaxDogPoolSize                 = 4
++	DefaultMaxLifecycleMessageAge         = 6 * time.Hour
++	DefaultSyncFailureEscalationThreshold = 3
++	DefaultDoctorMolCooldown              = 5 * time.Minute
++	DefaultRecoveryHeartbeatInterval      = 3 * time.Minute
++	DefaultBootSpawnCooldown              = 2 * time.Minute
++	DefaultBootIdleSuppression            = 15 * time.Minute
++	DefaultDeaconGracePeriod              = 5 * time.Minute
+ 
+ 	// Pressure check defaults — fully opt-in. All zero = disabled.
+ 	// Configure in settings/config.json under operational.daemon to enable.
+@@ -56,25 +58,44 @@ const (
+ 	DefaultPressureCPUThreshold   = 0.0
+ 	DefaultPressureMemThresholdGB = 0.0
+ 	DefaultPressureMaxSessions    = 0
++
++	// Context-lifecycle watchdog defaults (gfork-47p.2). YELLOW nudges a
++	// persistent agent to self-cycle at its next loop boundary; RED
++	// force-cycles it (idle-gated). Values are compiled-in defaults; the
++	// resolved thresholds are always clamped so RED > YELLOW (see
++	// ContextThresholdsForRoleV).
++	DefaultContextYellowTokens = 130_000
++	DefaultContextRedTokens    = 170_000
++	// contextYellowTokensFloor guards against a misconfigured near-zero
++	// YELLOW threshold triggering a nudge storm.
++	contextYellowTokensFloor    = 50_000
++	DefaultContextNudgeCooldown = 15 * time.Minute
+ )
+ 
++// DefaultContextCycleRoles is the default set of persistent-agent roles the
++// context watchdog monitors. A var (not const) because it's a slice; treat
++// as read-only. Polecats are deliberately never included — their lifecycle
++// belongs to reapIdlePolecats / self-terminate (gfork-47p.1), not this
++// recycle path.
++var DefaultContextCycleRoles = []string{constants.RoleWitness, constants.RoleRefinery, constants.RoleDeacon}
++
+ // Deacon defaults.
+ const (
+-	DefaultDeaconPingTimeout               = 30 * time.Second
+-	DefaultDeaconConsecutiveFailures       = 3
+-	DefaultDeaconCooldown                  = 5 * time.Minute
+-	DefaultDeaconHeartbeatStaleThreshold   = 5 * time.Minute
+-	DefaultDeaconHeartbeatVeryStale        = 20 * time.Minute
+-	DefaultMaxRedispatches                 = 3
+-	DefaultRedispatchCooldown              = 5 * time.Minute
+-	DefaultMaxFeedsPerCycle                = 3
+-	DefaultFeedCooldown                    = 10 * time.Minute
++	DefaultDeaconPingTimeout             = 30 * time.Second
++	DefaultDeaconConsecutiveFailures     = 3
++	DefaultDeaconCooldown                = 5 * time.Minute
++	DefaultDeaconHeartbeatStaleThreshold = 5 * time.Minute
++	DefaultDeaconHeartbeatVeryStale      = 20 * time.Minute
++	DefaultMaxRedispatches               = 3
++	DefaultRedispatchCooldown            = 5 * time.Minute
++	DefaultMaxFeedsPerCycle              = 3
++	DefaultFeedCooldown                  = 10 * time.Minute
+ )
+ 
+ // Polecat defaults.
+ const (
+-	DefaultPolecatHeartbeatStale = 3 * time.Minute
+-	DefaultPolecatDoltMaxRetries = 10
++	DefaultPolecatHeartbeatStale  = 3 * time.Minute
++	DefaultPolecatDoltMaxRetries  = 10
+ 	DefaultPolecatDoltBaseBackoff = 500 * time.Millisecond
+ 	DefaultPolecatDoltBackoffMax  = 30 * time.Second
+ 	DefaultPolecatPendingMaxAge   = 5 * time.Minute
+@@ -110,9 +131,9 @@ const (
+ 	DefaultWitnessStartupStallThreshold  = 90 * time.Second
+ 	DefaultWitnessStartupActivityGrace   = 60 * time.Second
+ 	DefaultWitnessMaxBeadRespawns        = 3
+-	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
+-	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
+-	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
++	DefaultWitnessDoneIntentStuckTimeout = 60 * time.Second
++	DefaultWitnessDoneIntentRecentGrace  = 30 * time.Second
++	DefaultWitnessHeartbeatStartupGrace  = 5 * time.Minute
+ )
+ 
+ // LoadOperationalConfig loads operational config from a town root.
+@@ -427,6 +448,53 @@ func (d *DaemonThresholds) PressureMaxSessionsV() int {
+ 	return DefaultPressureMaxSessions
+ }
+ 
++// ContextThresholdsForRoleV returns the effective (yellow, red) context-token
++// thresholds for role. Applies role's ContextTokensByRole override (if any)
++// to YELLOW, floors YELLOW at contextYellowTokensFloor, and clamps RED to be
++// strictly greater than the resolved YELLOW — a misconfigured RED <= YELLOW
++// would leave the RED tier unreachable, or fire before YELLOW ever nudges.
++func (d *DaemonThresholds) ContextThresholdsForRoleV(role string) (yellow, red int) {
++	yellow = DefaultContextYellowTokens
++	if d != nil && d.ContextYellowTokens != nil {
++		yellow = *d.ContextYellowTokens
++	}
++	if d != nil {
++		if v, ok := d.ContextTokensByRole[role]; ok && v > 0 {
++			yellow = v
++		}
++	}
++	if yellow < contextYellowTokensFloor {
++		yellow = contextYellowTokensFloor
++	}
++
++	red = DefaultContextRedTokens
++	if d != nil && d.ContextRedTokens != nil {
++		red = *d.ContextRedTokens
++	}
++	if red <= yellow {
++		red = yellow + contextYellowTokensFloor
++	}
++	return yellow, red
++}
++
++// ContextCycleRolesV returns the configured or default set of roles the
++// context watchdog monitors.
++func (d *DaemonThresholds) ContextCycleRolesV() []string {
++	if d != nil && len(d.ContextCycleRoles) > 0 {
++		return d.ContextCycleRoles
++	}
++	return DefaultContextCycleRoles
++}
++
++// ContextNudgeCooldownD returns the configured or default minimum interval
++// between YELLOW-tier context-pressure nudges for the same agent.
++func (d *DaemonThresholds) ContextNudgeCooldownD() time.Duration {
++	if d != nil {
++		return ParseDurationOrDefault(d.ContextNudgeCooldown, DefaultContextNudgeCooldown)
++	}
++	return DefaultContextNudgeCooldown
++}
++
+ // --- Deacon accessors ---
+ 
+ // GetDeaconConfig returns the deacon thresholds, never nil.
+diff --git a/internal/config/types.go b/internal/config/types.go
+index e49db03d..8c23e19e 100644
+--- a/internal/config/types.go
++++ b/internal/config/types.go
+@@ -372,6 +372,32 @@ type DaemonThresholds struct {
+ 	// PressureMaxSessions is the maximum number of concurrent agent tmux
+ 	// sessions before new non-infrastructure spawns are deferred. Disabled by default (0 = unlimited).
+ 	PressureMaxSessions *int `json:"pressure_max_sessions,omitempty"`
++
++	// ContextYellowTokens is the context-token count at which the context
++	// watchdog nudges a persistent agent to self-cycle at its next loop
++	// boundary (default 130,000). Overridable per-role via ContextTokensByRole.
++	ContextYellowTokens *int `json:"context_yellow_tokens,omitempty"`
++
++	// ContextRedTokens is the context-token count at which the context
++	// watchdog force-cycles a persistent agent's session, provided it is idle
++	// (default 170,000). Clamped to be strictly greater than the resolved
++	// YELLOW threshold.
++	ContextRedTokens *int `json:"context_red_tokens,omitempty"`
++
++	// ContextTokensByRole overrides ContextYellowTokens per role. Witness runs
++	// on Opus and fills its context faster than deacon/refinery, so it
++	// typically needs a lower threshold. Example: {"witness": 100000}.
++	ContextTokensByRole map[string]int `json:"context_tokens_by_role,omitempty"`
++
++	// ContextCycleRoles is the set of persistent-agent roles the context
++	// watchdog monitors (default ["witness", "refinery", "deacon"]). Polecats
++	// are never included — their lifecycle belongs to reapIdlePolecats /
++	// self-terminate, not this recycle path.
++	ContextCycleRoles []string `json:"context_cycle_roles,omitempty"`
++
++	// ContextNudgeCooldown is the minimum interval between YELLOW-tier
++	// context-pressure nudges for the same agent (default "15m").
++	ContextNudgeCooldown string `json:"context_nudge_cooldown,omitempty"`
+ }
+ 
+ // DeaconThresholds configures deacon health-check and dispatch thresholds.
+diff --git a/internal/daemon/context_watchdog.go b/internal/daemon/context_watchdog.go
+new file mode 100644
+index 00000000..19df25ec
+--- /dev/null
++++ b/internal/daemon/context_watchdog.go
+@@ -0,0 +1,270 @@
++package daemon
++
++import (
++	"fmt"
++	"path/filepath"
++	"time"
++
++	"github.com/steveyegge/gastown/internal/agentlog"
++	"github.com/steveyegge/gastown/internal/config"
++	"github.com/steveyegge/gastown/internal/constants"
++)
++
++// contextSessionGracePeriod is how long a newly (re)started persistent agent
++// session is exempt from context-pressure checks. A freshly cycled agent's
++// Claude Code process needs a moment to write its first usage event; acting
++// on a session this young would either read stale data or none at all.
++const contextSessionGracePeriod = 10 * time.Minute
++
++// contextBand classifies a context-token snapshot against the configured
++// YELLOW/RED thresholds.
++type contextBand string
++
++const (
++	contextBandNone   contextBand = "none"
++	contextBandYellow contextBand = "yellow"
++	contextBandRed    contextBand = "red"
++)
++
++// classifyContextBand bands a token snapshot against the yellow/red
++// thresholds. red is checked first: DaemonThresholds.ContextThresholdsForRoleV
++// always clamps red > yellow, so a tokens count crossing red also crosses
++// yellow and must report the higher band.
++func classifyContextBand(tokens, yellow, red int) contextBand {
++	switch {
++	case tokens >= red:
++		return contextBandRed
++	case tokens >= yellow:
++		return contextBandYellow
++	default:
++		return contextBandNone
++	}
++}
++
++// contextTarget is one persistent-agent session the context watchdog
++// monitors.
++type contextTarget struct {
++	identity    string // restart-tracker key / LifecycleRequest.From (e.g. "deacon", "<rig>-witness")
++	role        string // constants.RoleWitness / RoleRefinery / RoleDeacon — selects per-role threshold
++	sessionName string
++	projectDir  string // Claude Code project dir (per-role CLAUDE_CONFIG_DIR + workDir)
++}
++
++// checkContextPressure is the context-lifecycle watchdog (gfork-47p.2):
++// heartbeat step 12c. Persistent agents (deacon, witness, refinery) run one
++// Claude Code session for 1.5-1.6h with no compaction; left unchecked they
++// hit Claude's own context ceiling (RED) and wedge idle-at-prompt.
++//
++// Each tick, for every monitored role/rig:
++//   - YELLOW: nudge the agent to self-cycle at its next loop boundary
++//     (`gt handoff --cycle`), cooldown-guarded so a repeatedly-ignored nudge
++//     doesn't spam the pane.
++//   - RED: force-cycle the session via the daemon's own lifecycle action,
++//     but only when the pane is idle (never kill mid-turn) and the restart
++//     tracker / usage-limit guards agree it's safe.
++func (d *Daemon) checkContextPressure() {
++	cfg := d.loadOperationalConfig().GetDaemonConfig()
++	now := time.Now()
++
++	for _, target := range d.contextTargets(cfg.ContextCycleRolesV()) {
++		d.evaluateContextTarget(target, cfg, now)
++	}
++}
++
++// contextTargets enumerates the persistent agents monitored by the context
++// watchdog: deacon (town-level) plus witness/refinery per operational rig,
++// filtered to roles in roles and gated by each role's own patrol toggle.
++// Polecats are deliberately never enumerated — their lifecycle belongs to
++// reapIdlePolecats / self-terminate (gfork-47p.1), not this recycle path.
++func (d *Daemon) contextTargets(roles []string) []contextTarget {
++	roleSet := make(map[string]bool, len(roles))
++	for _, r := range roles {
++		roleSet[r] = true
++	}
++
++	var targets []contextTarget
++	if roleSet[constants.RoleDeacon] && d.isPatrolActive("deacon") {
++		if t, ok := d.buildContextTarget(constants.RoleDeacon, ""); ok {
++			targets = append(targets, t)
++		}
++	}
++	if roleSet[constants.RoleWitness] && d.isPatrolActive("witness") {
++		for _, rigName := range d.getPatrolRigs("witness") {
++			if t, ok := d.buildContextTarget(constants.RoleWitness, rigName); ok {
++				targets = append(targets, t)
++			}
++		}
++	}
++	if roleSet[constants.RoleRefinery] && d.isPatrolActive("refinery") {
++		for _, rigName := range d.getPatrolRigs("refinery") {
++			if t, ok := d.buildContextTarget(constants.RoleRefinery, rigName); ok {
++				targets = append(targets, t)
++			}
++		}
++	}
++	return targets
++}
++
++// buildContextTarget resolves the identity, session name, and Claude Code
++// project directory for one role/rig pair. Returns ok=false if the identity
++// can't be parsed or the working directory / project directory can't be
++// determined — skip the target, don't panic (matches the reader-err-skips-
++// tick contract used throughout the watchdog).
++func (d *Daemon) buildContextTarget(role, rigName string) (contextTarget, bool) {
++	var identity string
++	switch role {
++	case constants.RoleDeacon:
++		identity = constants.RoleDeacon
++	case constants.RoleWitness:
++		identity = rigName + "-witness"
++	case constants.RoleRefinery:
++		identity = rigName + "-refinery"
++	default:
++		return contextTarget{}, false
++	}
++
++	parsed, err := parseIdentity(identity)
++	if err != nil {
++		d.logger.Printf("context watchdog: cannot parse identity %q: %v", identity, err)
++		return contextTarget{}, false
++	}
++
++	workDir := d.getWorkDir(nil, parsed)
++	if workDir == "" {
++		d.logger.Printf("context watchdog: cannot determine workdir for %s", identity)
++		return contextTarget{}, false
++	}
++
++	rigPath := ""
++	if rigName != "" {
++		rigPath = filepath.Join(d.config.TownRoot, rigName)
++	}
++	configDir := ""
++	if rc := config.ResolveRoleAgentConfig(role, d.config.TownRoot, rigPath); rc != nil {
++		configDir = rc.Env["CLAUDE_CONFIG_DIR"]
++	}
++
++	projectDir, err := agentlog.ProjectDirFor(configDir, workDir)
++	if err != nil {
++		d.logger.Printf("context watchdog: cannot resolve project dir for %s: %v", identity, err)
++		return contextTarget{}, false
++	}
++
++	return contextTarget{
++		identity:    identity,
++		role:        role,
++		sessionName: d.identityToSession(identity),
++		projectDir:  projectDir,
++	}, true
++}
++
++// evaluateContextTarget checks one monitored session's context pressure and
++// acts on it. Any resolution failure (no session, no JSONL yet, unreadable
++// log) skips the target for this tick and logs — it never panics and never
++// treats "unknown" as "safe" or "over threshold".
++func (d *Daemon) evaluateContextTarget(target contextTarget, cfg *config.DaemonThresholds, now time.Time) {
++	hasSession, err := d.tmux.HasSession(target.sessionName)
++	if err != nil || !hasSession {
++		return
++	}
++
++	sessionCreated, err := d.tmux.GetSessionCreatedTime(target.sessionName)
++	if err != nil {
++		d.logger.Printf("context watchdog: %s: cannot read session start time: %v", target.identity, err)
++		return
++	}
++	if age := now.Sub(sessionCreated); age < contextSessionGracePeriod {
++		d.logger.Printf("context watchdog: %s: session %s old, within grace period", target.identity, age.Round(time.Second))
++		return
++	}
++
++	tokens, err := agentlog.CurrentContextTokens(target.projectDir, sessionCreated)
++	if err != nil {
++		d.logger.Printf("context watchdog: %s: cannot read context tokens: %v", target.identity, err)
++		return
++	}
++
++	yellow, red := cfg.ContextThresholdsForRoleV(target.role)
++	band := classifyContextBand(tokens, yellow, red)
++	d.logger.Printf("context watchdog: %s tokens=%d yellow=%d red=%d band=%s", target.identity, tokens, yellow, red, band)
++
++	switch band {
++	case contextBandRed:
++		d.tryContextCycle(target)
++	case contextBandYellow:
++		d.tryContextNudge(target, cfg, tokens, yellow, now)
++	}
++}
++
++// tryContextCycle force-cycles target's session at RED. Guarded so a
++// mid-turn agent is never killed: only acts when the pane is idle, and
++// defers to the restart tracker (crash-loop/backoff) and usage-limit
++// detector exactly like restartStuckDeacon, so a context-triggered cycle
++// can't fight or double-count against those existing safety nets.
++func (d *Daemon) tryContextCycle(target contextTarget) {
++	if d.restartTracker != nil {
++		if d.restartTracker.IsInCrashLoop(target.identity) {
++			d.logger.Printf("context watchdog: %s in crash-loop, not cycling", target.identity)
++			return
++		}
++		if !d.restartTracker.CanRestart(target.identity) {
++			d.logger.Printf("context watchdog: %s restart in backoff, not cycling", target.identity)
++			return
++		}
++	}
++
++	if !d.tmux.IsIdle(target.sessionName) {
++		d.logger.Printf("context watchdog: %s over RED threshold but busy, deferring cycle", target.identity)
++		return
++	}
++
++	if pane, err := d.tmux.CapturePane(target.sessionName, 30); err == nil && IsClaudeUsageLimit(pane) {
++		d.logger.Printf("context watchdog: %s paused on Claude usage-limit, skipping cycle (quota_dog will rotate accounts)", target.identity)
++		if d.restartTracker != nil {
++			d.restartTracker.RecordPause(target.identity)
++			if err := d.restartTracker.Save(); err != nil {
++				d.logger.Printf("context watchdog: warning: failed to save restart state: %v", err)
++			}
++		}
++		return
++	}
++
++	d.logger.Printf("context watchdog: %s over RED threshold and idle, cycling", target.identity)
++	req := &LifecycleRequest{From: target.identity, Action: ActionCycle, Timestamp: time.Now()}
++	if err := d.executeLifecycleAction(req); err != nil {
++		d.logger.Printf("context watchdog: %s cycle failed: %v", target.identity, err)
++		return
++	}
++	if d.restartTracker != nil {
++		d.restartTracker.RecordRestart(target.identity)
++		if err := d.restartTracker.Save(); err != nil {
++			d.logger.Printf("context watchdog: warning: failed to save restart state: %v", err)
++		}
++	}
++}
++
++// tryContextNudge nudges target at YELLOW to self-cycle at its next loop
++// boundary. NudgeSession's input is queued and only processed after the
++// agent's current turn completes, so this is boundary-safe by construction —
++// a refinery mid-merge finishes before acting on it. Cooldown-guarded via
++// contextNudgeLast (heartbeat-goroutine-only map, no lock needed).
++func (d *Daemon) tryContextNudge(target contextTarget, cfg *config.DaemonThresholds, tokens, yellow int, now time.Time) {
++	cooldown := cfg.ContextNudgeCooldownD()
++	if last, ok := d.contextNudgeLast[target.identity]; ok && now.Sub(last) < cooldown {
++		d.logger.Printf("context watchdog: %s YELLOW nudge suppressed, within cooldown (%s)", target.identity, cooldown)
++		return
++	}
++
++	msg := fmt.Sprintf(
++		"CONTEXT_YELLOW: session context ~%d tokens (threshold %d). Finish your current step, then run: gt handoff --cycle --reason context-yellow",
++		tokens, yellow,
++	)
++	if err := d.tmux.NudgeSession(target.sessionName, msg); err != nil {
++		d.logger.Printf("context watchdog: %s nudge failed: %v", target.identity, err)
++		return
++	}
++	if d.contextNudgeLast == nil {
++		d.contextNudgeLast = make(map[string]time.Time)
++	}
++	d.contextNudgeLast[target.identity] = now
++}
+diff --git a/internal/daemon/context_watchdog_test.go b/internal/daemon/context_watchdog_test.go
+new file mode 100644
+index 00000000..0cebeb0d
+--- /dev/null
++++ b/internal/daemon/context_watchdog_test.go
+@@ -0,0 +1,441 @@
++package daemon
++
++import (
++	"fmt"
++	"io"
++	"log"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/steveyegge/gastown/internal/config"
++	"github.com/steveyegge/gastown/internal/constants"
++	"github.com/steveyegge/gastown/internal/tmux"
++)
++
++func TestClassifyContextBand(t *testing.T) {
++	const yellow, red = 1000, 2000
++	tests := []struct {
++		name   string
++		tokens int
++		want   contextBand
++	}{
++		{"well under yellow", 100, contextBandNone},
++		{"just under yellow", yellow - 1, contextBandNone},
++		{"exactly yellow", yellow, contextBandYellow},
++		{"between yellow and red", 1500, contextBandYellow},
++		{"just under red", red - 1, contextBandYellow},
++		{"exactly red", red, contextBandRed},
++		{"well over red", 5000, contextBandRed},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := classifyContextBand(tt.tokens, yellow, red)
++			if got != tt.want {
++				t.Errorf("classifyContextBand(%d, %d, %d) = %s, want %s", tt.tokens, yellow, red, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestContextTargets_RoleGating verifies contextTargets() honors the
++// configured role set and each role's patrol toggle. Deacon-only: witness
++// and refinery enumeration go through getPatrolRigs -> isRigOperational,
++// which shells out to `bd` and reads wisp/rig registry state — out of scope
++// for this hermetic unit test (covered structurally below instead).
++func TestContextTargets_RoleGating(t *testing.T) {
++	tests := []struct {
++		name            string
++		roles           []string
++		disabledPatrols map[string]bool
++		wantIdentities  []string
++	}{
++		{
++			name:           "deacon in roles, patrol active: one target",
++			roles:          []string{constants.RoleDeacon},
++			wantIdentities: []string{"deacon"},
++		},
++		{
++			name:            "deacon in roles, patrol disabled: no target",
++			roles:           []string{constants.RoleDeacon},
++			disabledPatrols: map[string]bool{"deacon": true},
++			wantIdentities:  nil,
++		},
++		{
++			name:           "deacon not in configured roles: no target",
++			roles:          []string{constants.RoleWitness, constants.RoleRefinery},
++			wantIdentities: nil,
++		},
++		{
++			name:           "polecat can never appear: structurally excluded",
++			roles:          []string{constants.RoleDeacon, constants.RolePolecat},
++			wantIdentities: []string{"deacon"},
++		},
++		{
++			name:           "empty role set: no targets",
++			roles:          nil,
++			wantIdentities: nil,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			townRoot := t.TempDir()
++			d := &Daemon{
++				config:          &Config{TownRoot: townRoot},
++				logger:          log.New(io.Discard, "", 0),
++				disabledPatrols: tt.disabledPatrols,
++			}
++			targets := d.contextTargets(tt.roles)
++			var got []string
++			for _, target := range targets {
++				got = append(got, target.identity)
++			}
++			if len(got) != len(tt.wantIdentities) {
++				t.Fatalf("contextTargets(%v) identities = %v, want %v", tt.roles, got, tt.wantIdentities)
++			}
++			for i := range got {
++				if got[i] != tt.wantIdentities[i] {
++					t.Errorf("contextTargets(%v) identities = %v, want %v", tt.roles, got, tt.wantIdentities)
++				}
++			}
++		})
++	}
++}
++
++// writeFakeContextTmux writes a fake tmux binary controllable via env vars:
++//   - FAKE_HAS_SESSION=1 makes has-session report absent (exit 1); default present.
++//   - FAKE_SESSION_CREATED sets the #{session_created} unix timestamp for list-sessions.
++//   - FAKE_PANE_MARKER sets the capture-pane content (a nanosecond timestamp
++//     comment is appended so consecutive captures never compare equal —
++//     otherwise NudgeSession's sendEnterVerified exhausts its full retry
++//     budget waiting for pane content to "change").
++func writeFakeContextTmux(t *testing.T, dir string) {
++	t.Helper()
++	script := `#!/usr/bin/env bash
++set -euo pipefail
++
++cmd=""
++skip_next=0
++for arg in "$@"; do
++  if [[ "$skip_next" -eq 1 ]]; then
++    skip_next=0
++    continue
++  fi
++  if [[ "$arg" == "-u" ]]; then
++    continue
++  fi
++  if [[ "$arg" == "-L" ]]; then
++    skip_next=1
++    continue
++  fi
++  cmd="$arg"
++  break
++done
++
++if [[ -n "${TMUX_LOG:-}" ]]; then
++  printf "%s %s\n" "$cmd" "$*" >> "$TMUX_LOG"
++fi
++
++if [[ "${1:-}" == "-V" ]]; then
++  echo "tmux 3.3a"
++  exit 0
++fi
++
++if [[ "$cmd" == "has-session" ]]; then
++  if [[ "${FAKE_HAS_SESSION:-0}" == "1" ]]; then
++    exit 1
++  fi
++  exit 0
++fi
++
++if [[ "$cmd" == "list-sessions" ]]; then
++  echo "${FAKE_SESSION_CREATED:-0}"
++  exit 0
++fi
++
++if [[ "$cmd" == "capture-pane" ]]; then
++  printf '%s\n# ts %s\n' "${FAKE_PANE_MARKER:-}" "$(date +%s%N)"
++  exit 0
++fi
++
++exit 0
++`
++	path := filepath.Join(dir, "tmux")
++	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
++		t.Fatalf("write fake tmux: %v", err)
++	}
++}
++
++// idlePaneMarker is capture-pane content IsIdle reports as idle (ready
++// prompt, no busy indicator).
++const idlePaneMarker = "❯ "
++
++// busyPaneMarker is capture-pane content IsIdle reports as busy.
++const busyPaneMarker = "Thinking… (esc to interrupt)"
++
++// usageLimitPaneMarker is idle (ready prompt present) AND matches
++// IsClaudeUsageLimit, for testing the RED-tier usage-limit guard.
++const usageLimitPaneMarker = idlePaneMarker + "\nClaude usage limit reached, resets 2pm"
++
++func setupContextWatchdogTest(t *testing.T) (townRoot string, logBuf *strings.Builder, teardown func()) {
++	t.Helper()
++	if runtime.GOOS == "windows" {
++		t.Skip("skipping on Windows — fake tmux requires bash")
++	}
++	townRoot = t.TempDir()
++	fakeBinDir := t.TempDir()
++	writeFakeContextTmux(t, fakeBinDir)
++	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
++
++	logBuf = &strings.Builder{}
++	return townRoot, logBuf, func() {}
++}
++
++// fakeUsageLine builds one minimal assistant JSONL line with the given
++// snapshot token count (all in input_tokens, for a simple single-field golden
++// number — CurrentContextTokens itself is already covered exhaustively in
++// internal/agentlog).
++func fakeUsageLine(tokens int) string {
++	return fmt.Sprintf(`{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":%d,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}`, tokens)
++}
++
++func writeContextFixture(t *testing.T, projectDir string, tokens int, mtime time.Time) {
++	t.Helper()
++	if err := os.MkdirAll(projectDir, 0o755); err != nil {
++		t.Fatalf("mkdir projectDir: %v", err)
++	}
++	path := filepath.Join(projectDir, "session.jsonl")
++	if err := os.WriteFile(path, []byte(fakeUsageLine(tokens)+"\n"), 0o644); err != nil {
++		t.Fatalf("write fixture: %v", err)
++	}
++	if err := os.Chtimes(path, mtime, mtime); err != nil {
++		t.Fatalf("chtimes: %v", err)
++	}
++}
++
++func TestEvaluateContextTarget(t *testing.T) {
++	// Yellow/red are chosen above contextYellowTokensFloor (50k) so the
++	// clamp in ContextThresholdsForRoleV doesn't silently override them.
++	testThresholds := &config.DaemonThresholds{
++		ContextYellowTokens: intPtr(60_000),
++		ContextRedTokens:    intPtr(120_000),
++	}
++	sessionOld := time.Now().Add(-time.Hour)
++
++	t.Run("no session: returns silently, no panic", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_HAS_SESSION", "1")
++		d := &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(logBuf, "", 0), tmux: tmux.NewTmux()}
++
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: t.TempDir()}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		if logBuf.Len() != 0 {
++			t.Errorf("expected no log output when session absent, got: %s", logBuf.String())
++		}
++	})
++
++	t.Run("grace period: young session skipped before reading tokens", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", time.Now().Unix()))
++		d := &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(logBuf, "", 0), tmux: tmux.NewTmux()}
++
++		// No JSONL fixture at all — if the grace-period gate didn't fire
++		// first, CurrentContextTokens would error and we'd see that log line
++		// instead.
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: t.TempDir()}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "within grace period") {
++			t.Errorf("expected grace-period log, got: %s", out)
++		}
++		if strings.Contains(out, "cannot read context tokens") {
++			t.Errorf("must not attempt to read tokens during grace period, got: %s", out)
++		}
++	})
++
++	t.Run("reader error: no JSONL file skips the tick, does not panic", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		d := &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(logBuf, "", 0), tmux: tmux.NewTmux()}
++
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: t.TempDir()}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "cannot read context tokens") {
++			t.Errorf("expected reader-error log, got: %s", out)
++		}
++	})
++
++	t.Run("band none: below yellow takes no action", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		d := &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(logBuf, "", 0), tmux: tmux.NewTmux()}
++
++		projectDir := t.TempDir()
++		writeContextFixture(t, projectDir, 500, time.Now())
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: projectDir}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "band=none") {
++			t.Errorf("expected band=none, got: %s", out)
++		}
++		if strings.Contains(out, "cycling") || strings.Contains(out, "nudging") {
++			t.Errorf("must not act below YELLOW, got: %s", out)
++		}
++	})
++
++	t.Run("band red: busy pane defers the cycle", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		t.Setenv("FAKE_PANE_MARKER", busyPaneMarker)
++		d := &Daemon{
++			config:         &Config{TownRoot: townRoot},
++			logger:         log.New(logBuf, "", 0),
++			tmux:           tmux.NewTmux(),
++			restartTracker: NewRestartTracker(townRoot, DefaultRestartTrackerConfig()),
++		}
++
++		projectDir := t.TempDir()
++		writeContextFixture(t, projectDir, 150_000, time.Now())
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: projectDir}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "over RED threshold but busy, deferring cycle") {
++			t.Errorf("expected busy-defer log, got: %s", out)
++		}
++		if strings.Contains(out, "over RED threshold and idle, cycling") {
++			t.Errorf("must not attempt cycle while busy, got: %s", out)
++		}
++	})
++
++	t.Run("band red: crash-loop guard blocks the cycle", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		t.Setenv("FAKE_PANE_MARKER", idlePaneMarker)
++		rt := NewRestartTracker(townRoot, DefaultRestartTrackerConfig())
++		// Force a crash-loop state directly (same-package access to unexported state).
++		rt.state.Agents["deacon"] = &AgentRestartInfo{CrashLoopSince: time.Now()}
++		d := &Daemon{
++			config:         &Config{TownRoot: townRoot},
++			logger:         log.New(logBuf, "", 0),
++			tmux:           tmux.NewTmux(),
++			restartTracker: rt,
++		}
++
++		projectDir := t.TempDir()
++		writeContextFixture(t, projectDir, 150_000, time.Now())
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: projectDir}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "in crash-loop, not cycling") {
++			t.Errorf("expected crash-loop guard log, got: %s", out)
++		}
++	})
++
++	t.Run("band red: backoff guard blocks the cycle", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		t.Setenv("FAKE_PANE_MARKER", idlePaneMarker)
++		rt := NewRestartTracker(townRoot, DefaultRestartTrackerConfig())
++		rt.RecordRestart("deacon") // sets BackoffUntil in the future (InitialBackoff default 30s)
++		d := &Daemon{
++			config:         &Config{TownRoot: townRoot},
++			logger:         log.New(logBuf, "", 0),
++			tmux:           tmux.NewTmux(),
++			restartTracker: rt,
++		}
++
++		projectDir := t.TempDir()
++		writeContextFixture(t, projectDir, 150_000, time.Now())
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: projectDir}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "restart in backoff, not cycling") {
++			t.Errorf("expected backoff guard log, got: %s", out)
++		}
++	})
++
++	t.Run("band red: usage-limit guard pauses instead of cycling", func(t *testing.T) {
++		townRoot, logBuf, _ := setupContextWatchdogTest(t)
++		t.Setenv("FAKE_SESSION_CREATED", fmt.Sprintf("%d", sessionOld.Unix()))
++		t.Setenv("FAKE_PANE_MARKER", usageLimitPaneMarker)
++		rt := NewRestartTracker(townRoot, DefaultRestartTrackerConfig())
++		d := &Daemon{
++			config:         &Config{TownRoot: townRoot},
++			logger:         log.New(logBuf, "", 0),
++			tmux:           tmux.NewTmux(),
++			restartTracker: rt,
++		}
++
++		projectDir := t.TempDir()
++		writeContextFixture(t, projectDir, 150_000, time.Now())
++		target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon", projectDir: projectDir}
++		d.evaluateContextTarget(target, testThresholds, time.Now())
++
++		out := logBuf.String()
++		if !strings.Contains(out, "paused on Claude usage-limit") {
++			t.Errorf("expected usage-limit guard log, got: %s", out)
++		}
++		if rt.CanRestart("deacon") {
++			t.Error("expected RecordPause to apply a backoff window")
++		}
++	})
++
++	// Deliberately NOT tested here: RED band + idle + all guards clear, all
++	// the way through executeLifecycleAction's actual respawn. Verified by
++	// hand that this hangs for minutes against a faked tmux binary — the
++	// pre-existing restart/session-readiness machinery it drives (readiness
++	// polling, dialog detection) assumes a real Claude process on the other
++	// end and is out of scope for this bead. The guard tests above cover
++	// every branch that decides whether that call is reached; the "over RED
++	// threshold and idle, cycling" log line firing (or not) is exercised
++	// implicitly via the busy/crash-loop/backoff/usage-limit tests, which
++	// all assert its ABSENCE.
++}
++
++func TestTryContextNudge(t *testing.T) {
++	cfg := &config.DaemonThresholds{ContextNudgeCooldown: "15m"}
++
++	townRoot, logBuf, _ := setupContextWatchdogTest(t)
++	t.Setenv("FAKE_PANE_MARKER", idlePaneMarker)
++	d := &Daemon{
++		config: &Config{TownRoot: townRoot},
++		logger: log.New(logBuf, "", 0),
++		tmux:   tmux.NewTmux(),
++	}
++
++	target := contextTarget{identity: "deacon", role: "deacon", sessionName: "hq-deacon"}
++	now := time.Now()
++
++	d.tryContextNudge(target, cfg, 1500, 1000, now)
++	if _, ok := d.contextNudgeLast["deacon"]; !ok {
++		t.Fatal("expected contextNudgeLast to be recorded after a nudge")
++	}
++	firstLog := logBuf.String()
++	if strings.Contains(firstLog, "nudge suppressed") {
++		t.Errorf("first nudge must not be suppressed, got: %s", firstLog)
++	}
++
++	// Second nudge, immediately after, well within the 15m cooldown: must be
++	// suppressed WITHOUT calling through to tmux again (fast path — no real
++	// NudgeSession round-trip).
++	logBuf.Reset()
++	d.tryContextNudge(target, cfg, 1600, 1000, now.Add(time.Second))
++	secondLog := logBuf.String()
++	if !strings.Contains(secondLog, "nudge suppressed") {
++		t.Errorf("expected cooldown suppression, got: %s", secondLog)
++	}
++}
++
++func intPtr(v int) *int { return &v }
+diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
+index 3c28d64c..11ea4987 100755
+--- a/internal/daemon/daemon.go
++++ b/internal/daemon/daemon.go
+@@ -90,6 +90,14 @@ type Daemon struct {
+ 	// Only accessed from heartbeat loop goroutine - no sync needed.
+ 	bootLastSpawned time.Time
+ 
++	// contextNudgeLast tracks the last time each persistent agent identity
++	// (e.g. "deacon", "<rig>-witness") was nudged at the YELLOW context-
++	// pressure tier, enforcing ContextNudgeCooldown so a repeatedly-ignored
++	// nudge doesn't spam the pane. Lazily initialized on first write, same
++	// pattern as syncFailures. Only accessed from heartbeat loop goroutine -
++	// no sync needed.
++	contextNudgeLast map[string]time.Time
++
+ 	// Restart tracking with exponential backoff to prevent crash loops
+ 	restartTracker *RestartTracker
+ 
+@@ -163,12 +171,14 @@ func daemonPathCandidates(home, exePath string) []string {
+ 		candidates = append(candidates, filepath.Dir(exePath))
+ 	}
+ 	if home != "" {
+-		candidates = append(candidates,
++		candidates = append(
++			candidates,
+ 			filepath.Join(home, ".local/bin"),
+ 			filepath.Join(home, "bin"),
+ 		)
+ 	}
+-	return append(candidates,
++	return append(
++		candidates,
+ 		"/opt/homebrew/bin",
+ 		"/usr/local/bin",
+ 	)
+@@ -218,7 +228,7 @@ var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
+ func New(config *Config) (*Daemon, error) {
+ 	// Ensure daemon directory exists
+ 	daemonDir := filepath.Dir(config.LogFile)
+-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
++	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+ 		return nil, fmt.Errorf("creating daemon directory: %w", err)
+ 	}
+ 
+@@ -979,6 +989,11 @@ func (d *Daemon) heartbeat(state *State) {
+ 	// Kill sessions that have been idle longer than the configured threshold.
+ 	d.reapIdlePolecats()
+ 
++	// 12c. Context-lifecycle watchdog: auto-cycle persistent agents (witness,
++	// refinery, deacon) whose Claude Code session context has crossed the
++	// YELLOW threshold, before they hit RED and wedge idle-at-prompt (gfork-47p.2).
++	d.checkContextPressure()
++
+ 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
+ 	// These are Task tool subagents that didn't clean up after completion.
+ 	// This is a safety net - Deacon patrol also does this more frequently.
+@@ -1089,7 +1104,8 @@ func (d *Daemon) checkAllRigsDolt() error {
+ 	if backend := readBeadsBackend(townBeadsDir); backend != "" && backend != "dolt" {
+ 		problems = append(problems, fmt.Sprintf(
+ 			"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
+-			"town-root", backend, d.config.TownRoot))
++			"town-root", backend, d.config.TownRoot,
++		))
+ 	}
+ 
+ 	// Check each registered rig
+@@ -1099,7 +1115,8 @@ func (d *Daemon) checkAllRigsDolt() error {
+ 			rigPath := filepath.Join(d.config.TownRoot, rigName)
+ 			problems = append(problems, fmt.Sprintf(
+ 				"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
+-				rigName, backend, rigPath))
++				rigName, backend, rigPath,
++			))
+ 		}
+ 	}
+ 
+-- 
+2.50.1 (Apple Git-155)
+

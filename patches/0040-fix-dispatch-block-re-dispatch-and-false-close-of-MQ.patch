@@ -1,0 +1,284 @@
+From 1ab0737e9ffbce41f78971a0b0fd0f9f8b57e9fc Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 11 Jul 2026 00:50:00 -0400
+Subject: [PATCH 40/56] fix(dispatch): block re-dispatch and false-close of
+ MQ-submitted beads (gfork-649)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause of the an-abn false-close (2026-07-11): under merge_strategy=pr
+the source bead stays open until its PR merges (hq-6wd2) and the polecat
+session stops after gt done — so the convoy stranded scan (isReadyIssue)
+saw every completed-but-unmerged bead as abandoned (open bead, dead
+session) and re-fed it. The duplicate polecat then hit gt done's no-MR
+path where the verified_push gate passes vacuously (zero commits, HEAD on
+the master base) and force-closed the bead while the prior attempt's PR
+was still open.
+
+Three guards, all keyed on open merge-request beads (FindOpenMRsForIssue):
+
+1. gt sling refuses beads with a clean open MR (no conflict/retry/close
+   evidence) unless --force — the chokepoint for every dispatcher.
+   Distressed-MR takeover (GH#gt-zqvj prior-attempt flow) still passes.
+2. convoy stranded ready-list skips such issues so the daemon stops
+   nominating them every scan.
+3. gt done's no-MR close path skips close when ANY open MR references the
+   issue — the refinery owns completion (false-close backstop).
+
+Dispatch guards fail open on lookup errors (degrade to current behavior
+when Dolt is down); the close guard is the safety net behind them.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ internal/cmd/convoy.go                 |  9 +++
+ internal/cmd/dispatch_mr_guard.go      | 59 ++++++++++++++++
+ internal/cmd/dispatch_mr_guard_test.go | 94 ++++++++++++++++++++++++++
+ internal/cmd/done.go                   | 17 +++++
+ internal/cmd/sling.go                  | 15 ++++
+ 5 files changed, 194 insertions(+)
+ create mode 100644 internal/cmd/dispatch_mr_guard.go
+ create mode 100644 internal/cmd/dispatch_mr_guard_test.go
+
+diff --git a/internal/cmd/convoy.go b/internal/cmd/convoy.go
+index 6e424151..90367541 100644
+--- a/internal/cmd/convoy.go
++++ b/internal/cmd/convoy.go
+@@ -1659,6 +1659,15 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
+ 				if !convoyops.IsSlingableType(t.IssueType) {
+ 					continue
+ 				}
++				// An issue with a clean open MR is not stranded — its work is
++				// submitted and awaiting merge/review; the refinery closes it
++				// on merge (gfork-649). Feeding it would re-sling a duplicate
++				// polecat (gt sling refuses these anyway; skipping here keeps
++				// the daemon from retrying every scan).
++				if mrID, blocked := openMRDispatchBlock(townBeads, t.ID); blocked {
++					fmt.Fprintf(os.Stderr, "⚠ Note: convoy %s: %s has open MR %s awaiting merge — not stranded\n", convoy.ID, t.ID, mrID)
++					continue
++				}
+ 				readyIssues = append(readyIssues, t.ID)
+ 			}
+ 		}
+diff --git a/internal/cmd/dispatch_mr_guard.go b/internal/cmd/dispatch_mr_guard.go
+new file mode 100644
+index 00000000..9afce44c
+--- /dev/null
++++ b/internal/cmd/dispatch_mr_guard.go
+@@ -0,0 +1,59 @@
++package cmd
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++
++	"github.com/steveyegge/gastown/internal/beads"
++)
++
++// blockingOpenMR classifies open merge-request beads for dispatch gating
++// (gfork-649). A clean open MR — no conflict/retry/close evidence — means the
++// source issue's work is already submitted and awaiting merge/review, so
++// re-dispatching the issue would spawn a duplicate polecat against work the
++// refinery owns. Distressed MRs (conflict task attached, retries recorded, or
++// a close_reason set) are legitimate prior-attempt takeover targets
++// (GH#gt-zqvj) and do not block.
++func blockingOpenMR(mrs []*beads.Issue) (string, bool) {
++	for _, mr := range mrs {
++		if mr == nil {
++			continue
++		}
++		f := beads.ParseMRFields(mr)
++		if f == nil {
++			// An open gt:merge-request bead without parseable fields still
++			// represents a submission — block conservatively.
++			return mr.ID, true
++		}
++		if f.RetryCount > 0 || f.ConflictTaskID != "" || f.CloseReason != "" {
++			continue
++		}
++		return mr.ID, true
++	}
++	return "", false
++}
++
++// openMRDispatchBlock reports whether issueID has a clean open merge request
++// that should block re-dispatch, resolving the issue's rig beads DB from its
++// prefix (MR beads live in the rig DB, not the town DB). Lookup failures fail
++// OPEN (no block): dispatch guards must degrade to current behavior when Dolt
++// is unavailable — gt done's open-MR close guard is the backstop against
++// false-closes.
++func openMRDispatchBlock(townRoot, issueID string) (string, bool) {
++	prefix := beads.ExtractPrefix(issueID)
++	if prefix == "" {
++		return "", false
++	}
++	rig := beads.GetRigNameForPrefix(townRoot, prefix)
++	if rig == "" {
++		return "", false // town-level bead — not part of the rig MR flow
++	}
++	bd := beads.New(filepath.Join(townRoot, rig))
++	mrs, err := bd.FindOpenMRsForIssue(issueID)
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Warning: open-MR dispatch check for %s failed (proceeding without guard): %v\n", issueID, err)
++		return "", false
++	}
++	return blockingOpenMR(mrs)
++}
+diff --git a/internal/cmd/dispatch_mr_guard_test.go b/internal/cmd/dispatch_mr_guard_test.go
+new file mode 100644
+index 00000000..a9805f60
+--- /dev/null
++++ b/internal/cmd/dispatch_mr_guard_test.go
+@@ -0,0 +1,94 @@
++package cmd
++
++import (
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/beads"
++)
++
++func mrIssue(id, description string) *beads.Issue {
++	return &beads.Issue{
++		ID:          id,
++		Title:       "Merge " + id,
++		Status:      "open",
++		Description: description,
++	}
++}
++
++func TestBlockingOpenMR_NoMRs(t *testing.T) {
++	if id, blocked := blockingOpenMR(nil); blocked {
++		t.Fatalf("nil MR list should not block, got %q", id)
++	}
++	if id, blocked := blockingOpenMR([]*beads.Issue{}); blocked {
++		t.Fatalf("empty MR list should not block, got %q", id)
++	}
++	if id, blocked := blockingOpenMR([]*beads.Issue{nil}); blocked {
++		t.Fatalf("nil MR entry should not block, got %q", id)
++	}
++}
++
++func TestBlockingOpenMR_CleanMRBlocks(t *testing.T) {
++	// The an-abn shape (gfork-649): gt done created a clean MR, the PR is
++	// open awaiting review — re-dispatch must be blocked.
++	mr := mrIssue("an-wisp-nglv", "branch: polecat/nux/an-abn\nsource_issue: an-abn\nworker: polecats/nux\nrig: android\ncommit_sha: abc123\n")
++	id, blocked := blockingOpenMR([]*beads.Issue{mr})
++	if !blocked {
++		t.Fatal("clean open MR must block dispatch")
++	}
++	if id != "an-wisp-nglv" {
++		t.Fatalf("expected blocking MR an-wisp-nglv, got %q", id)
++	}
++}
++
++func TestBlockingOpenMR_DistressedMRsAllowTakeover(t *testing.T) {
++	// Prior-attempt takeover (GH#gt-zqvj) stays possible: MRs with
++	// conflict/retry/close evidence do not block re-dispatch.
++	cases := []struct {
++		name string
++		desc string
++	}{
++		{"retry_count", "branch: b\nsource_issue: gt-1\nretry_count: 2\n"},
++		{"conflict_task", "branch: b\nsource_issue: gt-1\nconflict_task_id: gt-cfx\n"},
++		{"close_reason", "branch: b\nsource_issue: gt-1\nclose_reason: rejected\n"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if id, blocked := blockingOpenMR([]*beads.Issue{mrIssue("gt-wisp-1", tc.desc)}); blocked {
++				t.Fatalf("distressed MR (%s) should not block, got %q", tc.name, id)
++			}
++		})
++	}
++}
++
++func TestBlockingOpenMR_MixedDistressedAndClean(t *testing.T) {
++	distressed := mrIssue("gt-wisp-old", "branch: b1\nsource_issue: gt-1\nretry_count: 1\n")
++	clean := mrIssue("gt-wisp-new", "branch: b2\nsource_issue: gt-1\ncommit_sha: def456\n")
++	id, blocked := blockingOpenMR([]*beads.Issue{distressed, clean})
++	if !blocked {
++		t.Fatal("a clean MR alongside distressed ones must still block")
++	}
++	if id != "gt-wisp-new" {
++		t.Fatalf("expected clean MR gt-wisp-new to block, got %q", id)
++	}
++}
++
++func TestBlockingOpenMR_UnparseableFieldsBlocksConservatively(t *testing.T) {
++	// An open gt:merge-request bead without parseable key: value fields still
++	// represents a submission — fail closed on the dispatch side.
++	mr := mrIssue("gt-wisp-junk", "free-form text with no fields")
++	if _, blocked := blockingOpenMR([]*beads.Issue{mr}); !blocked {
++		t.Fatal("unparseable MR fields should block conservatively")
++	}
++}
++
++func TestOpenMRDispatchBlock_UnroutablePrefixFailsOpen(t *testing.T) {
++	// No routes.jsonl in an empty town root → prefix unresolvable → no block
++	// (fail open; gt done's close guard is the false-close backstop).
++	townRoot := t.TempDir()
++	if id, blocked := openMRDispatchBlock(townRoot, "zz-123"); blocked {
++		t.Fatalf("unroutable prefix should fail open, got %q", id)
++	}
++	if id, blocked := openMRDispatchBlock(townRoot, "noprefix"); blocked {
++		t.Fatalf("prefixless ID should fail open, got %q", id)
++	}
++}
+diff --git a/internal/cmd/done.go b/internal/cmd/done.go
+index 0da5cf48..dba98ef8 100644
+--- a/internal/cmd/done.go
++++ b/internal/cmd/done.go
+@@ -941,6 +941,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
+ 					skipClose = true
+ 				}
+ 
++				// False-close guard (gfork-649): "no commits ahead" does NOT
++				// mean the work landed — a prior attempt may have submitted it
++				// and its PR is still open awaiting merge/review. The
++				// verified_push gate below passes vacuously in that case (HEAD
++				// sits on the master base commit), so check for open MRs
++				// explicitly. The refinery closes the source issue when the MR
++				// merges (Manager.PostMerge).
++				if !skipClose {
++					if openMRs, findErr := bd.FindOpenMRsForIssue(issueID); findErr == nil && len(openMRs) > 0 {
++						skipReason := fmt.Sprintf("open merge request %s already references %s — work is submitted, awaiting merge", openMRs[0].ID, issueID)
++						style.PrintWarning("skipping close: %s", skipReason)
++						fmt.Printf("  The bead stays open; the refinery closes it when the PR merges.\n")
++						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
++						skipClose = true
++					}
++				}
++
+ 				if !skipClose {
+ 					closeReason := "Completed with no code changes (already fixed or already merged)"
+ 					noMRCommitSHA, _ := g.Rev("HEAD")
+diff --git a/internal/cmd/sling.go b/internal/cmd/sling.go
+index aaaa8511..d1b0cb66 100644
+--- a/internal/cmd/sling.go
++++ b/internal/cmd/sling.go
+@@ -638,6 +638,21 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
+ 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
+ 	}
+ 
++	// Guard against re-dispatching work already submitted to the merge queue
++	// (gfork-649). Under merge_strategy=pr the source bead stays open until
++	// its PR merges (hq-6wd2) and the polecat session stops after gt done —
++	// so to convoy/orphan recovery a completed-but-unmerged bead looks
++	// abandoned (open bead, dead session). Re-slinging it spawns a duplicate
++	// polecat that can false-close the bead while the PR is still open. A
++	// clean open MR means the refinery owns completion; MRs with
++	// conflict/retry evidence are legitimate takeover targets (GH#gt-zqvj)
++	// and pass through.
++	if !slingForce {
++		if mrID, blocked := openMRDispatchBlock(townRoot, beadID); blocked {
++			return fmt.Errorf("refusing to sling bead %s: open merge request %s is awaiting merge/review\nThe work is already submitted — the refinery closes the bead when the PR merges.\nIf the MR is stale, reject it first (gt mq reject %s) or use --force", beadID, mrID, mrID)
++		}
++	}
++
+ 	originalStatus := info.Status
+ 	originalAssignee := info.Assignee
+ 	force := slingForce // local copy to avoid mutating package-level flag
+-- 
+2.50.1 (Apple Git-155)
+

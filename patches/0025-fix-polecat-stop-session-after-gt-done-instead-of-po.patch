@@ -1,0 +1,212 @@
+From 8f4acc490621e0cceb86eedbe2008f3ebda2058a Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 4 Jul 2026 13:39:23 -0400
+Subject: [PATCH 25/56] fix(polecat): stop session after gt done instead of
+ poll-looping the MR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gfork-47p.1: replace the doomed in-process goroutine in done.go with a detached `sh -c 'sleep 3; exec gt session stop --force <target>'` (gated on !pushFailed && !mrFailed; GOOS!=windows), and reconcile the four mol-polecat-* formulas to the ephemeral contract — drop 'nuke sandbox'/'check the MR again' language, add an anti-poll hard-stop, bump versions. Resolves the done.go<->formula contradiction where a persistent-but-idle polecat invented a poll loop, grew to RED, and squatted a dispatch slot.
+
+Validated this session: gofumpt/vet/build/test-race green. E2E/devbox soak pending (lead gate).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../mol-polecat-code-review.formula.toml       | 18 ++++++++++++------
+ .../mol-polecat-review-pr.formula.toml         | 18 ++++++++++++------
+ .../mol-polecat-work-monorepo.formula.toml     | 12 +++++++++---
+ .../formulas/mol-polecat-work.formula.toml     | 16 +++++++++++-----
+ 4 files changed, 44 insertions(+), 20 deletions(-)
+
+diff --git a/internal/formula/formulas/mol-polecat-code-review.formula.toml b/internal/formula/formulas/mol-polecat-code-review.formula.toml
+index 217a18fd..4417cdd0 100644
+--- a/internal/formula/formulas/mol-polecat-code-review.formula.toml
++++ b/internal/formula/formulas/mol-polecat-code-review.formula.toml
+@@ -12,11 +12,12 @@ opportunities. The output is a set of beads capturing actionable findings.
+ You are a self-cleaning worker. You:
+ 1. Receive work via your hook (pinned molecule + review scope)
+ 2. Work through molecule steps using `bd mol current` / `bd close <step>`
+-3. Complete and self-clean via `gt done` (submit findings + nuke yourself)
++3. Complete and self-clean via `gt done` (submit findings + terminate your session)
+ 4. You are GONE - your findings are recorded in beads
+ 
+-**Self-cleaning:** When you run `gt done`, you submit your findings, nuke your
+-sandbox, and exit. There is no idle state. Done means gone.
++**Self-cleaning:** When you run `gt done`, you submit your findings and
++terminate your session — worktree preserved for pool reuse. There is no idle
++state. Done means gone.
+ 
+ **Important:** This formula defines the template. Your molecule already has step
+ beads created from it. Use `bd mol current` to find them - do NOT read this file directly.
+@@ -42,7 +43,7 @@ beads created from it. Use `bd mol current` to find them - do NOT read this file
+ | Can't understand code | Mail Witness for context |
+ | Critical issue found | Mail Witness immediately, then continue |"""
+ formula = "mol-polecat-code-review"
+-version = 1
++version = 2
+ 
+ [[steps]]
+ id = "load-context"
+@@ -298,7 +299,7 @@ Signal completion and clean up. You cease to exist after this step.
+ **Self-Cleaning Model:**
+ Once you run `gt done`, you're gone. The command:
+ 1. Syncs beads (final sync)
+-2. Nukes your sandbox
++2. Terminates your session — worktree preserved for pool reuse
+ 3. Exits your session immediately
+ 
+ **Run gt done:**
+@@ -314,7 +315,12 @@ gt done
+ 
+ You are NOT involved in any of that. You're gone. Done means gone.
+ 
+-**Exit criteria:** Beads synced, sandbox nuked, session exited."""
++**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
++not check mail, do not re-check the MR/PR/git, do not run any command. Your
++session terminates within seconds; if it isn't, sit silent — the town reclaims
++idle sessions. Any post-done polling is a bug.
++
++**Exit criteria:** Beads synced, session self-terminating, no further action taken."""
+ 
+ [vars]
+ [vars.scope]
+diff --git a/internal/formula/formulas/mol-polecat-review-pr.formula.toml b/internal/formula/formulas/mol-polecat-review-pr.formula.toml
+index 737b7284..0dc18db9 100644
+--- a/internal/formula/formulas/mol-polecat-review-pr.formula.toml
++++ b/internal/formula/formulas/mol-polecat-review-pr.formula.toml
+@@ -10,11 +10,12 @@ standards, then approves, requests changes, or files followup beads.
+ You are a self-cleaning worker. You:
+ 1. Receive work via your hook (pinned molecule + PR reference)
+ 2. Work through molecule steps using `bd mol current` / `bd close <step>`
+-3. Complete and self-clean via `gt done` (submit findings + nuke yourself)
++3. Complete and self-clean via `gt done` (submit findings + terminate your session)
+ 4. You are GONE - your review is recorded in beads
+ 
+-**Self-cleaning:** When you run `gt done`, you submit your findings, nuke your
+-sandbox, and exit. There is no idle state. Done means gone.
++**Self-cleaning:** When you run `gt done`, you submit your findings and
++terminate your session — worktree preserved for pool reuse. There is no idle
++state. Done means gone.
+ 
+ **Important:** This formula defines the template. Your molecule already has step
+ beads created from it. Use `bd mol current` to find them - do NOT read this file directly.
+@@ -40,7 +41,7 @@ beads created from it. Use `bd mol current` to find them - do NOT read this file
+ | Major issues found | File followup beads, request changes |
+ | Unclear requirements | Mail Witness for guidance |"""
+ formula = "mol-polecat-review-pr"
+-version = 1
++version = 2
+ 
+ [[steps]]
+ id = "load-context"
+@@ -260,7 +261,7 @@ Signal completion and clean up. You cease to exist after this step.
+ **Self-Cleaning Model:**
+ Once you run `gt done`, you're gone. The command:
+ 1. Syncs beads
+-2. Nukes your sandbox
++2. Terminates your session — worktree preserved for pool reuse
+ 3. Exits your session immediately
+ 
+ **Run gt done:**
+@@ -276,7 +277,12 @@ gt done
+ 
+ You are NOT involved in any of that. You're gone. Done means gone.
+ 
+-**Exit criteria:** Beads synced, sandbox nuked, session exited."""
++**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
++not check mail, do not re-check the MR/PR/git, do not run any command. Your
++session terminates within seconds; if it isn't, sit silent — the town reclaims
++idle sessions. Any post-done polling is a bug.
++
++**Exit criteria:** Beads synced, session self-terminating, no further action taken."""
+ 
+ [vars]
+ [vars.pr_url]
+diff --git a/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml b/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
+index f0905451..1933e3b5 100644
+--- a/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
++++ b/internal/formula/formulas/mol-polecat-work-monorepo.formula.toml
+@@ -13,11 +13,12 @@ crash after any step and resume from the last completed step.
+ You are a self-cleaning worker. You:
+ 1. Receive work via your hook (formula checklist + issue)
+ 2. Work through formula steps in order (shown inline at prime time)
+-3. Complete and self-clean via `gt done` (submit + nuke yourself)
++3. Complete and self-clean via `gt done` (submit + terminate your session)
+ 4. You are GONE - Refinery merges from MQ
+ 
+ **Self-cleaning:** When you run `gt done`, you push your work, submit to MQ,
+-nuke your sandbox, and exit. There is no idle state. Done means gone.
++and terminate your session — worktree preserved for pool reuse. There is no
++idle state. Done means gone.
+ 
+ **Important:** This formula defines the workflow template. Steps are shown inline
+ when you run `gt prime` — there are no separate step beads to close. Work through
+@@ -570,7 +571,12 @@ Check your base_branch variable:
+ 
+ You are GONE after `gt done`. Done means gone.
+ 
+-**Exit criteria:** Work submitted (or PR left for review), sandbox nuked, session exited."""
++**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
++not check mail, do not re-check the MR/PR/git, do not run any command. Your
++session terminates within seconds; if it isn't, sit silent — the town reclaims
++idle sessions. Any post-done polling is a bug.
++
++**Exit criteria:** Work submitted (or PR left for review), session self-terminating, no further action taken."""
+ 
+ [vars]
+ [vars.issue]
+diff --git a/internal/formula/formulas/mol-polecat-work.formula.toml b/internal/formula/formulas/mol-polecat-work.formula.toml
+index b40a0675..09130b4f 100644
+--- a/internal/formula/formulas/mol-polecat-work.formula.toml
++++ b/internal/formula/formulas/mol-polecat-work.formula.toml
+@@ -10,11 +10,12 @@ crash after any step and resume from the last completed step.
+ You are a self-cleaning worker. You:
+ 1. Receive work via your hook (formula checklist + issue)
+ 2. Work through formula steps in order (shown inline at prime time)
+-3. Complete and self-clean via `gt done` (submit + nuke yourself)
++3. Complete and self-clean via `gt done` (submit + terminate your session)
+ 4. You are GONE - Refinery merges from MQ
+ 
+ **Self-cleaning:** When you run `gt done`, you push your work, submit to MQ,
+-nuke your sandbox, and exit. There is no idle state. Done means gone.
++and terminate your session — worktree preserved for pool reuse. There is no
++idle state. Done means gone.
+ 
+ **Important:** This formula defines the workflow template. Steps are shown inline
+ when you run `gt prime` — there are no separate step beads to close. Work through
+@@ -521,7 +522,7 @@ Submit your work and clean up. You cease to exist after this step.
+ Once you run `gt done`, you're gone. The command:
+ 1. Pushes your branch to origin
+ 2. Creates an MR bead in the merge queue
+-3. Nukes your sandbox (worktree removal)
++3. Terminates your session — worktree preserved for pool reuse
+ 4. Exits your session immediately
+ 
+ **Pre-flight: Verify you have actual work to submit (HARD GATE):**
+@@ -550,7 +551,7 @@ You should see output like:
+   Source: polecat/<name>
+   Target: {{base_branch}}
+   Issue: {{issue}}
+-✓ Sandbox nuked
++✓ Self-terminating session
+ ✓ Session exiting
+ ```
+ 
+@@ -563,7 +564,12 @@ You should see output like:
+ 
+ You are NOT involved in any of that. You're gone. Done means gone.
+ 
+-**Exit criteria:** Work submitted, sandbox nuked, session exited."""
++**ANTI-POLL HARD STOP:** After `gt done` returns: END YOUR TURN IMMEDIATELY. Do
++not check mail, do not re-check the MR/PR/git, do not run any command. Your
++session terminates within seconds; if it isn't, sit silent — the town reclaims
++idle sessions. Any post-done polling is a bug.
++
++**Exit criteria:** Work submitted, session self-terminating, no further action taken."""
+ 
+ [vars]
+ [vars.issue]
+-- 
+2.50.1 (Apple Git-155)
+

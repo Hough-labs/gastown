@@ -1,0 +1,96 @@
+From 8e279b229295c61c3fb10f092bed6c18226bd5dd Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Sat, 4 Jul 2026 15:21:23 -0400
+Subject: [PATCH 28/56] fix(daemon): context watchdog skips zero-token trailing
+ usage events
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gfork-47p.2 E2E finding (live-town soak): CurrentContextTokens took the newest assistant usage event unconditionally, but Claude Code emits an all-zero-token usage row for server_tool_use (web search/fetch) and interrupted turns. When that synthetic row lands newest, the snapshot read 0 — a loaded agent reported as empty, so the watchdog would NEVER fire (the exact idle-wedge the feature prevents, defeated by a tool-use turn landing last). Verified on a live witness JSONL: newest event was a zero-token web-search turn masking a real ~45k context (reported 0 → now 45054). Fix: skip usage events whose token total is 0, falling through to the most recent real snapshot; error (fail-safe, caller skips tick) if none. Real-data cross-check unchanged for mayor (262343) + deacon (67899), byte-exact vs independent jq extraction. Regression tests added (trailing-zero fallback + all-zero→error).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/agentlog/context.go      | 17 ++++++++++++--
+ internal/agentlog/context_test.go | 37 +++++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/internal/agentlog/context.go b/internal/agentlog/context.go
+index 34dabd93..3770e0b0 100644
+--- a/internal/agentlog/context.go
++++ b/internal/agentlog/context.go
+@@ -140,8 +140,21 @@ func CurrentContextTokens(projectDir string, since time.Time) (int, error) {
+ 			continue
+ 		}
+ 		u := entry.Message.Usage
+-		return u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens, nil
++		total := u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
++		if total == 0 {
++			// A trailing usage event with all-zero token fields is a synthetic
++			// turn — Claude Code emits one for server_tool_use (web search/fetch)
++			// and interrupted/empty turns. It does NOT reflect the session's real
++			// context, so skip it and fall through to the most recent event that
++			// carries a real snapshot. Returning 0 here would make the watchdog
++			// read a loaded agent as empty and never fire — the exact idle-wedge
++			// this feature exists to prevent, defeated by a tool-use turn landing
++			// last. Verified against a live witness JSONL (gfork-47p.2 E2E): the
++			// newest event was a zero-token web-search turn masking a 45k context.
++			continue
++		}
++		return total, nil
+ 	}
+ 
+-	return 0, fmt.Errorf("no main-chain assistant usage event found in %s", path)
++	return 0, fmt.Errorf("no main-chain assistant usage event with non-zero tokens found in %s", path)
+ }
+diff --git a/internal/agentlog/context_test.go b/internal/agentlog/context_test.go
+index 8ff82c91..8046792f 100644
+--- a/internal/agentlog/context_test.go
++++ b/internal/agentlog/context_test.go
+@@ -124,6 +124,43 @@ func TestCurrentContextTokens(t *testing.T) {
+ 		}
+ 	})
+ 
++	t.Run("trailing zero-token turn: falls back to last real snapshot", func(t *testing.T) {
++		dir := t.TempDir()
++		// Claude Code emits a zero-token usage event for server_tool_use (web
++		// search/fetch) and interrupted turns. It lands NEWEST but does not
++		// reflect real context, so the snapshot must fall through to the last
++		// event carrying real tokens. Regression for the gfork-47p.2 E2E
++		// finding: a live witness's newest event was a zero-token web-search
++		// turn masking a ~45k context — reported 0, would never fire.
++		lines := []string{
++			ccUsageLine(false, 2, 5, 43546, 1307), // the real snapshot — golden answer
++			ccUsageLine(false, 0, 0, 0, 0),        // trailing zero-token web-search turn
++		}
++		writeJSONLFixture(t, dir, "session", lines, time.Now())
++
++		got, err := CurrentContextTokens(dir, sessionStart)
++		if err != nil {
++			t.Fatalf("CurrentContextTokens: %v", err)
++		}
++		want := 2 + 5 + 43546 + 1307
++		if got != want {
++			t.Errorf("got %d, want %d (trailing all-zero usage event must be skipped, not taken as the snapshot)", got, want)
++		}
++	})
++
++	t.Run("all zero-token turns: error, not zero", func(t *testing.T) {
++		dir := t.TempDir()
++		// If every usage event is a zero-token synthetic turn, there is no real
++		// snapshot — must error (caller skips the tick) rather than report 0,
++		// which would read a loaded agent as safely empty.
++		writeJSONLFixture(t, dir, "session",
++			[]string{ccUsageLine(false, 0, 0, 0, 0), ccUsageLine(false, 0, 0, 0, 0)},
++			time.Now())
++		if _, err := CurrentContextTokens(dir, sessionStart); err == nil {
++			t.Error("expected error when all usage events are zero-token, got nil")
++		}
++	})
++
+ 	t.Run("truncated last line: falls back to newest complete line", func(t *testing.T) {
+ 		dir := t.TempDir()
+ 		good := ccUsageLine(false, 10, 50, 40000, 1000)
+-- 
+2.50.1 (Apple Git-155)
+

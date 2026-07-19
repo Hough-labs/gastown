@@ -1,0 +1,42 @@
+From 57a4459f7308ae7ff0af843fba30e2f30e30b3ac Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 16:03:49 -0400
+Subject: [PATCH 44/56] fix(test): reconcile PR-approval stub with reviews-API
+ gate
+
+Upstream added TestPullRequestApprovalAndMergeUseResolvedURLAndRepo, whose
+fake gh stubs '--json reviewDecision'. Fork patch 0017 reads '--json reviews'
+(reviewDecision is empty on Free private repos), so the stub + log assertion
+must match the reviews-API shape. Reconciled during the upstream/main
+81233d36 -> 5ffa55a2 baseline bump.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/git/pr_lookup_test.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/internal/git/pr_lookup_test.go b/internal/git/pr_lookup_test.go
+index 449ee2d5..f8cbca29 100644
+--- a/internal/git/pr_lookup_test.go
++++ b/internal/git/pr_lookup_test.go
+@@ -133,7 +133,7 @@ func TestPullRequestApprovalAndMergeUseResolvedURLAndRepo(t *testing.T) {
+ 	installFakeGH(t, `#!/bin/sh
+ printf '%s\n' "$*" >> "$GH_LOG"
+ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+-  printf '%s\n' '{"reviewDecision":"APPROVED"}'
++  printf '%s\n' '{"reviews":[{"author":{"login":"reviewer1"},"state":"APPROVED"}]}'
+   exit 0
+ fi
+ if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+@@ -163,7 +163,7 @@ exit 1
+ 	}
+ 	log := string(logBytes)
+ 	for _, want := range []string{
+-		"pr view https://github.com/upstream/repo/pull/42 --json reviewDecision --repo upstream/repo",
++		"pr view https://github.com/upstream/repo/pull/42 --json reviews --repo upstream/repo",
+ 		"pr merge https://github.com/upstream/repo/pull/42 --squash --delete-branch --repo upstream/repo",
+ 	} {
+ 		if !strings.Contains(log, want) {
+-- 
+2.50.1 (Apple Git-155)
+

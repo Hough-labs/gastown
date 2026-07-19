@@ -1,0 +1,209 @@
+From 8b0a3b7ce9ed5b2b5c52912c52d2c569f78dac77 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sat, 18 Jul 2026 16:17:20 -0400
+Subject: [PATCH 48/56] fix(polecat): missing worktree classifies reusable, not
+ NEEDS_RECOVERY (hq-fqap)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A cleanly nuked polecat keeps its identity but its worktree/clone dir is
+removed (branch already pushed before nuke). Running git against the
+absent path fails, which the workstate gatherers recorded as an
+unknown-danger GitCheckFailed -> DecideWorkstate failed closed to
+NEEDS_RECOVERY. Nuked polecats then held pool slots permanently: observed
+live on feryn as recovery=10 of 11 (0 free), starving dispatch of 5
+mergeable PRs even though the polecats were healthy and reusable.
+
+A missing worktree holds no local uncommitted/stashed/unpushed work, so
+there is nothing to recover. Detect the absent clone dir explicitly in
+both workstate input gatherers (manager.workstateInputForPolecat and the
+check-recovery builder) and set a new WorktreeMissing fact instead of
+GitCheckFailed. DecideWorkstate clears the untrustworthy git-derived
+danger facts, treats the absent git state as clean, and skips the MQ
+submit check (no worktree to submit from). Bead-level blockers gathered
+independently — hook still set, active work, open MR — are still honored,
+so a nuked polecat with a genuinely open PR still reports PENDING_MR.
+
+Tests: add missing-worktree reusable case, MQ false-alarm suppression,
+and honored-open-MR / honored-hook cases to workstate_test.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/polecat.go            |  6 ++++
+ internal/polecat/manager.go        | 44 ++++++++++++++++++++----------
+ internal/polecat/workstate.go      | 29 ++++++++++++++++++++
+ internal/polecat/workstate_test.go | 29 ++++++++++++++++++++
+ 4 files changed, 93 insertions(+), 15 deletions(-)
+
+diff --git a/internal/cmd/polecat.go b/internal/cmd/polecat.go
+index 27e6eb3c..339020d3 100644
+--- a/internal/cmd/polecat.go
++++ b/internal/cmd/polecat.go
+@@ -1083,6 +1083,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
+ 	workTerminal := beadTerminal
+ 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
+ 	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch, SessionRunning: p.SessionRunning}
++	// A cleanly nuked polecat's worktree is gone; git checks against the absent
++	// clone path fail and would otherwise fail closed to NEEDS_RECOVERY. Flag the
++	// missing worktree so DecideWorkstate treats it as no-work-at-risk. (hq-fqap)
++	if _, statErr := os.Stat(p.ClonePath); os.IsNotExist(statErr) {
++		input.WorktreeMissing = true
++	}
+ 	var gitState *GitState
+ 	var gitErr error
+ 	gitStateLoaded := false
+diff --git a/internal/polecat/manager.go b/internal/polecat/manager.go
+index 20a4dc5b..ed8a5091 100644
+--- a/internal/polecat/manager.go
++++ b/internal/polecat/manager.go
+@@ -2350,30 +2350,44 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
+ 		}
+ 	}
+ 	clonePath := m.clonePath(name)
++	// A cleanly nuked polecat has no worktree on disk. Running git against a path
++	// that does not exist fails, which would otherwise be recorded as an
++	// unknown-danger GitCheckFailed and leak a permanent NEEDS_RECOVERY slot. Detect
++	// the absent worktree explicitly and skip the git-state gathering; DecideWorkstate
++	// treats a missing worktree as no-work-at-risk. (hq-fqap)
++	if _, statErr := os.Stat(clonePath); os.IsNotExist(statErr) {
++		input.WorktreeMissing = true
++	}
+ 	g := git.NewGit(clonePath)
+-	branch, branchErr := g.CurrentBranch()
+-	if branchErr != nil {
+-		input.GitCheckFailed = true
+-	} else {
+-		input.Branch = branch
++	var branch string
++	if !input.WorktreeMissing {
++		var branchErr error
++		branch, branchErr = g.CurrentBranch()
++		if branchErr != nil {
++			input.GitCheckFailed = true
++		} else {
++			input.Branch = branch
++		}
+ 	}
+ 	targetRefs, targetRefLookupFailed := m.reuseTargetRefs(fields, branch)
+ 	if targetRefLookupFailed {
+ 		input.MQLookupFailed = true
+ 	}
+-	if status, err := g.CheckUncommittedWork(); err == nil {
+-		input.GitDirty = !status.CleanExcludingRuntime()
+-		input.StashCount = status.StashCount
+-		input.UnpushedCommits = status.UnpushedCommits
+-	} else {
+-		input.GitCheckFailed = true
+-	}
+-	if branch != "" {
+-		if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
+-			input.UnpushedCommits = preservation.UnpreservedPatchCount
++	if !input.WorktreeMissing {
++		if status, err := g.CheckUncommittedWork(); err == nil {
++			input.GitDirty = !status.CleanExcludingRuntime()
++			input.StashCount = status.StashCount
++			input.UnpushedCommits = status.UnpushedCommits
+ 		} else {
+ 			input.GitCheckFailed = true
+ 		}
++		if branch != "" {
++			if preservation, err := g.BranchPreservationStatus(branch, "origin", targetRefs); err == nil {
++				input.UnpushedCommits = preservation.UnpreservedPatchCount
++			} else {
++				input.GitCheckFailed = true
++			}
++		}
+ 	}
+ 	// Legacy/test polecats can lack agent cleanup metadata. If git proves there is
+ 	// no local work at risk, treat the missing cleanup_status as clean; otherwise
+diff --git a/internal/polecat/workstate.go b/internal/polecat/workstate.go
+index 5df6fa59..865419ab 100644
+--- a/internal/polecat/workstate.go
++++ b/internal/polecat/workstate.go
+@@ -43,6 +43,15 @@ type WorkstateInput struct {
+ 	// a coder may have an empty worktree before its first commit. Such a polecat
+ 	// must never be classified SAFE_TO_NUKE or recovery will reap in-flight work. (hq-zxhx)
+ 	SessionRunning bool
++	// WorktreeMissing is true when the polecat's clone/worktree directory does not
++	// exist on disk. This is the normal state of a cleanly nuked polecat: identity
++	// persists, the worktree was removed, and the branch was pushed before nuke.
++	// A missing worktree holds no local uncommitted/stashed/unpushed work, so there
++	// is nothing to recover — the git-state checks below cannot run and must NOT be
++	// treated as an unknown-danger GitCheckFailed. Distinguishing this from a real
++	// git failure keeps nuked polecats classified reusable instead of leaking a
++	// capacity slot as a permanent NEEDS_RECOVERY false-positive. (hq-fqap)
++	WorktreeMissing bool
+ }
+ 
+ // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
+@@ -113,6 +122,26 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
+ 		}
+ 	}
+ 
++	// A missing worktree means the clone directory is gone, so there is no local
++	// uncommitted/stashed/unpushed work that could be lost — nothing to recover.
++	// The git-derived danger facts cannot be trusted (they were gathered against a
++	// path that no longer exists), so clear them and treat the absent git state as
++	// clean. Bead-level blockers (hook still set, active work, open MR) are gathered
++	// independently and are still honored below, so a nuked polecat with a genuinely
++	// open PR still reports PENDING_MR rather than reusable. MQ submission cannot be
++	// re-checked without a worktree and would only raise a false not-submitted alarm,
++	// so skip it — the ActiveMR bead assessment already covers real open PRs. (hq-fqap)
++	if in.WorktreeMissing {
++		in.GitCheckFailed = false
++		in.GitDirty = false
++		in.StashCount = 0
++		in.UnpushedCommits = 0
++		if in.CleanupStatus == CleanupUnknown || in.CleanupStatus == "" {
++			in.CleanupStatus = CleanupClean
++		}
++		in.MQCheckRequired = false
++	}
++
+ 	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}
+ 	capacityBlocked := false
+ 	block := func(reason, blocker string, countsTowardCapacity bool) {
+diff --git a/internal/polecat/workstate_test.go b/internal/polecat/workstate_test.go
+index f6036386..900dc393 100644
+--- a/internal/polecat/workstate_test.go
++++ b/internal/polecat/workstate_test.go
+@@ -149,6 +149,35 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
+ 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/review", SessionRunning: true},
+ 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "session-running", CountsTowardCapacity: true},
+ 		},
++		{
++			// hq-fqap: a nuked polecat's worktree is gone (cleanup_status unrecorded,
++			// git checks fail). No worktree means no work at risk — it is reusable
++			// capacity, not a permanent NEEDS_RECOVERY zombie holding a slot.
++			name: "missing worktree with unknown state is reusable",
++			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-preserved"},
++		},
++		{
++			// hq-fqap: a missing worktree must not let the MQ check raise a false
++			// not-submitted alarm — there is no worktree to submit from.
++			name: "missing worktree suppresses mq not-submitted false alarm",
++			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, MQCheckRequired: true, HasSubmittableWork: true},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-preserved"},
++		},
++		{
++			// hq-fqap: bead-level blockers are gathered independently of the worktree,
++			// so a nuked polecat with a genuinely open PR still reports PENDING_MR.
++			name: "missing worktree still honors open active mr",
++			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
++		},
++		{
++			// hq-fqap: a missing worktree does not excuse a hook that was never
++			// cleared — that is a genuine incomplete-handoff needing recovery.
++			name: "missing worktree still honors hook still set",
++			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupUnknown, Branch: "polecat/chrome", WorktreeMissing: true, GitCheckFailed: true, HookBead: "gt-open"},
++			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "hook-still-set", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"has work on hook (gt-open)"}},
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,49 @@
+From 1b6ae968f84a94cca9dd7e49d887309eddb34cfb Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 9 Jul 2026 15:41:48 -0400
+Subject: [PATCH 36/56] test(prime): reconcile refinery carve-out assertion
+ with upstream safety-stop gate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After rebasing onto upstream/main, the refinery startup-directive path is gated
+behind refinery.ActiveSafetyStop (upstream). In TestOutputStartupDirectiveLite's
+bare hermetic town that check can't be verified, so the refinery emits its
+safety-stop early exit instead of the STARTUP PROTOCOL block — breaking the
+stale assertion that demanded the full protocol text.
+
+The carve-out intent (refinery is NOT given the lite steady-state prime under
+primeLiteMode) is already proven by outputStartupDirectiveLite returning false
+(Fatalf above). Replace the template-internal string assertion with hermetic
+"not-lite" checks (no "steady-state patrol cycle", no "Begin patrol at step 1.").
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/prime_output_test.go | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/internal/cmd/prime_output_test.go b/internal/cmd/prime_output_test.go
+index 52611742..56c603e3 100644
+--- a/internal/cmd/prime_output_test.go
++++ b/internal/cmd/prime_output_test.go
+@@ -385,8 +385,14 @@ func TestOutputStartupDirectiveLite(t *testing.T) {
+ 			outputStartupDirective(ctx)
+ 		})
+ 
+-		if !strings.Contains(output, "STARTUP PROTOCOL") || !strings.Contains(output, "Refinery") {
+-			t.Errorf("refinery must keep its full startup protocol under primeLiteMode, got:\n%s", output)
++		// Carve-out is proven above: outputStartupDirectiveLite returns false for
++		// refinery. It then falls through to the full (non-lite) refinery path,
++		// which upstream gates behind refinery.ActiveSafetyStop — in this bare
++		// hermetic town that check can't be verified, so the full path emits its
++		// safety-stop early exit rather than the STARTUP PROTOCOL block. Either
++		// way, the lite collapse markers must be absent.
++		if strings.Contains(output, "steady-state patrol cycle") {
++			t.Errorf("refinery should not get the lite prime context, got:\n%s", output)
+ 		}
+ 		if strings.Contains(output, "Begin patrol at step 1.") {
+ 			t.Errorf("refinery should not get the lite patrol-start line, got:\n%s", output)
+-- 
+2.50.1 (Apple Git-155)
+

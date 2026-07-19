@@ -1,0 +1,49 @@
+From e667c5e5b890616206bf449664280cfeca60180f Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Thu, 4 Jun 2026 16:41:59 -0400
+Subject: [PATCH 20/56] fix(git): FetchBranch uses explicit refspec for
+ reliable branch resume (hq-w4z7)
+
+Re-slinging a gopher onto an existing PR branch (`gt sling --branch`)
+repeatedly failed with "couldn't find remote ref
+polecat/furiosa/gaunt-8ro8.1@mpznbgnd" then a noisy "full repair" + duplicate
+polecats. FetchBranch ran `git fetch <remote> <branch>` with a bare branch arg,
+which neither creates the remote-tracking ref nor reliably resolves polecat
+branch names (suffixed with an id after '@').
+
+Switch to an explicit src:dst refspec (branch:refs/remotes/<remote>/<branch>),
+mirroring FetchBranchShallow. This creates origin/<branch> and resolves the
+ref unambiguously, so the resume worktree-add finds it on the first try. All
+callers fetch a single branch, so the tracking ref is desirable for each.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/git/git.go | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/internal/git/git.go b/internal/git/git.go
+index 61657d79..5acccc97 100644
+--- a/internal/git/git.go
++++ b/internal/git/git.go
+@@ -916,8 +916,17 @@ func (g *Git) FetchPrune(remote string) error {
+ }
+ 
+ // FetchBranch fetches a specific branch from the remote.
++//
++// It uses an explicit refspec (src:dst) rather than a bare branch argument so
++// the remote-tracking ref (e.g. origin/<branch>) is created, and so the ref is
++// resolved unambiguously as a literal name. Polecat branches are suffixed with
++// an id (e.g. polecat/furiosa/gaunt-8ro8.1@mpznbgnd); a bare
++// `git fetch origin <branch>@<id>` was observed to fail with "couldn't find
++// remote ref" when resuming onto an existing PR branch. The refspec form mirrors
++// FetchBranchShallow and resolves it reliably. (hq-w4z7)
+ func (g *Git) FetchBranch(remote, branch string) error {
+-	_, err := g.run("fetch", remote, branch)
++	refspec := branch + ":refs/remotes/" + remote + "/" + branch
++	_, err := g.run("fetch", remote, refspec)
+ 	return err
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

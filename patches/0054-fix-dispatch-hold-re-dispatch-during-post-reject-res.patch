@@ -1,0 +1,252 @@
+From fb4fe8a17ad80243547575b57e50a5feba7577cd Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 16:51:58 -0400
+Subject: [PATCH 54/56] fix(dispatch): hold re-dispatch during post-reject
+ resubmit window (gfork-dk6)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RejectMR/closeIneligibleMR CLOSE the merge-request bead (close_reason
+rejected/superseded) but leave the source work bead open. The open-MR
+dispatch guard (gfork-649) only inspects OPEN MRs, so a just-rejected
+issue looks ready with no blocking MR — the deacon dispatches a duplicate
+polecat before the owner (the nudged worker, or the refinery) resubmits.
+
+Add a resubmit grace window: openMRDispatchBlock now also checks recently
+CLOSED rejected/superseded MRs and blocks re-dispatch for
+mrResubmitGraceWindow (10m) after the close. Stale rejects (past the
+window), merged/conflict closures, and unparseable close timestamps do
+not block — takeover degrades to current behavior, with gt done's close
+guard as the backstop. Adds FindClosedMRsForIssue.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/beads/beads_mr.go             | 22 ++++++++
+ internal/cmd/dispatch_mr_guard.go      | 72 +++++++++++++++++++++++-
+ internal/cmd/dispatch_mr_guard_test.go | 77 ++++++++++++++++++++++++++
+ 3 files changed, 170 insertions(+), 1 deletion(-)
+
+diff --git a/internal/beads/beads_mr.go b/internal/beads/beads_mr.go
+index 3ce13a61..1f2fb406 100644
+--- a/internal/beads/beads_mr.go
++++ b/internal/beads/beads_mr.go
+@@ -108,6 +108,28 @@ func (b *Beads) FindOpenMRsForIssue(issueID string) ([]*Issue, error) {
+ 	return matches, nil
+ }
+ 
++// FindClosedMRsForIssue returns closed merge-request beads whose source_issue
++// matches issueID. Used by the dispatch guard (gfork-dk6) to detect a recently
++// rejected/superseded MR whose owner is mid-resubmit, so a fresh dispatch is not
++// spawned into the resubmit window.
++func (b *Beads) FindClosedMRsForIssue(issueID string) ([]*Issue, error) {
++	issues, err := b.ListMergeRequests(ListOptions{
++		Status: "closed",
++		Label:  "gt:merge-request",
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	var matches []*Issue
++	for _, issue := range issues {
++		if MatchesMRSourceIssue(issue.Description, issueID) {
++			matches = append(matches, issue)
++		}
++	}
++	return matches, nil
++}
++
+ // MatchesMRSourceIssue returns true if the MR description contains a
+ // source_issue field matching the given issue ID exactly. The trailing
+ // newline in the needle prevents partial ID matches (e.g., "gt-abc"
+diff --git a/internal/cmd/dispatch_mr_guard.go b/internal/cmd/dispatch_mr_guard.go
+index 9afce44c..da5a2873 100644
+--- a/internal/cmd/dispatch_mr_guard.go
++++ b/internal/cmd/dispatch_mr_guard.go
+@@ -4,10 +4,20 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"time"
+ 
+ 	"github.com/steveyegge/gastown/internal/beads"
+ )
+ 
++// mrResubmitGraceWindow is how long after an MR is rejected/superseded the
++// dispatch guard keeps blocking re-dispatch of the source issue (gfork-dk6).
++// Reject CLOSES the MR bead, so the source issue momentarily has no OPEN MR and
++// the open-MR guard fails open — the deacon then dispatches a duplicate polecat
++// before the owner (the nudged worker, or the refinery) resubmits a fresh MR.
++// Once the window elapses with no resubmit, the work is treated as abandoned and
++// takeover proceeds as before.
++const mrResubmitGraceWindow = 10 * time.Minute
++
+ // blockingOpenMR classifies open merge-request beads for dispatch gating
+ // (gfork-649). A clean open MR — no conflict/retry/close evidence — means the
+ // source issue's work is already submitted and awaiting merge/review, so
+@@ -55,5 +65,65 @@ func openMRDispatchBlock(townRoot, issueID string) (string, bool) {
+ 		fmt.Fprintf(os.Stderr, "Warning: open-MR dispatch check for %s failed (proceeding without guard): %v\n", issueID, err)
+ 		return "", false
+ 	}
+-	return blockingOpenMR(mrs)
++	if mrID, blocked := blockingOpenMR(mrs); blocked {
++		return mrID, true
++	}
++
++	// gfork-dk6: a rejected/superseded MR is CLOSED, so it never appears in the
++	// open-MR list above — the source issue looks ready and the deacon spawns a
++	// duplicate polecat before the owner resubmits. Hold dispatch for a grace
++	// window after a recent reject so the resubmit can land first.
++	closed, err := bd.FindClosedMRsForIssue(issueID)
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Warning: closed-MR dispatch check for %s failed (proceeding without guard): %v\n", issueID, err)
++		return "", false
++	}
++	return recentlyResubmittingMR(closed, time.Now())
++}
++
++// recentlyResubmittingMR reports whether issueID has a merge request that was
++// rejected or superseded within mrResubmitGraceWindow of now, i.e. an owner is
++// expected to resubmit imminently and a fresh dispatch would duplicate it
++// (gfork-dk6). Merged/conflict closures and stale (past-window) rejects do not
++// block. An unparseable close timestamp fails OPEN, consistent with the rest of
++// this guard — gt done's open-MR close guard is the backstop.
++func recentlyResubmittingMR(mrs []*beads.Issue, now time.Time) (string, bool) {
++	for _, mr := range mrs {
++		if mr == nil {
++			continue
++		}
++		f := beads.ParseMRFields(mr)
++		if f == nil {
++			continue
++		}
++		if f.CloseReason != "rejected" && f.CloseReason != "superseded" {
++			continue
++		}
++		closedAt := mrCloseTime(mr)
++		if closedAt.IsZero() {
++			continue
++		}
++		if now.Sub(closedAt) <= mrResubmitGraceWindow {
++			return mr.ID, true
++		}
++	}
++	return "", false
++}
++
++// mrCloseTime resolves when an MR bead reached its terminal state, preferring
++// the explicit closed_at and falling back to updated_at (the reject updates the
++// bead). Returns the zero time if neither is a parseable RFC3339 timestamp.
++func mrCloseTime(mr *beads.Issue) time.Time {
++	for _, ts := range []string{mr.ClosedAt, mr.UpdatedAt} {
++		if ts == "" {
++			continue
++		}
++		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
++			return t
++		}
++		if t, err := time.Parse(time.RFC3339, ts); err == nil {
++			return t
++		}
++	}
++	return time.Time{}
+ }
+diff --git a/internal/cmd/dispatch_mr_guard_test.go b/internal/cmd/dispatch_mr_guard_test.go
+index a9805f60..d55a8e5e 100644
+--- a/internal/cmd/dispatch_mr_guard_test.go
++++ b/internal/cmd/dispatch_mr_guard_test.go
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"testing"
++	"time"
+ 
+ 	"github.com/steveyegge/gastown/internal/beads"
+ )
+@@ -81,6 +82,82 @@ func TestBlockingOpenMR_UnparseableFieldsBlocksConservatively(t *testing.T) {
+ 	}
+ }
+ 
++func closedMR(id, closeReason string, closedAt time.Time) *beads.Issue {
++	iss := &beads.Issue{
++		ID:          id,
++		Title:       "Merge " + id,
++		Status:      "closed",
++		Description: "branch: b\nsource_issue: gt-1\nclose_reason: " + closeReason + "\n",
++	}
++	if !closedAt.IsZero() {
++		iss.ClosedAt = closedAt.Format(time.RFC3339)
++	}
++	return iss
++}
++
++func TestRecentlyResubmittingMR_BlocksWithinGraceWindow(t *testing.T) {
++	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
++	for _, reason := range []string{"rejected", "superseded"} {
++		t.Run(reason, func(t *testing.T) {
++			mr := closedMR("gt-wisp-rej", reason, now.Add(-2*time.Minute))
++			id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now)
++			if !blocked {
++				t.Fatalf("recent %s MR must block during resubmit window", reason)
++			}
++			if id != "gt-wisp-rej" {
++				t.Fatalf("expected gt-wisp-rej, got %q", id)
++			}
++		})
++	}
++}
++
++func TestRecentlyResubmittingMR_StaleRejectAllowsTakeover(t *testing.T) {
++	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
++	mr := closedMR("gt-wisp-old", "rejected", now.Add(-mrResubmitGraceWindow-time.Minute))
++	if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
++		t.Fatalf("a reject older than the grace window must not block, got %q", id)
++	}
++}
++
++func TestRecentlyResubmittingMR_NonResubmitReasonsDoNotBlock(t *testing.T) {
++	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
++	for _, reason := range []string{"merged", "conflict", ""} {
++		t.Run("reason="+reason, func(t *testing.T) {
++			mr := closedMR("gt-wisp-x", reason, now.Add(-time.Minute))
++			if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
++				t.Fatalf("close_reason %q should not block dispatch, got %q", reason, id)
++			}
++		})
++	}
++}
++
++func TestRecentlyResubmittingMR_UnparseableCloseTimeFailsOpen(t *testing.T) {
++	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
++	mr := &beads.Issue{
++		ID:          "gt-wisp-notime",
++		Status:      "closed",
++		Description: "branch: b\nsource_issue: gt-1\nclose_reason: rejected\n",
++		ClosedAt:    "not-a-timestamp",
++		UpdatedAt:   "also-bad",
++	}
++	if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
++		t.Fatalf("unparseable close time should fail open, got %q", id)
++	}
++}
++
++func TestRecentlyResubmittingMR_FallsBackToUpdatedAt(t *testing.T) {
++	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
++	mr := &beads.Issue{
++		ID:          "gt-wisp-upd",
++		Status:      "closed",
++		Description: "branch: b\nsource_issue: gt-1\nclose_reason: rejected\n",
++		UpdatedAt:   now.Add(-time.Minute).Format(time.RFC3339),
++	}
++	if _, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); !blocked {
++		t.Fatal("a recent reject with only updated_at set must still block")
++	}
++}
++
+ func TestOpenMRDispatchBlock_UnroutablePrefixFailsOpen(t *testing.T) {
+ 	// No routes.jsonl in an empty town root → prefix unresolvable → no block
+ 	// (fail open; gt done's close guard is the false-close backstop).
+-- 
+2.50.1 (Apple Git-155)
+

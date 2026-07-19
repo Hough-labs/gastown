@@ -1,0 +1,46 @@
+From 66d91952f81c31ccc67e7fcb9351ef82a6e0914d Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Fri, 3 Jul 2026 23:35:40 -0400
+Subject: [PATCH 24/56] build(patches): bump fork baseline v1.2.0 -> v1.2.1
+
+Rebased the local patch stack onto the released v1.2.1 tag, dropping four
+patches upstream now subsumes (costs-record polecat Stop 0005/0018 via the
+role-aware Stop check, reaper Dolt-1105 0026 via v1.2.1's schema rework, mail
+reply-to 0027). Retarget UPSTREAM_BASE so make patches / pre-push validate
+against the new base.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .githooks/pre-push | 2 +-
+ Makefile           | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index ac8ed237..af66cbb8 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -9,7 +9,7 @@
+ # ── Anvil branch: validate patches/ is up-to-date ───────────────────────────
+ # Baseline tag this fork tracks. Keep in sync with UPSTREAM_BASE in the Makefile;
+ # bump both on every upstream upgrade.
+-UPSTREAM_BASE="v1.2.0"
++UPSTREAM_BASE="v1.2.1"
+ BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+ if [ "$BRANCH_NAME" = "anvil" ]; then
+     PATCH_TMPDIR=$(mktemp -d)
+diff --git a/Makefile b/Makefile
+index b17d1d0a..4071a42a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -193,7 +193,7 @@ check-version-tag:
+ # Upstream baseline this fork tracks. We pin to a release TAG (not upstream/main)
+ # because main diverges from release tags. Bump this on every upstream upgrade
+ # (and the matching ref in .githooks/pre-push), then rebase patches onto it.
+-UPSTREAM_BASE := v1.2.0
++UPSTREAM_BASE := v1.2.1
+ 
+ # Export current local commits (UPSTREAM_BASE..HEAD divergence) to patches/.
+ # Run this after adding or editing a local patch commit.
+-- 
+2.50.1 (Apple Git-155)
+
