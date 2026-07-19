@@ -4,9 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
+
+// mrResubmitGraceWindow is how long after an MR is rejected/superseded the
+// dispatch guard keeps blocking re-dispatch of the source issue (gfork-dk6).
+// Reject CLOSES the MR bead, so the source issue momentarily has no OPEN MR and
+// the open-MR guard fails open — the deacon then dispatches a duplicate polecat
+// before the owner (the nudged worker, or the refinery) resubmits a fresh MR.
+// Once the window elapses with no resubmit, the work is treated as abandoned and
+// takeover proceeds as before.
+const mrResubmitGraceWindow = 10 * time.Minute
 
 // blockingOpenMR classifies open merge-request beads for dispatch gating
 // (gfork-649). A clean open MR — no conflict/retry/close evidence — means the
@@ -55,5 +65,65 @@ func openMRDispatchBlock(townRoot, issueID string) (string, bool) {
 		fmt.Fprintf(os.Stderr, "Warning: open-MR dispatch check for %s failed (proceeding without guard): %v\n", issueID, err)
 		return "", false
 	}
-	return blockingOpenMR(mrs)
+	if mrID, blocked := blockingOpenMR(mrs); blocked {
+		return mrID, true
+	}
+
+	// gfork-dk6: a rejected/superseded MR is CLOSED, so it never appears in the
+	// open-MR list above — the source issue looks ready and the deacon spawns a
+	// duplicate polecat before the owner resubmits. Hold dispatch for a grace
+	// window after a recent reject so the resubmit can land first.
+	closed, err := bd.FindClosedMRsForIssue(issueID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: closed-MR dispatch check for %s failed (proceeding without guard): %v\n", issueID, err)
+		return "", false
+	}
+	return recentlyResubmittingMR(closed, time.Now())
+}
+
+// recentlyResubmittingMR reports whether issueID has a merge request that was
+// rejected or superseded within mrResubmitGraceWindow of now, i.e. an owner is
+// expected to resubmit imminently and a fresh dispatch would duplicate it
+// (gfork-dk6). Merged/conflict closures and stale (past-window) rejects do not
+// block. An unparseable close timestamp fails OPEN, consistent with the rest of
+// this guard — gt done's open-MR close guard is the backstop.
+func recentlyResubmittingMR(mrs []*beads.Issue, now time.Time) (string, bool) {
+	for _, mr := range mrs {
+		if mr == nil {
+			continue
+		}
+		f := beads.ParseMRFields(mr)
+		if f == nil {
+			continue
+		}
+		if f.CloseReason != "rejected" && f.CloseReason != "superseded" {
+			continue
+		}
+		closedAt := mrCloseTime(mr)
+		if closedAt.IsZero() {
+			continue
+		}
+		if now.Sub(closedAt) <= mrResubmitGraceWindow {
+			return mr.ID, true
+		}
+	}
+	return "", false
+}
+
+// mrCloseTime resolves when an MR bead reached its terminal state, preferring
+// the explicit closed_at and falling back to updated_at (the reject updates the
+// bead). Returns the zero time if neither is a parseable RFC3339 timestamp.
+func mrCloseTime(mr *beads.Issue) time.Time {
+	for _, ts := range []string{mr.ClosedAt, mr.UpdatedAt} {
+		if ts == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			return t
+		}
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }

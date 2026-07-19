@@ -108,6 +108,28 @@ func (b *Beads) FindOpenMRsForIssue(issueID string) ([]*Issue, error) {
 	return matches, nil
 }
 
+// FindClosedMRsForIssue returns closed merge-request beads whose source_issue
+// matches issueID. Used by the dispatch guard (gfork-dk6) to detect a recently
+// rejected/superseded MR whose owner is mid-resubmit, so a fresh dispatch is not
+// spawned into the resubmit window.
+func (b *Beads) FindClosedMRsForIssue(issueID string) ([]*Issue, error) {
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "closed",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var matches []*Issue
+	for _, issue := range issues {
+		if MatchesMRSourceIssue(issue.Description, issueID) {
+			matches = append(matches, issue)
+		}
+	}
+	return matches, nil
+}
+
 // MatchesMRSourceIssue returns true if the MR description contains a
 // source_issue field matching the given issue ID exactly. The trailing
 // newline in the needle prevents partial ID matches (e.g., "gt-abc"

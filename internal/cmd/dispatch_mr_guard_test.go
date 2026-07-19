@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
@@ -78,6 +79,82 @@ func TestBlockingOpenMR_UnparseableFieldsBlocksConservatively(t *testing.T) {
 	mr := mrIssue("gt-wisp-junk", "free-form text with no fields")
 	if _, blocked := blockingOpenMR([]*beads.Issue{mr}); !blocked {
 		t.Fatal("unparseable MR fields should block conservatively")
+	}
+}
+
+func closedMR(id, closeReason string, closedAt time.Time) *beads.Issue {
+	iss := &beads.Issue{
+		ID:          id,
+		Title:       "Merge " + id,
+		Status:      "closed",
+		Description: "branch: b\nsource_issue: gt-1\nclose_reason: " + closeReason + "\n",
+	}
+	if !closedAt.IsZero() {
+		iss.ClosedAt = closedAt.Format(time.RFC3339)
+	}
+	return iss
+}
+
+func TestRecentlyResubmittingMR_BlocksWithinGraceWindow(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	for _, reason := range []string{"rejected", "superseded"} {
+		t.Run(reason, func(t *testing.T) {
+			mr := closedMR("gt-wisp-rej", reason, now.Add(-2*time.Minute))
+			id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now)
+			if !blocked {
+				t.Fatalf("recent %s MR must block during resubmit window", reason)
+			}
+			if id != "gt-wisp-rej" {
+				t.Fatalf("expected gt-wisp-rej, got %q", id)
+			}
+		})
+	}
+}
+
+func TestRecentlyResubmittingMR_StaleRejectAllowsTakeover(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	mr := closedMR("gt-wisp-old", "rejected", now.Add(-mrResubmitGraceWindow-time.Minute))
+	if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
+		t.Fatalf("a reject older than the grace window must not block, got %q", id)
+	}
+}
+
+func TestRecentlyResubmittingMR_NonResubmitReasonsDoNotBlock(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	for _, reason := range []string{"merged", "conflict", ""} {
+		t.Run("reason="+reason, func(t *testing.T) {
+			mr := closedMR("gt-wisp-x", reason, now.Add(-time.Minute))
+			if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
+				t.Fatalf("close_reason %q should not block dispatch, got %q", reason, id)
+			}
+		})
+	}
+}
+
+func TestRecentlyResubmittingMR_UnparseableCloseTimeFailsOpen(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	mr := &beads.Issue{
+		ID:          "gt-wisp-notime",
+		Status:      "closed",
+		Description: "branch: b\nsource_issue: gt-1\nclose_reason: rejected\n",
+		ClosedAt:    "not-a-timestamp",
+		UpdatedAt:   "also-bad",
+	}
+	if id, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); blocked {
+		t.Fatalf("unparseable close time should fail open, got %q", id)
+	}
+}
+
+func TestRecentlyResubmittingMR_FallsBackToUpdatedAt(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	mr := &beads.Issue{
+		ID:          "gt-wisp-upd",
+		Status:      "closed",
+		Description: "branch: b\nsource_issue: gt-1\nclose_reason: rejected\n",
+		UpdatedAt:   now.Add(-time.Minute).Format(time.RFC3339),
+	}
+	if _, blocked := recentlyResubmittingMR([]*beads.Issue{mr}, now); !blocked {
+		t.Fatal("a recent reject with only updated_at set must still block")
 	}
 }
 
