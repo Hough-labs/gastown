@@ -37,7 +37,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-
 	"runtime"
 	"strconv"
 	"strings"
@@ -443,7 +442,8 @@ func (c *Config) HostPort() string {
 // databases relative to cmd.Dir instead of querying the live shared server.
 func buildDoltSQLCmd(ctx context.Context, config *Config, args ...string) *exec.Cmd {
 	fullArgs := make([]string, 0, 8+len(args))
-	fullArgs = append(fullArgs,
+	fullArgs = append(
+		fullArgs,
 		"--host", config.EffectiveHost(),
 		"--port", strconv.Itoa(config.Port),
 		"--user", config.User,
@@ -609,7 +609,7 @@ func SaveState(townRoot string, state *State) error {
 	stateFile := StateFile(townRoot)
 
 	// Ensure daemon directory exists
-	if err := os.MkdirAll(filepath.Dir(stateFile), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil {
 		return err
 	}
 
@@ -623,10 +623,10 @@ func refreshPIDStateFromLiveInfo(townRoot string, config *Config, pid int) (bool
 
 	changed := false
 	if data, err := os.ReadFile(config.PidFile); err != nil || strings.TrimSpace(string(data)) != strconv.Itoa(pid) {
-		if err := os.MkdirAll(filepath.Dir(config.PidFile), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(config.PidFile), 0o755); err != nil {
 			return changed, err
 		}
-		if err := atomicfile.WriteFile(config.PidFile, []byte(strconv.Itoa(pid)+"\n"), 0644); err != nil {
+		if err := atomicfile.WriteFile(config.PidFile, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
 			return changed, err
 		}
 		changed = true
@@ -1438,12 +1438,11 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("resolving town root: %w", err)
 	}
-	absTemp, err := filepath.Abs(os.TempDir())
-	if err != nil {
-		return 0, fmt.Errorf("resolving temp dir: %w", err)
-	}
-	rel, err := filepath.Rel(absTemp, absRoot)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+	// Checked against both the raw and symlink-resolved forms of os.TempDir()
+	// (see isUnderTempDir): callers that pre-resolve their temp dir (e.g. via
+	// filepath.EvalSymlinks, common on macOS where t.TempDir() sits behind a
+	// /var -> /private/var symlink) would otherwise be wrongly refused here.
+	if !isUnderTempDir(absRoot) {
 		return 0, fmt.Errorf("refusing to reap Dolt outside temp dir: %s", absRoot)
 	}
 
@@ -1481,6 +1480,203 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		}
 	}
 
+	return stopped, nil
+}
+
+// OrphanProcessCandidate describes a dolt sql-server process being evaluated
+// for operational (non-test) orphan reaping. Every field is derived from
+// read-only process inspection so shouldReapOrphanCandidate stays a pure,
+// unit-testable gate — no live process needed to test the decision logic.
+type OrphanProcessCandidate struct {
+	PID                  int
+	ParentPID            int
+	Port                 int
+	DataDir              string
+	EstablishedConnCount int
+}
+
+// shouldReapOrphanCandidate decides whether an operationally-orphaned dolt
+// sql-server process is safe to reap. Every clause favors leaving an
+// ambiguous process alone: this must NEVER return true for the bastion/3307
+// production server (hq-rhlx — a data-dir mismatch killed prod Dolt twice)
+// or for any server still serving a client.
+func shouldReapOrphanCandidate(c OrphanProcessCandidate) bool {
+	if c.Port == DefaultPort {
+		return false
+	}
+	if isBastionDataDir(c.DataDir) {
+		return false
+	}
+	orphanedParent := c.ParentPID == 1
+	if !orphanedParent && !isEphemeralDataDir(c.DataDir) {
+		return false
+	}
+	if c.EstablishedConnCount > 0 {
+		return false
+	}
+	return true
+}
+
+// isBastionDataDir reports whether dataDir belongs to the launchd-managed
+// bastion Dolt install (~/.local/share/bastion/dolt/databases) — the shared
+// production server that must never be targeted by an automated reaper.
+func isBastionDataDir(dataDir string) bool {
+	if dataDir == "" {
+		return false
+	}
+	sep := string(filepath.Separator)
+	return strings.Contains(dataDir, sep+"bastion"+sep)
+}
+
+// isEphemeralDataDir reports whether dataDir sits under a known ephemeral
+// root: Go's os.TempDir(), or the Claude Code sandbox scratchpad root
+// (/private/tmp/claude-* or /tmp/claude-*), which macOS's os.TempDir()
+// (/var/folders/.../T) does not cover — the class of leak seen in the
+// hq-wisp-8ww incident (scratchpad-rooted orphan on port 13307).
+func isEphemeralDataDir(dataDir string) bool {
+	if dataDir == "" {
+		return false
+	}
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return false
+	}
+	if isUnderTempDir(absDataDir) {
+		return true
+	}
+	for _, root := range []string{"/private/tmp/claude-", "/tmp/claude-"} {
+		if strings.HasPrefix(absDataDir, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnderTempDir reports whether absPath sits under os.TempDir(), checking
+// both the raw path and its symlink-resolved form. On macOS, os.TempDir()
+// returns a symlinked path (/var/folders/...) while live processes report
+// (via ps/lsof cwd) and test helpers that call filepath.EvalSymlinks see the
+// resolved form (/private/var/folders/...) — comparing against only one form
+// misclassifies genuinely temp-dir-rooted paths as outside it.
+func isUnderTempDir(absPath string) bool {
+	temp := os.TempDir()
+	candidates := []string{temp}
+	if resolved, err := filepath.EvalSymlinks(temp); err == nil {
+		candidates = append(candidates, resolved)
+	}
+	for _, candidate := range candidates {
+		absTemp, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if rel, err := filepath.Rel(absTemp, absPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
+			return true
+		}
+	}
+	return false
+}
+
+// getParentPID returns pid's parent process ID, or 0 if it cannot be resolved
+// (including on Windows, where this is not supported).
+func getParentPID(pid int) int {
+	if runtime.GOOS == "windows" {
+		return 0
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=")
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	ppid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return ppid
+}
+
+// countEstablishedConnections returns the number of ESTABLISHED TCP client
+// connections to pid's listening port. Scoped to both the PID (via lsof's
+// ANDed -a -p) and that specific port (-i TCP:port) rather than PID alone —
+// dolt sql-server itself holds outbound ESTABLISHED connections unrelated to
+// serving clients (e.g. a DoltHub telemetry/update-check connection on 443),
+// which would otherwise be miscounted as "still serving a client" and block
+// every reap.
+func countEstablishedConnections(pid, port int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-i", fmt.Sprintf("TCP:%d", port), "-sTCP:ESTABLISHED", "-n", "-P", "-F", "n")
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(line, "n") {
+			count++
+		}
+	}
+	return count
+}
+
+// FindOrphanedDoltProcesses discovers operationally-orphaned dolt sql-server
+// candidates system-wide, without terminating anything — the read-only
+// counterpart to ReapOrphanedDoltProcesses, used for --dry-run previews.
+func FindOrphanedDoltProcesses() []OrphanProcessCandidate {
+	var candidates []OrphanProcessCandidate
+	for _, listener := range FindAllDoltListeners() {
+		if listener.PID <= 0 || !processIsAlive(listener.PID) {
+			continue
+		}
+		if !isDoltSQLServerProcess(listener.PID) {
+			continue
+		}
+		candidate := OrphanProcessCandidate{
+			PID:                  listener.PID,
+			ParentPID:            getParentPID(listener.PID),
+			Port:                 listener.Port,
+			DataDir:              resolveDataDirFromProcess(listener.PID),
+			EstablishedConnCount: countEstablishedConnections(listener.PID, listener.Port),
+		}
+		if shouldReapOrphanCandidate(candidate) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates
+}
+
+// ReapOrphanedDoltProcesses terminates operationally-orphaned dolt sql-server
+// processes system-wide: servers reparented to PID 1, or rooted in a known
+// ephemeral data dir, that hold zero established client connections. This is
+// the operational (production) counterpart to ReapOwnedTestServers, which is
+// scoped to a single test-owned townRoot. Unlike that helper, this scans every
+// dolt listener on the machine — but the bastion/3307 production server and
+// any server with live connections are always skipped; see
+// shouldReapOrphanCandidate, the single safety gate every candidate passes
+// through before a signal is sent.
+func ReapOrphanedDoltProcesses() (stopped int, err error) {
+	for _, candidate := range FindOrphanedDoltProcesses() {
+		proc, findErr := os.FindProcess(candidate.PID)
+		if findErr != nil {
+			continue
+		}
+		if err := gracefulTerminate(proc); err != nil {
+			return stopped, fmt.Errorf("terminating orphaned Dolt PID %d: %w", candidate.PID, err)
+		}
+		for i := 0; i < 20; i++ {
+			time.Sleep(100 * time.Millisecond)
+			if !processIsAlive(candidate.PID) {
+				stopped++
+				break
+			}
+		}
+		if processIsAlive(candidate.PID) {
+			_ = proc.Kill()
+			time.Sleep(100 * time.Millisecond)
+			stopped++
+		}
+	}
 	return stopped, nil
 }
 
@@ -1569,19 +1765,29 @@ func PortHolder(port int) (pid int, dataDir string) {
 	if pid <= 0 {
 		return 0, ""
 	}
-	if dataDir = GetDoltDataDirFromProcess(pid); dataDir != "" {
-		return pid, dataDir
+	return pid, resolveDataDirFromProcess(pid)
+}
+
+// resolveDataDirFromProcess best-effort resolves the data directory a live
+// dolt sql-server process is serving from, in decreasing order of certainty:
+// the structural --data-dir flag, the directory containing a --config
+// config.yaml (Gas Town always launches via --config, never --data-dir — see
+// NewSQLServerCommand), and finally the process's CWD (cmd.Dir is set to the
+// data dir at launch). Returns "" if none can be resolved.
+func resolveDataDirFromProcess(pid int) string {
+	if dataDir := GetDoltDataDirFromProcess(pid); dataDir != "" {
+		return dataDir
 	}
 	if configPath := getDoltConfigPathFromProcess(pid); configPath != "" {
 		if filepath.Base(configPath) == "config.yaml" {
-			return pid, filepath.Dir(configPath)
+			return filepath.Dir(configPath)
 		}
-		return pid, configPath
+		return configPath
 	}
 	if cwd := getProcessCWD(pid); cwd != "" {
-		return pid, cwd
+		return cwd
 	}
-	return pid, ""
+	return ""
 }
 
 // FindFreePort returns the first free TCP port at or above startFrom.
@@ -1668,7 +1874,8 @@ func writeServerConfig(config *Config, configPath string) error {
 		systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(config.DoltStatsEnabled))
 	}
 
-	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town (gt dolt start)
+	content := fmt.Sprintf(
+		`# Dolt SQL server configuration — managed by Gas Town (gt dolt start)
 # Do not edit manually; changes are overwritten on each server start.
 # To customize, set Gas Town environment variables:
 #   GT_DOLT_PORT, GT_DOLT_HOST, GT_DOLT_USER, GT_DOLT_PASSWORD, GT_DOLT_LOGLEVEL
@@ -1698,7 +1905,7 @@ behavior:
 		systemVariablesBlock,
 	)
 
-	return os.WriteFile(configPath, []byte(content), 0600)
+	return os.WriteFile(configPath, []byte(content), 0o600)
 }
 
 // Start starts the Dolt SQL server.
@@ -1707,7 +1914,7 @@ func Start(townRoot string) error {
 
 	// Ensure daemon directory exists
 	daemonDir := filepath.Dir(config.LogFile)
-	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		return fmt.Errorf("creating daemon directory: %w", err)
 	}
 
@@ -1852,7 +2059,7 @@ func Start(townRoot string) error {
 	}
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(config.DataDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
@@ -1870,7 +2077,7 @@ func Start(townRoot string) error {
 	databases, _ := ListDatabases(townRoot)
 
 	// Open log file
-	logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening log file: %w", err)
 	}
@@ -1934,7 +2141,7 @@ func Start(townRoot string) error {
 	}
 
 	// Write PID file
-	if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+	if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
 		// Try to kill the process we just started
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("writing PID file: %w", err)
@@ -2566,7 +2773,8 @@ func verifyDatabasesWithRetry(townRoot string, maxAttempts int) (served, missing
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		// SHOW DATABASES is catalog-scoped; embedded mode sees the on-disk catalog
 		// rather than the running server's, which is the exact bug #3518/#3641 fix.
-		cmd := buildServerSQLCmd(ctx, config,
+		cmd := buildServerSQLCmd(
+			ctx, config,
 			"-r", "json",
 			"-q", "SHOW DATABASES",
 		)
@@ -2787,7 +2995,7 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 	} else {
 		// Server not running: create directory and init manually.
 		// The database will be picked up when the server starts.
-		if err := os.MkdirAll(rigDir, 0755); err != nil {
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
 			return false, false, fmt.Errorf("creating rig directory: %w", err)
 		}
 
@@ -3069,7 +3277,7 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	}
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(config.DataDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
@@ -3679,7 +3887,7 @@ func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase 
 		effectiveDB = doltDatabase[0]
 	}
 
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
@@ -3762,7 +3970,7 @@ func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase 
 		return fmt.Errorf("marshaling metadata: %w", err)
 	}
 
-	if err := atomicfile.WriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
+	if err := atomicfile.WriteFile(metadataPath, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("writing metadata.json: %w", err)
 	}
 
@@ -3955,7 +4163,7 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 	}
 	if rigName == "hq" {
 		dir := filepath.Join(townRoot, ".beads")
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", fmt.Errorf("creating HQ beads dir: %w", err)
 		}
 		return dir, nil
@@ -3967,7 +4175,7 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
 	if _, err := os.Stat(mayorBeads); err == nil {
 		// Ensure it still exists (no-op if present, recreates if deleted)
-		if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		if err := os.MkdirAll(mayorBeads, 0o755); err != nil {
 			return "", fmt.Errorf("ensuring mayor beads dir: %w", err)
 		}
 		return mayorBeads, nil
@@ -3976,7 +4184,7 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 	// Check rig-root .beads
 	rigBeads := filepath.Join(townRoot, rigName, ".beads")
 	if _, err := os.Stat(rigBeads); err == nil {
-		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		if err := os.MkdirAll(rigBeads, 0o755); err != nil {
 			return "", fmt.Errorf("ensuring rig beads dir: %w", err)
 		}
 		return rigBeads, nil
@@ -3988,7 +4196,7 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 	// cause InitBeads to misdetect an untracked repo as having tracked beads,
 	// taking the redirect early-return and skipping config.yaml creation
 	// (see rig/manager.go InitBeads).
-	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+	if err := os.MkdirAll(rigBeads, 0o755); err != nil {
 		return "", fmt.Errorf("creating beads dir: %w", err)
 	}
 

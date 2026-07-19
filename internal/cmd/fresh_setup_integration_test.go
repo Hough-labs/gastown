@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 var freshSetupIntegrationCounter atomic.Int32
@@ -39,6 +40,11 @@ func TestFreshInstallRigPolecatHookIntegration(t *testing.T) {
 
 	env := freshSetupIntegrationEnv(tmpDir, doltPortString)
 	configureGitIdentityForEnv(t, env)
+
+	// Crash-safe: if the test panics/fails before the `gt dolt stop` cleanup
+	// below runs, this still reaps the embedded dolt sql-server this test
+	// spawned on doltPortString (gfork-d5h).
+	testutil.ReapOwnedDoltOnCleanup(t, hqPath)
 
 	gtBinary := buildGT(t)
 	runFreshSetupCmd(t, "", env, gtBinary, "install", hqPath, "--name", "test-town", "--git", "--dolt-port", doltPortString)
@@ -143,7 +149,7 @@ func configureGitIdentityForEnv(t *testing.T, env []string) {
 func createFreshSetupSourceRepo(t *testing.T, tmpDir string) string {
 	t.Helper()
 	repoDir := filepath.Join(tmpDir, "source-repo")
-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatalf("mkdir source repo: %v", err)
 	}
 
@@ -151,10 +157,10 @@ func createFreshSetupSourceRepo(t *testing.T, tmpDir string) string {
 	runFreshSetupCmd(t, repoDir, nil, "git", "config", "user.email", "test@test.com")
 	runFreshSetupCmd(t, repoDir, nil, "git", "config", "user.name", "Test User")
 
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Fresh setup fixture\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Fresh setup fixture\n"), 0o644); err != nil {
 		t.Fatalf("write README.md: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatalf("write main.go: %v", err)
 	}
 	runFreshSetupCmd(t, repoDir, nil, "git", "add", ".")
