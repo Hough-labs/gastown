@@ -133,7 +133,7 @@ func TestPullRequestApprovalAndMergeUseResolvedURLAndRepo(t *testing.T) {
 	installFakeGH(t, `#!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  printf '%s\n' '{"reviewDecision":"APPROVED"}'
+  printf '%s\n' '{"reviews":[{"author":{"login":"reviewer1"},"state":"APPROVED"}]}'
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
@@ -163,7 +163,7 @@ exit 1
 	}
 	log := string(logBytes)
 	for _, want := range []string{
-		"pr view https://github.com/upstream/repo/pull/42 --json reviewDecision --repo upstream/repo",
+		"pr view https://github.com/upstream/repo/pull/42 --json reviews --repo upstream/repo",
 		"pr merge https://github.com/upstream/repo/pull/42 --squash --delete-branch --repo upstream/repo",
 	} {
 		if !strings.Contains(log, want) {
