@@ -195,7 +195,7 @@ check-version-tag:
 # it to pick up the beads v1.0.5 dependency-schema migration). Bump this on every
 # upstream upgrade (and the matching ref in .githooks/pre-push), then rebase
 # patches onto it. The SHA must be fetched/reachable for `make patches`.
-UPSTREAM_BASE := 81233d36f27465fcae83944f78bdea1674d7143e
+UPSTREAM_BASE := 5ffa55a2bc03fa1110ea0b1495bfa26bbe6b66f3
 
 # Export current local commits (UPSTREAM_BASE..HEAD divergence) to patches/.
 # Run this after adding or editing a local patch commit.
