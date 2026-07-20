@@ -1,7 +1,7 @@
 From 09a0b063b1e461c60647b34440c171743f42f234 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 17:01:11 -0400
-Subject: [PATCH 32/60] fix(sling): mark review-only formula beads review_only
+Subject: [PATCH 32/61] fix(sling): mark review-only formula beads review_only
  so gt done skips verified_push gate (gfork-06a)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

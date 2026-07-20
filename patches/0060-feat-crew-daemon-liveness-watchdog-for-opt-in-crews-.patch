@@ -1,7 +1,7 @@
-From dd773d7211515d5f5ffaee28681ff4ecaeba56e8 Mon Sep 17 00:00:00 2001
+From 7146855db7afbdd6d8690c70bb0e19fae4b5d9e9 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 22:26:56 -0400
-Subject: [PATCH 60/60] feat(crew): daemon liveness watchdog for opt-in crews +
+Subject: [PATCH 60/61] feat(crew): daemon liveness watchdog for opt-in crews +
  rig status surface (feryn-409i)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

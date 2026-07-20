@@ -1720,7 +1720,14 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap); found {
+		// hq-l6mm5 direct-tracking: resolve the polecat's hooked work bead from the
+		// work bead itself (status=hooked + assignee), the same primary source
+		// manager.loadFromBeads uses. Polecat agent beads no longer exist under this
+		// model, so this is the only signal that a dead-session polecat still holds
+		// in-flight work needing recovery (feryn-lxc6).
+		directHook, directHookUpdated := resolveDirectHookBead(bd, workDir, rigName, polecatName)
+
+		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap, directHook, directHookUpdated); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1968,11 +1975,33 @@ func hasSuccessfulSubmissionEvidence(snap *agentBeadSnapshot) bool {
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats with dead sessions,
 // restarts them to preserve worktrees and branches.
-func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, directHook string, directHookUpdatedAt string) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot.
 	snapState, snapHook := "", ""
 	if snap != nil {
 		snapState, snapHook = snap.AgentState, snap.HookBead
+	}
+
+	// hq-l6mm5 direct-tracking: a polecat's in-flight work is tracked on the work
+	// bead itself (status=hooked + assignee), not on an agent-bead hook_bead field.
+	// Under this model polecat agent beads no longer exist, so snap is nil and
+	// snapHook is empty for every polecat. Without adopting the work-bead hook here,
+	// a polecat whose session died mid-work is invisible to zombie detection
+	// (isZombieState sees no hook, no active state) and is never restarted — while
+	// capacity (manager.loadFromBeads, same work-bead source) still counts it as
+	// recovery-blocked. That divergence saturates recovery slots and stalls dispatch
+	// with no self-heal (feryn-lxc6). Adopt the work-bead hook as the primary source,
+	// keeping any legacy agent-bead hook as a fallback.
+	if directHook != "" && snapHook == "" {
+		// Spawn grace: a freshly-hooked polecat may still be bringing up its tmux
+		// session (sling assigns the work bead before the session is live). Mirror
+		// the SpawnGracePeriod guard used for agent_state=spawning so we don't
+		// restart a polecat mid-spawn. Only applies when we have no agent bead to
+		// consult; if one exists its own spawning guard already covers this.
+		if age := parseBeadUpdatedAge(directHookUpdatedAt); age >= 0 && age < SpawnGracePeriod {
+			return ZombieResult{}, false
+		}
+		snapHook = directHook
 	}
 
 	// Heartbeat v2 check (gt-3vr5): for dead sessions, a fresh heartbeat means
@@ -2864,6 +2893,48 @@ func getAgentBeadAge(bd *BdCli, workDir, agentBeadID string) time.Duration {
 // Returns the status string and true if the lookup succeeded, or ("", false) if
 // the bead couldn't be queried (network error, cross-rig routing failure, etc.).
 // Callers must check the bool to distinguish "bead not found/reaped" from "lookup error."
+// resolveDirectHookBead returns the work bead a polecat currently holds under the
+// hq-l6mm5 direct-tracking model: a bead with status=hooked assigned to the
+// polecat's address (rig/polecats/name). This is the same primary source
+// manager.loadFromBeads uses for capacity/state derivation. The witness zombie
+// detector must consult it because polecat agent beads (and their hook_bead field)
+// no longer exist under direct-tracking, so fetchAgentBeadSnapshot returns nil and
+// snap.HookBead is empty for every polecat. Returns the bead ID and its updated_at
+// timestamp (used for the spawn-grace check), or "" when no hooked work is assigned
+// or the query fails (fail-safe: no hook means no restart).
+func resolveDirectHookBead(bd *BdCli, workDir, rigName, polecatName string) (id string, updatedAt string) {
+	assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+	output, err := bd.Exec(workDir, "list", "--status", "hooked", "--assignee", assignee, "--json")
+	if err != nil || output == "" {
+		return "", ""
+	}
+	var issues []struct {
+		ID        string `json:"id"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return "", ""
+	}
+	return issues[0].ID, issues[0].UpdatedAt
+}
+
+// parseBeadUpdatedAge returns the time since a bead's updated_at timestamp.
+// Accepts RFC3339 and the "2006-01-02 15:04:05" fallback bd sometimes emits.
+// Returns -1 when the timestamp is empty or unparseable, so callers can treat an
+// unknown age as "not fresh" (do not skip recovery on parse failure).
+func parseBeadUpdatedAge(updatedAt string) time.Duration {
+	if updatedAt == "" {
+		return -1
+	}
+	if ts, err := time.Parse(time.RFC3339, updatedAt); err == nil {
+		return time.Since(ts)
+	}
+	if ts, err := time.Parse("2006-01-02 15:04:05", updatedAt); err == nil {
+		return time.Since(ts)
+	}
+	return -1
+}
+
 func getBeadStatus(bd *BdCli, workDir, beadID string) (string, bool) {
 	if beadID == "" {
 		return "", false

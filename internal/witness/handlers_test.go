@@ -2818,3 +2818,124 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
 	}
 }
+
+// --- hq-l6mm5 direct-tracking recovery (feryn-lxc6) ---
+
+// TestResolveDirectHookBead_ReturnsHookedWork verifies the witness resolves a
+// polecat's in-flight work from the work bead itself (status=hooked + assignee),
+// the same primary source manager.loadFromBeads uses. This is required because
+// polecat agent beads no longer exist under direct-tracking, so the agent-bead
+// hook_bead field is always empty and dead-session polecats would otherwise be
+// invisible to zombie recovery.
+func TestResolveDirectHookBead_ReturnsHookedWork(t *testing.T) {
+	t.Parallel()
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) > 0 && args[0] == "list" {
+				return `[{"id":"feryn-lorn","updated_at":"2026-07-19T22:27:20Z"}]`, nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	id, updatedAt := resolveDirectHookBead(bd, t.TempDir(), "feryn", "fury")
+	if id != "feryn-lorn" {
+		t.Errorf("id = %q, want %q", id, "feryn-lorn")
+	}
+	if updatedAt != "2026-07-19T22:27:20Z" {
+		t.Errorf("updatedAt = %q, want %q", updatedAt, "2026-07-19T22:27:20Z")
+	}
+
+	// Must scope the query to status=hooked AND the polecat's assignee address,
+	// so one polecat's dead session never adopts another's work.
+	got := strings.Join(mock.calls, "\n")
+	for _, want := range []string{"list", "--status", "hooked", "--assignee", "feryn/polecats/fury"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("resolveDirectHookBead query missing %q; got: %s", want, got)
+		}
+	}
+}
+
+// TestResolveDirectHookBead_NoHookedWork verifies the fail-safe: when nothing is
+// hooked to the polecat, no hook is returned (no hook => no restart).
+func TestResolveDirectHookBead_NoHookedWork(t *testing.T) {
+	t.Parallel()
+	bd, _ := mockBd(
+		func(args []string) (string, error) { return "[]", nil },
+		func(args []string) error { return nil },
+	)
+	if id, _ := resolveDirectHookBead(bd, t.TempDir(), "feryn", "fury"); id != "" {
+		t.Errorf("id = %q, want empty when no hooked work assigned", id)
+	}
+}
+
+// TestResolveDirectHookBead_QueryError verifies a query failure fails safe to no
+// hook rather than fabricating one.
+func TestResolveDirectHookBead_QueryError(t *testing.T) {
+	t.Parallel()
+	bd, _ := mockBd(
+		func(args []string) (string, error) { return "", fmt.Errorf("boom") },
+		func(args []string) error { return nil },
+	)
+	if id, updatedAt := resolveDirectHookBead(bd, t.TempDir(), "feryn", "fury"); id != "" || updatedAt != "" {
+		t.Errorf("resolveDirectHookBead on error = (%q,%q), want empty", id, updatedAt)
+	}
+}
+
+func TestParseBeadUpdatedAge(t *testing.T) {
+	t.Parallel()
+	// Empty and unparseable timestamps return -1 so callers treat unknown age as
+	// "not fresh" and do NOT skip recovery on a parse failure.
+	if got := parseBeadUpdatedAge(""); got != -1 {
+		t.Errorf("parseBeadUpdatedAge(\"\") = %v, want -1", got)
+	}
+	if got := parseBeadUpdatedAge("not-a-timestamp"); got != -1 {
+		t.Errorf("parseBeadUpdatedAge(garbage) = %v, want -1", got)
+	}
+
+	// RFC3339 timestamp ~10 minutes old parses to a positive, sane age.
+	rfc := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	if got := parseBeadUpdatedAge(rfc); got < 9*time.Minute || got > 11*time.Minute {
+		t.Errorf("parseBeadUpdatedAge(%q) = %v, want ~10m", rfc, got)
+	}
+
+	// The "2006-01-02 15:04:05" fallback format bd sometimes emits also parses.
+	// time.Parse reads a zoneless layout as UTC, so build the string in UTC.
+	fallback := time.Now().Add(-10 * time.Minute).UTC().Format("2006-01-02 15:04:05")
+	if got := parseBeadUpdatedAge(fallback); got < 9*time.Minute || got > 11*time.Minute {
+		t.Errorf("parseBeadUpdatedAge(%q) = %v, want ~10m", fallback, got)
+	}
+}
+
+// TestDirectTrackingSpawnGrace documents the spawn-grace decision the dead-session
+// detector applies when it has no agent bead and is relying on the work-bead hook:
+// a freshly-hooked polecat (session may still be coming up) is skipped, while one
+// hooked longer than SpawnGracePeriod is eligible for restart-first recovery.
+func TestDirectTrackingSpawnGrace(t *testing.T) {
+	t.Parallel()
+	adopt := func(directHook string, age time.Duration) bool {
+		// Mirrors detectZombieDeadSession's adoption guard (snapHook=="" branch).
+		if directHook == "" {
+			return false
+		}
+		if age >= 0 && age < SpawnGracePeriod {
+			return false // freshly hooked — session may still be spawning
+		}
+		return true
+	}
+
+	if adopt("feryn-lorn", 30*time.Second) {
+		t.Error("freshly-hooked polecat (30s) should be skipped by spawn grace")
+	}
+	if !adopt("feryn-lorn", SpawnGracePeriod+time.Minute) {
+		t.Error("polecat hooked past SpawnGracePeriod should be eligible for recovery")
+	}
+	// Unknown age (-1) must NOT be treated as fresh — recovery proceeds.
+	if !adopt("feryn-lorn", -1) {
+		t.Error("unknown hook age should not be treated as fresh (must recover)")
+	}
+	if adopt("", time.Hour) {
+		t.Error("no direct hook => nothing to adopt")
+	}
+}
