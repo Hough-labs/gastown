@@ -71,7 +71,18 @@ type PatrolScanOutput struct {
 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
+	Reap        *PatrolScanReapOutput     `json:"reap,omitempty"`
 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+}
+
+// PatrolScanReapOutput reports the capacity-pressure reap pass (feryn-355z).
+type PatrolScanReapOutput struct {
+	Checked      int      `json:"checked"`
+	Reaped       []string `json:"reaped,omitempty"`
+	Skipped      string   `json:"skipped,omitempty"`
+	CapacityFree int      `json:"capacity_free"`
+	QueuedReady  int      `json:"queued_ready"`
+	Errors       []string `json:"errors,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -167,6 +178,9 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
 	})
+	reapResult := runPatrolScanPhase(diagnostics, "safe-to-nuke reap", func() *witness.ReapSafeToNukeResult {
+		return witness.ReapSafeToNukeUnderPressure(bd, workDir, rigName)
+	})
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -183,10 +197,10 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, reapResult, receipts)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, reapResult, receipts)
 }
 
 func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
@@ -285,7 +299,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	_ = router.Send(mayorMsg)
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
@@ -361,12 +375,27 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		output.Completions = co
 	}
 
+	// Reap
+	if reapResult != nil {
+		ro := &PatrolScanReapOutput{
+			Checked:      reapResult.Checked,
+			Reaped:       reapResult.Reaped,
+			Skipped:      reapResult.Skipped,
+			CapacityFree: reapResult.CapacityFree,
+			QueuedReady:  reapResult.QueuedReady,
+		}
+		for _, e := range reapResult.Errors {
+			ro.Errors = append(ro.Errors, e.Error())
+		}
+		output.Reap = ro
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, _ []witness.PatrolReceipt) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -448,6 +477,22 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 				fmt.Println()
 				fmt.Printf("    Action: %s\n", d.Action)
 			}
+		}
+		fmt.Println()
+	}
+
+	// Reap (only surfaced when it acted or in verbose mode)
+	if reapResult != nil && (len(reapResult.Reaped) > 0 || len(reapResult.Errors) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Safe-to-nuke Reap: checked %d polecat(s) (free=%d queued_ready=%d)\n",
+			style.Bold.Render("♻"), reapResult.Checked, reapResult.CapacityFree, reapResult.QueuedReady)
+		if reapResult.Skipped != "" {
+			fmt.Printf("  %s\n", style.Dim.Render("Skipped: "+reapResult.Skipped))
+		}
+		for _, name := range reapResult.Reaped {
+			fmt.Printf("  ♻ reaped %s (freed capacity slot)\n", name)
+		}
+		for _, e := range reapResult.Errors {
+			fmt.Printf("    %s\n", style.Dim.Render(fmt.Sprintf("Error: %v", e)))
 		}
 		fmt.Println()
 	}

@@ -851,6 +851,17 @@ func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
 }
 
 func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, string) {
+	return polecatSafeToNukeVerdict(workDir, rigName, polecatName)
+}
+
+// polecatSafeToNukeVerdict runs `gt polecat check-recovery --reconcile-cleanup`
+// for the polecat and reports whether the verdict is SAFE_TO_NUKE. The
+// --reconcile-cleanup flag flips a stale dirty cleanup_status to clean when live
+// predicates prove no work is at risk, so a completed polecat whose persisted
+// status lagged behind its real (merged/submitted) state is classified
+// correctly. Returns (false, reason) on a non-safe verdict or a check failure —
+// the conservative default, so an ambiguous polecat is never reaped.
+func polecatSafeToNukeVerdict(workDir, rigName, polecatName string) (bool, string) {
 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
 	if err != nil {
 		return false, fmt.Sprintf("check-recovery failed: %v", err)
@@ -2343,6 +2354,136 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			stalled.Action = "auto-dismissed"
 		}
 		result.Stalled = append(result.Stalled, stalled)
+	}
+
+	return result
+}
+
+// ReapSafeToNukeResult reports the outcome of a capacity-pressure reap pass.
+type ReapSafeToNukeResult struct {
+	Checked      int      // idle polecats classified this pass
+	Reaped       []string // polecat names nuked (all SAFE_TO_NUKE-verdict)
+	Skipped      string   // non-empty when the pass was a deliberate no-op
+	CapacityFree int      // scheduler free slots at pass start
+	QueuedReady  int      // ready beads waiting to dispatch at pass start
+	Errors       []error
+}
+
+// disableAutoReapEnv, when set to "1", disables the capacity-pressure reaper.
+// A live-system escape hatch: if the reaper ever misbehaves it can be turned off
+// without a redeploy.
+const disableAutoReapEnv = "GT_WITNESS_DISABLE_AUTOREAP"
+
+// Injection seams for testing the reap loop without a live scheduler/tmux/nuke.
+var (
+	reapReadSchedulerStatus = readSchedulerStatusForSlotOpen
+	reapPolecatSafeToNuke   = polecatSafeToNukeVerdict
+	reapNukePolecat         = NukePolecat
+)
+
+// shouldReapUnderPressure reports whether the scheduler is starved enough to
+// justify reclaiming reusable-idle slots: active, no free capacity, and ready
+// work queued. When false it returns a human reason for the no-op. Keeping this
+// pure makes the pressure gate directly testable.
+func shouldReapUnderPressure(status slotOpenSchedulerStatus) (bool, string) {
+	switch {
+	case status.Paused:
+		return false, "scheduler paused"
+	case status.Capacity.Max <= 0:
+		return false, "scheduler not in capacity mode"
+	case status.Capacity.Free > 0:
+		return false, "free capacity available"
+	case status.QueuedReady == 0:
+		return false, "no ready beads queued"
+	default:
+		return true, ""
+	}
+}
+
+// ReapSafeToNukeUnderPressure reaps completed polecats that are provably done
+// (check-recovery verdict SAFE_TO_NUKE) but still holding a capacity slot, so a
+// burst of quick completions can't starve dispatch until an operator manually
+// runs `gt polecat nuke` (feryn-355z).
+//
+// It is deliberately conservative:
+//   - Pressure-gated: a no-op unless the scheduler is genuinely starved (no free
+//     slots AND ready beads queued). With spare capacity, completed polecats are
+//     left as reusable-idle to preserve the persistent-polecat reuse model
+//     (gt-4ac) — this pass never trades reuse for nothing.
+//   - Live sessions are skipped outright; a working polecat is never reaped.
+//   - Only SAFE_TO_NUKE-verdict polecats are nuked, via NukePolecat, which itself
+//     refuses when a Mayor ACP session is active (gt-qnp) or an MR is pending in
+//     the refinery (gt-6a9d). Reconciliation (--reconcile-cleanup) inside the
+//     verdict check only clears a stale cleanup_status when live predicates prove
+//     no work is at risk. Recoverable work is therefore never reaped — this
+//     complements the restart-first zombie policy (gt-dsgp) rather than
+//     overriding it: it acts only on work that is already merged/submitted.
+//   - Bounded: reaps at most QueuedReady polecats — just enough to clear the
+//     immediate backlog — leaving the rest reusable.
+func ReapSafeToNukeUnderPressure(bd *BdCli, workDir, rigName string) *ReapSafeToNukeResult {
+	result := &ReapSafeToNukeResult{}
+	if os.Getenv(disableAutoReapEnv) == "1" {
+		result.Skipped = "disabled via " + disableAutoReapEnv
+		return result
+	}
+
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+	initRegistryFromTownRoot(townRoot)
+
+	status, err := reapReadSchedulerStatus(townRoot)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("reading scheduler status: %w", err))
+		return result
+	}
+	result.CapacityFree = status.Capacity.Free
+	result.QueuedReady = status.QueuedReady
+
+	// Pressure gate. Only reclaim slots when dispatch is actually blocked:
+	// scheduler active, no free capacity, and ready work waiting. Otherwise
+	// preserve reusable-idle polecats for fast reuse.
+	if ok, reason := shouldReapUnderPressure(status); !ok {
+		result.Skipped = reason
+		return result
+	}
+
+	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return result // No polecats directory — nothing to reap.
+	}
+
+	t := tmux.NewTmux()
+	reapCap := status.QueuedReady
+	for _, entry := range entries {
+		if len(result.Reaped) >= reapCap {
+			break // Freed enough to clear the immediate backlog.
+		}
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		polecatName := entry.Name()
+
+		// Never reap a live, working polecat. check-recovery would classify a
+		// live session as WORKING anyway, but skip it up front to avoid the cost
+		// and any window where the verdict lags the session.
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+		if alive, _ := t.HasSession(sessionName); alive && t.IsAgentAlive(sessionName) {
+			continue
+		}
+
+		result.Checked++
+		safe, _ := reapPolecatSafeToNuke(workDir, rigName, polecatName)
+		if !safe {
+			continue
+		}
+		if nukeErr := reapNukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("reaping %s: %w", polecatName, nukeErr))
+			continue
+		}
+		result.Reaped = append(result.Reaped, polecatName)
 	}
 
 	return result

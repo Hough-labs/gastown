@@ -1,7 +1,7 @@
 From 8e279b229295c61c3fb10f092bed6c18226bd5dd Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 15:21:23 -0400
-Subject: [PATCH 28/58] fix(daemon): context watchdog skips zero-token trailing
+Subject: [PATCH 28/59] fix(daemon): context watchdog skips zero-token trailing
  usage events
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

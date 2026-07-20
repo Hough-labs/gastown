@@ -1,0 +1,471 @@
+From 4ee4ed886cfe920da7c91f308bf30d76dcafa494 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 22:11:27 -0400
+Subject: [PATCH 59/59] fix(witness): auto-reap SAFE_TO_NUKE polecats under
+ capacity pressure (feryn-355z)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After a burst of quick completions, town-wide capacity could saturate (0 free
+of 11, recovery: 11) and block review/merge dispatch until an operator ran
+`gt polecat check-recovery` + `gt polecat nuke` by hand. Completed polecats hold
+a slot as idle-recovery-needed (NEEDS_RECOVERY counts toward capacity) when a
+stale cleanup_status lags behind their real merged/submitted state, and truly
+SAFE_TO_NUKE polecats weren't auto-reaped.
+
+Add a capacity-pressure reap pass to `gt patrol scan` (run each witness patrol)
+that automates exactly the operator's manual steps via the same safety-gated
+primitives:
+
+  - Pressure-gated: no-op unless the scheduler is genuinely starved (active, 0
+    free slots, ready beads queued). With spare capacity it leaves completed
+    polecats as reusable-idle, preserving the persistent-polecat reuse model
+    (gt-4ac) — reuse is never traded away for nothing.
+  - Classifies each idle polecat via check-recovery --reconcile-cleanup, which
+    clears a stale cleanup_status only when live predicates prove no work is at
+    risk. Live/working sessions are skipped outright.
+  - Reaps only SAFE_TO_NUKE-verdict polecats through NukePolecat, which refuses
+    when a Mayor ACP session is active (gt-qnp) or an MR is pending in the
+    refinery (gt-6a9d), and gt polecat nuke re-checks safety. Recoverable work is
+    never reaped — this complements the restart-first zombie policy (gt-dsgp),
+    it does not override it.
+  - Bounded: reaps at most queued_ready polecats — just enough to clear the
+    immediate backlog.
+  - Kill switch: GT_WITNESS_DISABLE_AUTOREAP=1 disables it without a redeploy.
+
+Reap outcome is surfaced in `gt patrol scan` (human + --json). Tests cover the
+pressure gate matrix, queue-bounded reaping, never-reap-recoverable, no-op
+without pressure, and the kill switch.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/patrol_scan.go   |  53 +++++++++++-
+ internal/witness/handlers.go  | 141 ++++++++++++++++++++++++++++++++
+ internal/witness/reap_test.go | 146 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 336 insertions(+), 4 deletions(-)
+ create mode 100644 internal/witness/reap_test.go
+
+diff --git a/internal/cmd/patrol_scan.go b/internal/cmd/patrol_scan.go
+index 6a7051ec..2065062b 100644
+--- a/internal/cmd/patrol_scan.go
++++ b/internal/cmd/patrol_scan.go
+@@ -71,9 +71,20 @@ type PatrolScanOutput struct {
+ 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
+ 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
+ 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
++	Reap        *PatrolScanReapOutput     `json:"reap,omitempty"`
+ 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+ }
+ 
++// PatrolScanReapOutput reports the capacity-pressure reap pass (feryn-355z).
++type PatrolScanReapOutput struct {
++	Checked      int      `json:"checked"`
++	Reaped       []string `json:"reaped,omitempty"`
++	Skipped      string   `json:"skipped,omitempty"`
++	CapacityFree int      `json:"capacity_free"`
++	QueuedReady  int      `json:"queued_ready"`
++	Errors       []string `json:"errors,omitempty"`
++}
++
+ // PatrolScanZombieOutput holds zombie detection results.
+ type PatrolScanZombieOutput struct {
+ 	Checked int                    `json:"checked"`
+@@ -167,6 +178,9 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
+ 	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
+ 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
+ 	})
++	reapResult := runPatrolScanPhase(diagnostics, "safe-to-nuke reap", func() *witness.ReapSafeToNukeResult {
++		return witness.ReapSafeToNukeUnderPressure(bd, workDir, rigName)
++	})
+ 
+ 	// Build patrol receipts for zombies
+ 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
+@@ -183,10 +197,10 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
+ 	}
+ 
+ 	if patrolScanJSON {
+-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
++		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, reapResult, receipts)
+ 	}
+ 
+-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
++	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, reapResult, receipts)
+ }
+ 
+ func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
+@@ -285,7 +299,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
+ 	_ = router.Send(mayorMsg)
+ }
+ 
+-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
++func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, receipts []witness.PatrolReceipt) error {
+ 	output := PatrolScanOutput{
+ 		Rig:       rigName,
+ 		Timestamp: timestamp,
+@@ -361,12 +375,27 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
+ 		output.Completions = co
+ 	}
+ 
++	// Reap
++	if reapResult != nil {
++		ro := &PatrolScanReapOutput{
++			Checked:      reapResult.Checked,
++			Reaped:       reapResult.Reaped,
++			Skipped:      reapResult.Skipped,
++			CapacityFree: reapResult.CapacityFree,
++			QueuedReady:  reapResult.QueuedReady,
++		}
++		for _, e := range reapResult.Errors {
++			ro.Errors = append(ro.Errors, e.Error())
++		}
++		output.Reap = ro
++	}
++
+ 	enc := json.NewEncoder(os.Stdout)
+ 	enc.SetIndent("", "  ")
+ 	return enc.Encode(output)
+ }
+ 
+-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
++func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, _ []witness.PatrolReceipt) error {
+ 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
+ 
+ 	// Zombies
+@@ -452,6 +481,22 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
+ 		fmt.Println()
+ 	}
+ 
++	// Reap (only surfaced when it acted or in verbose mode)
++	if reapResult != nil && (len(reapResult.Reaped) > 0 || len(reapResult.Errors) > 0 || patrolScanVerbose) {
++		fmt.Printf("%s Safe-to-nuke Reap: checked %d polecat(s) (free=%d queued_ready=%d)\n",
++			style.Bold.Render("♻"), reapResult.Checked, reapResult.CapacityFree, reapResult.QueuedReady)
++		if reapResult.Skipped != "" {
++			fmt.Printf("  %s\n", style.Dim.Render("Skipped: "+reapResult.Skipped))
++		}
++		for _, name := range reapResult.Reaped {
++			fmt.Printf("  ♻ reaped %s (freed capacity slot)\n", name)
++		}
++		for _, e := range reapResult.Errors {
++			fmt.Printf("    %s\n", style.Dim.Render(fmt.Sprintf("Error: %v", e)))
++		}
++		fmt.Println()
++	}
++
+ 	// Summary
+ 	zombieCount := 0
+ 	activeCount := 0
+diff --git a/internal/witness/handlers.go b/internal/witness/handlers.go
+index d2aa7468..b8ac30ee 100644
+--- a/internal/witness/handlers.go
++++ b/internal/witness/handlers.go
+@@ -851,6 +851,17 @@ func runGTForSlotOpen(townRoot string, args ...string) (string, error) {
+ }
+ 
+ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, string) {
++	return polecatSafeToNukeVerdict(workDir, rigName, polecatName)
++}
++
++// polecatSafeToNukeVerdict runs `gt polecat check-recovery --reconcile-cleanup`
++// for the polecat and reports whether the verdict is SAFE_TO_NUKE. The
++// --reconcile-cleanup flag flips a stale dirty cleanup_status to clean when live
++// predicates prove no work is at risk, so a completed polecat whose persisted
++// status lagged behind its real (merged/submitted) state is classified
++// correctly. Returns (false, reason) on a non-safe verdict or a check failure —
++// the conservative default, so an ambiguous polecat is never reaped.
++func polecatSafeToNukeVerdict(workDir, rigName, polecatName string) (bool, string) {
+ 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
+ 	if err != nil {
+ 		return false, fmt.Sprintf("check-recovery failed: %v", err)
+@@ -2348,6 +2359,136 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
+ 	return result
+ }
+ 
++// ReapSafeToNukeResult reports the outcome of a capacity-pressure reap pass.
++type ReapSafeToNukeResult struct {
++	Checked      int      // idle polecats classified this pass
++	Reaped       []string // polecat names nuked (all SAFE_TO_NUKE-verdict)
++	Skipped      string   // non-empty when the pass was a deliberate no-op
++	CapacityFree int      // scheduler free slots at pass start
++	QueuedReady  int      // ready beads waiting to dispatch at pass start
++	Errors       []error
++}
++
++// disableAutoReapEnv, when set to "1", disables the capacity-pressure reaper.
++// A live-system escape hatch: if the reaper ever misbehaves it can be turned off
++// without a redeploy.
++const disableAutoReapEnv = "GT_WITNESS_DISABLE_AUTOREAP"
++
++// Injection seams for testing the reap loop without a live scheduler/tmux/nuke.
++var (
++	reapReadSchedulerStatus = readSchedulerStatusForSlotOpen
++	reapPolecatSafeToNuke   = polecatSafeToNukeVerdict
++	reapNukePolecat         = NukePolecat
++)
++
++// shouldReapUnderPressure reports whether the scheduler is starved enough to
++// justify reclaiming reusable-idle slots: active, no free capacity, and ready
++// work queued. When false it returns a human reason for the no-op. Keeping this
++// pure makes the pressure gate directly testable.
++func shouldReapUnderPressure(status slotOpenSchedulerStatus) (bool, string) {
++	switch {
++	case status.Paused:
++		return false, "scheduler paused"
++	case status.Capacity.Max <= 0:
++		return false, "scheduler not in capacity mode"
++	case status.Capacity.Free > 0:
++		return false, "free capacity available"
++	case status.QueuedReady == 0:
++		return false, "no ready beads queued"
++	default:
++		return true, ""
++	}
++}
++
++// ReapSafeToNukeUnderPressure reaps completed polecats that are provably done
++// (check-recovery verdict SAFE_TO_NUKE) but still holding a capacity slot, so a
++// burst of quick completions can't starve dispatch until an operator manually
++// runs `gt polecat nuke` (feryn-355z).
++//
++// It is deliberately conservative:
++//   - Pressure-gated: a no-op unless the scheduler is genuinely starved (no free
++//     slots AND ready beads queued). With spare capacity, completed polecats are
++//     left as reusable-idle to preserve the persistent-polecat reuse model
++//     (gt-4ac) — this pass never trades reuse for nothing.
++//   - Live sessions are skipped outright; a working polecat is never reaped.
++//   - Only SAFE_TO_NUKE-verdict polecats are nuked, via NukePolecat, which itself
++//     refuses when a Mayor ACP session is active (gt-qnp) or an MR is pending in
++//     the refinery (gt-6a9d). Reconciliation (--reconcile-cleanup) inside the
++//     verdict check only clears a stale cleanup_status when live predicates prove
++//     no work is at risk. Recoverable work is therefore never reaped — this
++//     complements the restart-first zombie policy (gt-dsgp) rather than
++//     overriding it: it acts only on work that is already merged/submitted.
++//   - Bounded: reaps at most QueuedReady polecats — just enough to clear the
++//     immediate backlog — leaving the rest reusable.
++func ReapSafeToNukeUnderPressure(bd *BdCli, workDir, rigName string) *ReapSafeToNukeResult {
++	result := &ReapSafeToNukeResult{}
++	if os.Getenv(disableAutoReapEnv) == "1" {
++		result.Skipped = "disabled via " + disableAutoReapEnv
++		return result
++	}
++
++	townRoot, err := workspace.Find(workDir)
++	if err != nil || townRoot == "" {
++		townRoot = workDir
++	}
++	initRegistryFromTownRoot(townRoot)
++
++	status, err := reapReadSchedulerStatus(townRoot)
++	if err != nil {
++		result.Errors = append(result.Errors, fmt.Errorf("reading scheduler status: %w", err))
++		return result
++	}
++	result.CapacityFree = status.Capacity.Free
++	result.QueuedReady = status.QueuedReady
++
++	// Pressure gate. Only reclaim slots when dispatch is actually blocked:
++	// scheduler active, no free capacity, and ready work waiting. Otherwise
++	// preserve reusable-idle polecats for fast reuse.
++	if ok, reason := shouldReapUnderPressure(status); !ok {
++		result.Skipped = reason
++		return result
++	}
++
++	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
++	entries, err := os.ReadDir(polecatsDir)
++	if err != nil {
++		return result // No polecats directory — nothing to reap.
++	}
++
++	t := tmux.NewTmux()
++	reapCap := status.QueuedReady
++	for _, entry := range entries {
++		if len(result.Reaped) >= reapCap {
++			break // Freed enough to clear the immediate backlog.
++		}
++		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
++			continue
++		}
++		polecatName := entry.Name()
++
++		// Never reap a live, working polecat. check-recovery would classify a
++		// live session as WORKING anyway, but skip it up front to avoid the cost
++		// and any window where the verdict lags the session.
++		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
++		if alive, _ := t.HasSession(sessionName); alive && t.IsAgentAlive(sessionName) {
++			continue
++		}
++
++		result.Checked++
++		safe, _ := reapPolecatSafeToNuke(workDir, rigName, polecatName)
++		if !safe {
++			continue
++		}
++		if nukeErr := reapNukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
++			result.Errors = append(result.Errors, fmt.Errorf("reaping %s: %w", polecatName, nukeErr))
++			continue
++		}
++		result.Reaped = append(result.Reaped, polecatName)
++	}
++
++	return result
++}
++
+ // CompletionDiscovery represents a polecat completion discovered from agent bead
+ // metadata rather than POLECAT_DONE mail. This is the primary discovery mechanism
+ // for polecat state transitions (gt-w0br).
+diff --git a/internal/witness/reap_test.go b/internal/witness/reap_test.go
+new file mode 100644
+index 00000000..91654dde
+--- /dev/null
++++ b/internal/witness/reap_test.go
+@@ -0,0 +1,146 @@
++package witness
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestShouldReapUnderPressure(t *testing.T) {
++	pressured := slotOpenSchedulerStatus{QueuedReady: 3}
++	pressured.Capacity.Max = 11
++	pressured.Capacity.Free = 0
++
++	cases := []struct {
++		name   string
++		mutate func(*slotOpenSchedulerStatus)
++		want   bool
++	}{
++		{"starved-with-queue", func(*slotOpenSchedulerStatus) {}, true},
++		{"paused", func(s *slotOpenSchedulerStatus) { s.Paused = true }, false},
++		{"not-capacity-mode", func(s *slotOpenSchedulerStatus) { s.Capacity.Max = 0 }, false},
++		{"free-slots", func(s *slotOpenSchedulerStatus) { s.Capacity.Free = 2 }, false},
++		{"empty-queue", func(s *slotOpenSchedulerStatus) { s.QueuedReady = 0 }, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			s := pressured
++			tc.mutate(&s)
++			got, reason := shouldReapUnderPressure(s)
++			if got != tc.want {
++				t.Fatalf("shouldReapUnderPressure = %v (%q), want %v", got, reason, tc.want)
++			}
++			if !got && reason == "" {
++				t.Fatal("expected a non-empty skip reason on no-op")
++			}
++		})
++	}
++}
++
++// withReapSeams swaps the reap injection seams for a test and restores them.
++func withReapSeams(t *testing.T, status slotOpenSchedulerStatus, statusErr error, safe func(string) bool, nuked *[]string) {
++	t.Helper()
++	origStatus, origSafe, origNuke := reapReadSchedulerStatus, reapPolecatSafeToNuke, reapNukePolecat
++	t.Cleanup(func() {
++		reapReadSchedulerStatus = origStatus
++		reapPolecatSafeToNuke = origSafe
++		reapNukePolecat = origNuke
++	})
++	reapReadSchedulerStatus = func(string) (slotOpenSchedulerStatus, error) { return status, statusErr }
++	reapPolecatSafeToNuke = func(_, _, polecatName string) (bool, string) {
++		if safe(polecatName) {
++			return true, ""
++		}
++		return false, "check-recovery verdict=NEEDS_RECOVERY"
++	}
++	reapNukePolecat = func(_ *BdCli, _, _, polecatName string) error {
++		*nuked = append(*nuked, polecatName)
++		return nil
++	}
++}
++
++func makePolecatDirs(t *testing.T, townRoot, rigName string, names ...string) {
++	t.Helper()
++	for _, n := range names {
++		if err := os.MkdirAll(filepath.Join(townRoot, rigName, "polecats", n), 0755); err != nil {
++			t.Fatalf("mkdir polecat %s: %v", n, err)
++		}
++	}
++}
++
++func pressuredStatus(queuedReady int) slotOpenSchedulerStatus {
++	s := slotOpenSchedulerStatus{QueuedReady: queuedReady}
++	s.Capacity.Max = 11
++	s.Capacity.Free = 0
++	return s
++}
++
++func TestReapSafeToNukeUnderPressureReapsBoundedByQueue(t *testing.T) {
++	townRoot := t.TempDir()
++	makePolecatDirs(t, townRoot, "feryn", "chrome", "guzzle", "nitro")
++
++	var nuked []string
++	// All three classify SAFE_TO_NUKE, but only 2 beads are queued-ready.
++	withReapSeams(t, pressuredStatus(2), nil, func(string) bool { return true }, &nuked)
++
++	result := ReapSafeToNukeUnderPressure(nil, townRoot, "feryn")
++	if len(result.Reaped) != 2 {
++		t.Fatalf("reaped %v, want exactly 2 (bounded by queued_ready)", result.Reaped)
++	}
++	if len(nuked) != 2 {
++		t.Fatalf("NukePolecat called %d times, want 2", len(nuked))
++	}
++}
++
++func TestReapSafeToNukeUnderPressureSkipsNonSafe(t *testing.T) {
++	townRoot := t.TempDir()
++	makePolecatDirs(t, townRoot, "feryn", "chrome", "guzzle")
++
++	var nuked []string
++	// Only "chrome" is SAFE_TO_NUKE; "guzzle" still has recoverable work.
++	withReapSeams(t, pressuredStatus(5), nil, func(name string) bool { return name == "chrome" }, &nuked)
++
++	result := ReapSafeToNukeUnderPressure(nil, townRoot, "feryn")
++	if len(result.Reaped) != 1 || result.Reaped[0] != "chrome" {
++		t.Fatalf("reaped %v, want [chrome] only", result.Reaped)
++	}
++	if len(nuked) != 1 || nuked[0] != "chrome" {
++		t.Fatalf("nuked %v, want [chrome] — a recoverable polecat must never be reaped", nuked)
++	}
++}
++
++func TestReapSafeToNukeUnderPressureNoOpWithoutPressure(t *testing.T) {
++	townRoot := t.TempDir()
++	makePolecatDirs(t, townRoot, "feryn", "chrome")
++
++	var nuked []string
++	// Free capacity available → preserve reusable-idle polecats, reap nothing.
++	free := pressuredStatus(5)
++	free.Capacity.Free = 3
++	withReapSeams(t, free, nil, func(string) bool { return true }, &nuked)
++
++	result := ReapSafeToNukeUnderPressure(nil, townRoot, "feryn")
++	if len(result.Reaped) != 0 || len(nuked) != 0 {
++		t.Fatalf("reaped %v (nuked %v), want none when capacity is available", result.Reaped, nuked)
++	}
++	if result.Skipped == "" {
++		t.Fatal("expected a skip reason when not under pressure")
++	}
++}
++
++func TestReapSafeToNukeUnderPressureRespectsKillSwitch(t *testing.T) {
++	t.Setenv(disableAutoReapEnv, "1")
++	townRoot := t.TempDir()
++	makePolecatDirs(t, townRoot, "feryn", "chrome")
++
++	var nuked []string
++	withReapSeams(t, pressuredStatus(5), nil, func(string) bool { return true }, &nuked)
++
++	result := ReapSafeToNukeUnderPressure(nil, townRoot, "feryn")
++	if len(nuked) != 0 {
++		t.Fatalf("kill switch set but nuked %v", nuked)
++	}
++	if result.Skipped == "" {
++		t.Fatal("expected a skip reason when disabled via kill switch")
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+
