@@ -97,6 +97,57 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 	}
 }
 
+func TestPatrolScanOrphanOutputJSON(t *testing.T) {
+	// feryn-ktm0: orphaned-bead recovery pass must round-trip through the
+	// patrol scan JSON envelope so the witness can act on it.
+	output := PatrolScanOutput{
+		Rig:       "feryn",
+		Timestamp: "2026-07-20T12:00:00Z",
+		Orphans: &PatrolScanOrphanOutput{
+			Checked: 4,
+			Found:   2,
+			Orphans: []PatrolScanOrphanItem{
+				{BeadID: "feryn-lorn", Assignee: "feryn/polecats/fury", Polecat: "fury", Recovered: true},
+				{BeadID: "feryn-6jiw.4", Assignee: "feryn/polecats/guzzle", Polecat: "guzzle", Recovered: false},
+			},
+			Errors: []string{"listing hooked beads: boom"},
+		},
+	}
+
+	data, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("failed to marshal output: %v", err)
+	}
+
+	var parsed PatrolScanOutput
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal output: %v", err)
+	}
+
+	if parsed.Orphans == nil {
+		t.Fatal("Orphans = nil, want non-nil")
+	}
+	if parsed.Orphans.Checked != 4 {
+		t.Errorf("Orphans.Checked = %d, want 4", parsed.Orphans.Checked)
+	}
+	if parsed.Orphans.Found != 2 {
+		t.Errorf("Orphans.Found = %d, want 2", parsed.Orphans.Found)
+	}
+	if len(parsed.Orphans.Orphans) != 2 {
+		t.Fatalf("len(Orphans) = %d, want 2", len(parsed.Orphans.Orphans))
+	}
+	o := parsed.Orphans.Orphans[0]
+	if o.BeadID != "feryn-lorn" || o.Polecat != "fury" || !o.Recovered {
+		t.Errorf("orphan[0] = %+v, want feryn-lorn/fury recovered", o)
+	}
+	if parsed.Orphans.Orphans[1].Recovered {
+		t.Error("orphan[1].Recovered = true, want false")
+	}
+	if len(parsed.Orphans.Errors) != 1 {
+		t.Errorf("len(Orphans.Errors) = %d, want 1", len(parsed.Orphans.Errors))
+	}
+}
+
 func TestCountActiveWorkZombies(t *testing.T) {
 	result := &witness.DetectZombiePolecatsResult{
 		Zombies: []witness.ZombieResult{

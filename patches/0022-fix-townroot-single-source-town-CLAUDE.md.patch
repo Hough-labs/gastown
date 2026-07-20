@@ -1,7 +1,7 @@
 From d81e66aedd1e44fa9cdd24c49e48d32d381463f7 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Mon, 8 Jun 2026 13:58:24 -0400
-Subject: [PATCH 22/61] fix(townroot): single-source town CLAUDE.md
+Subject: [PATCH 22/62] fix(townroot): single-source town CLAUDE.md
 
 ---
  internal/cmd/install.go | 11 +----------

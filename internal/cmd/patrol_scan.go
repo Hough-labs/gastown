@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -72,7 +73,28 @@ type PatrolScanOutput struct {
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
 	Reap        *PatrolScanReapOutput     `json:"reap,omitempty"`
+	Orphans     *PatrolScanOrphanOutput   `json:"orphans,omitempty"`
 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+}
+
+// PatrolScanOrphanOutput reports the orphaned-bead recovery pass (feryn-ktm0).
+// Orphans are hooked/in_progress beads assigned to polecats whose session is
+// dead AND whose worktree directory is gone, so DetectZombiePolecats (which
+// scans FROM polecat directories) can never see them. Without this pass they
+// stay un-dispatchable until the next full `gt up`.
+type PatrolScanOrphanOutput struct {
+	Checked int                    `json:"checked"`
+	Found   int                    `json:"found"`
+	Orphans []PatrolScanOrphanItem `json:"orphans,omitempty"`
+	Errors  []string               `json:"errors,omitempty"`
+}
+
+// PatrolScanOrphanItem is a single orphaned-bead recovery in scan output.
+type PatrolScanOrphanItem struct {
+	BeadID    string `json:"bead_id"`
+	Assignee  string `json:"assignee"`
+	Polecat   string `json:"polecat"`
+	Recovered bool   `json:"recovered"`
 }
 
 // PatrolScanReapOutput reports the capacity-pressure reap pass (feryn-355z).
@@ -181,6 +203,24 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	reapResult := runPatrolScanPhase(diagnostics, "safe-to-nuke reap", func() *witness.ReapSafeToNukeResult {
 		return witness.ReapSafeToNukeUnderPressure(bd, workDir, rigName)
 	})
+	// Orphaned-bead recovery (feryn-ktm0): scans FROM beads to catch hooked/
+	// in_progress work assigned to polecats whose session is dead AND worktree
+	// directory is gone — the case DetectZombiePolecats (which scans FROM polecat
+	// directories) structurally cannot see. Previously this only ran at `gt up`,
+	// so a daemon restart or reap that removed a polecat dir left its bead stuck
+	// un-dispatchable until the next full boot. Runs after reap so it also clears
+	// beads left behind by this scan's own reaping.
+	//
+	// Unlike the other passes, this one runs `bd list` (no bead-ID prefix to route
+	// on), which resolves against the beads DB of its working directory. The rig's
+	// work beads live in the rig DB, not town root's, so it must run from the rig
+	// dir — matching the `gt up` orphan-recovery caller (recoverOrphanedBeads),
+	// which passes filepath.Join(townRoot, rigName). Passing townRoot here would
+	// query the town DB and silently find zero rig orphans.
+	rigWorkDir := filepath.Join(townRoot, rigName)
+	orphanResult := runPatrolScanPhase(diagnostics, "orphaned-bead recovery", func() *witness.DetectOrphanedBeadsResult {
+		return witness.DetectOrphanedBeads(bd, rigWorkDir, rigName, router)
+	})
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -197,10 +237,10 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	}
 
 	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, reapResult, receipts)
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, reapResult, orphanResult, receipts)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, reapResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, reapResult, orphanResult, receipts)
 }
 
 func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
@@ -299,7 +339,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	_ = router.Send(mayorMsg)
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, orphanResult *witness.DetectOrphanedBeadsResult, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
@@ -390,12 +430,32 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		output.Reap = ro
 	}
 
+	// Orphaned beads (feryn-ktm0)
+	if orphanResult != nil {
+		oo := &PatrolScanOrphanOutput{
+			Checked: orphanResult.Checked,
+			Found:   len(orphanResult.Orphans),
+		}
+		for _, o := range orphanResult.Orphans {
+			oo.Orphans = append(oo.Orphans, PatrolScanOrphanItem{
+				BeadID:    o.BeadID,
+				Assignee:  o.Assignee,
+				Polecat:   o.PolecatName,
+				Recovered: o.BeadRecovered,
+			})
+		}
+		for _, e := range orphanResult.Errors {
+			oo.Errors = append(oo.Errors, e.Error())
+		}
+		output.Orphans = oo
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, reapResult *witness.ReapSafeToNukeResult, orphanResult *witness.DetectOrphanedBeadsResult, _ []witness.PatrolReceipt) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -497,6 +557,27 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 		fmt.Println()
 	}
 
+	// Orphaned beads (feryn-ktm0) — surfaced only when it acted or in verbose mode.
+	if orphanResult != nil && (len(orphanResult.Orphans) > 0 || len(orphanResult.Errors) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Orphaned-bead Recovery: checked %d bead(s)\n",
+			style.Bold.Render("🧹"), orphanResult.Checked)
+		if len(orphanResult.Orphans) == 0 {
+			fmt.Printf("  %s\n", style.Dim.Render("No orphaned beads detected"))
+		} else {
+			for _, o := range orphanResult.Orphans {
+				status := "reset for re-dispatch"
+				if !o.BeadRecovered {
+					status = "detected (not reset — see errors/guards)"
+				}
+				fmt.Printf("  🧹 %s (was %s) → %s\n", o.BeadID, o.Assignee, status)
+			}
+		}
+		for _, e := range orphanResult.Errors {
+			fmt.Printf("    %s\n", style.Dim.Render(fmt.Sprintf("Error: %v", e)))
+		}
+		fmt.Println()
+	}
+
 	// Summary
 	zombieCount := 0
 	activeCount := 0
@@ -512,12 +593,16 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 	if completionResult != nil {
 		completionCount = len(completionResult.Discovered)
 	}
+	orphanCount := 0
+	if orphanResult != nil {
+		orphanCount = len(orphanResult.Orphans)
+	}
 
-	if zombieCount == 0 && stallCount == 0 && completionCount == 0 {
+	if zombieCount == 0 && stallCount == 0 && completionCount == 0 && orphanCount == 0 {
 		fmt.Printf("%s All clear — no issues detected\n", style.Success.Render("✓"))
 	} else {
-		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
-			zombieCount, activeCount, stallCount, completionCount)
+		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s), %d orphaned bead(s)\n",
+			zombieCount, activeCount, stallCount, completionCount, orphanCount)
 	}
 
 	return nil
