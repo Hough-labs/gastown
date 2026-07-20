@@ -1,7 +1,7 @@
 From 8c978c0de33ff28716767ce3d6f19b6d33802f2a Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 20:36:40 -0400
-Subject: [PATCH 57/63] fix(dispatch): enforce open-MR guard on scheduler
+Subject: [PATCH 57/64] fix(dispatch): enforce open-MR guard on scheduler
  deferred-dispatch path (feryn-zqm7)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

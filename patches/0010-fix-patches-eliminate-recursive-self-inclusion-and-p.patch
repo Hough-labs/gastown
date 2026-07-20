@@ -1,7 +1,7 @@
 From 4da4401f3047e0526e8f98174ba58c2b4a4d3bc3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 16 Apr 2026 19:20:48 -0400
-Subject: [PATCH 10/63] fix(patches): eliminate recursive self-inclusion and
+Subject: [PATCH 10/64] fix(patches): eliminate recursive self-inclusion and
  pre-push amend bug
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

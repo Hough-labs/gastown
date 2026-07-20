@@ -184,6 +184,13 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	router := mail.NewRouter(townRoot)
 	workDir := townRoot
 
+	// Rig work beads live in the rig DB, not town root's. Any pass that runs
+	// `bd list` (cwd-routed — no bead-ID prefix to route on) must execute from
+	// the rig dir, or it queries the town DB and silently finds zero rig beads.
+	// feryn-ktm0 established this for orphaned-bead recovery; feryn-ipm9 extended
+	// it to zombie detection (see the zombie pass below).
+	rigWorkDir := filepath.Join(townRoot, rigName)
+
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	// Run all three detection passes.
@@ -191,8 +198,16 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// internally — it only uses the router for workspace context. Notifications
 	// are sent exclusively below via --notify, avoiding double-send.
 	diagnostics := cmd.ErrOrStderr()
+	// feryn-ipm9: run from the rig dir, not town root. Under direct-tracking
+	// (hq-l6mm5) a dead-session polecat's in-flight work is discovered via
+	// resolveDirectHookBead's cwd-routed `bd list --status hooked --assignee ...`.
+	// From town root that query hits the town DB, finds no hook, so the polecat
+	// looks work-free (snapHook empty → not a zombie) and is never restarted — its
+	// stranded bead stalls forever and re-trips the mass-death dog every patrol.
+	// Filesystem enumeration is unaffected: DetectZombiePolecats derives its
+	// polecats dir from workspace.Find(workDir), not workDir directly.
 	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
-		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
+		return witness.DetectZombiePolecats(bd, rigWorkDir, rigName, router)
 	})
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
 		return witness.DetectStalledPolecats(workDir, rigName)
@@ -216,8 +231,8 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// work beads live in the rig DB, not town root's, so it must run from the rig
 	// dir — matching the `gt up` orphan-recovery caller (recoverOrphanedBeads),
 	// which passes filepath.Join(townRoot, rigName). Passing townRoot here would
-	// query the town DB and silently find zero rig orphans.
-	rigWorkDir := filepath.Join(townRoot, rigName)
+	// query the town DB and silently find zero rig orphans. (rigWorkDir is defined
+	// above, alongside workDir.)
 	orphanResult := runPatrolScanPhase(diagnostics, "orphaned-bead recovery", func() *witness.DetectOrphanedBeadsResult {
 		return witness.DetectOrphanedBeads(bd, rigWorkDir, rigName, router)
 	})

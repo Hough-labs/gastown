@@ -1,7 +1,7 @@
 From 0fcb93b140426581138b0a2e7a60005a9027432e Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:42 -0400
-Subject: [PATCH 18/63] fix(polecat): protect live-session polecats from
+Subject: [PATCH 18/64] fix(polecat): protect live-session polecats from
  stall-recovery nuke (hq-zxhx)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 22a6bdd390985545faf62c46529c2767d58e8d01 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:56:02 -0400
-Subject: [PATCH 55/63] fix(dispatch): dedup review polecats per-PR at the
+Subject: [PATCH 55/64] fix(dispatch): dedup review polecats per-PR at the
  schedule chokepoint (gfork-uf2)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
