@@ -1,7 +1,7 @@
 From 57a4459f7308ae7ff0af843fba30e2f30e30b3ac Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:03:49 -0400
-Subject: [PATCH 44/59] fix(test): reconcile PR-approval stub with reviews-API
+Subject: [PATCH 44/60] fix(test): reconcile PR-approval stub with reviews-API
  gate
 
 Upstream added TestPullRequestApprovalAndMergeUseResolvedURLAndRepo, whose

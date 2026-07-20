@@ -31,6 +31,7 @@ import (
 	"github.com/steveyegge/gastown/internal/estop"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/feed"
+	"github.com/steveyegge/gastown/internal/crew"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -956,6 +957,20 @@ func (d *Daemon) heartbeat(state *State) {
 		d.logger.Printf("Refinery patrol disabled in config, skipping")
 		// Kill leftover refinery sessions from before patrol was disabled. (hq-2mstj)
 		d.killRefinerySessions()
+	}
+
+	// 5.5. Ensure auto-restart crews are running (feryn-409i).
+	// Only crews that opted in via `gt crew autorestart <name> on` are
+	// supervised — a silent crew death (e.g. the iris review crew) parks all
+	// reviews/merges until a human restarts it. Off-by-default so the daemon
+	// never fights a deliberate `gt crew stop`. Pressure-gated like refineries:
+	// restarting a crew spawns a Claude session.
+	if d.isPatrolActive("crew") {
+		if p := d.checkPressure("refinery"); !p.OK {
+			d.logger.Printf("Deferring crew auto-restart: %s", p.Reason)
+		} else {
+			d.ensureCrewsRunning()
+		}
 	}
 
 	// 6. Ensure Mayor is running (restart if dead)
@@ -1919,6 +1934,85 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	d.metrics.recordRestart(d.ctx, "refinery")
 	telemetry.RecordDaemonRestart(d.ctx, "refinery-"+rigName)
 	d.logger.Printf("Refinery session for %s started successfully", rigName)
+}
+
+// ensureCrewsRunning restarts opted-in crews whose sessions have died, across
+// all operational rigs (feryn-409i). A silent crew death (e.g. the iris review
+// crew) otherwise parks all reviews/merges until a human intervenes.
+func (d *Daemon) ensureCrewsRunning() {
+	rigs := d.getPatrolRigs("crew")
+	d.rigPool.runPerRig(d.ctx, rigs, func(ctx context.Context, rigName string) error {
+		d.ensureCrewRunningForRig(rigName)
+		return nil
+	})
+}
+
+// ensureCrewRunningForRig restarts any AutoRestart-opted-in crew in rigName
+// whose session has died. Crews without the flag are left alone, so the daemon
+// never fights a deliberate `gt crew stop`.
+func (d *Daemon) ensureCrewRunningForRig(rigName string) {
+	r := &rig.Rig{
+		Name: rigName,
+		Path: filepath.Join(d.config.TownRoot, rigName),
+	}
+	mgr := crew.NewManager(r, gitpkg.NewGit(r.Path))
+	workers, err := mgr.List()
+	if err != nil {
+		d.logger.Printf("Crew watchdog: listing crew for %s failed: %v", rigName, err)
+		return
+	}
+	for _, w := range workers {
+		if w == nil || !w.AutoRestart {
+			continue
+		}
+		d.ensureCrewMemberRunning(mgr, rigName, w.Name)
+	}
+}
+
+// ensureCrewMemberRunning restarts a single opted-in crew member if its session
+// has died, honoring the same crash-loop / backoff guards used for other
+// supervised agents so a repeatedly-dying crew doesn't spin.
+func (d *Daemon) ensureCrewMemberRunning(mgr *crew.Manager, rigName, crewName string) {
+	sessionName := mgr.SessionName(crewName)
+	running, err := d.tmux.HasSession(sessionName)
+	if err != nil {
+		d.logger.Printf("Crew watchdog: checking session %s: %v", sessionName, err)
+		return
+	}
+	if running {
+		return // Alive — nothing to do.
+	}
+
+	agentID := "crew-" + rigName + "-" + crewName
+	if d.restartTracker != nil {
+		if d.restartTracker.IsInCrashLoop(agentID) {
+			d.logger.Printf("Crew watchdog: %s/%s in crash loop, not restarting (use 'gt daemon clear-backoff %s')", rigName, crewName, agentID)
+			return
+		}
+		if !d.restartTracker.CanRestart(agentID) {
+			d.logger.Printf("Crew watchdog: %s/%s restart in backoff, %s remaining",
+				rigName, crewName, d.restartTracker.GetBackoffRemaining(agentID).Round(time.Second))
+			return
+		}
+	}
+
+	if err := mgr.Start(crewName, crew.StartOptions{Topic: "restart"}); err != nil {
+		if errors.Is(err, crew.ErrSessionRunning) {
+			return // Raced with another starter — fine.
+		}
+		d.logger.Printf("Crew watchdog: error restarting %s/%s: %v", rigName, crewName, err)
+		return
+	}
+
+	if d.restartTracker != nil {
+		d.restartTracker.RecordRestart(agentID)
+		if err := d.restartTracker.Save(); err != nil {
+			d.logger.Printf("Crew watchdog: failed to save restart state: %v", err)
+		}
+	}
+	d.metrics.recordRestart(d.ctx, "crew")
+	telemetry.RecordDaemonRestart(d.ctx, "crew-"+rigName+"-"+crewName)
+	d.logger.Printf("Crew watchdog: restarted %s/%s (auto_restart, session was dead)", rigName, crewName)
 }
 
 // ensureMayorRunning ensures the Mayor is running.

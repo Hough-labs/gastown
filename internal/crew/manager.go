@@ -495,6 +495,28 @@ func (m *Manager) List() ([]*CrewWorker, error) {
 	return workers, nil
 }
 
+// SetAutoRestart persists the auto-restart supervision flag for a crew worker
+// (feryn-409i). When enabled, the daemon restarts the crew if its session dies
+// while the rig is operational.
+func (m *Manager) SetAutoRestart(name string, enabled bool) error {
+	if err := validateCrewName(name); err != nil {
+		return err
+	}
+	fl, err := m.lockCrew(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	crew, err := m.getLocked(name)
+	if err != nil {
+		return err
+	}
+	crew.AutoRestart = enabled
+	crew.UpdatedAt = time.Now().UTC()
+	return m.saveState(crew)
+}
+
 // Get returns a specific crew worker by name.
 func (m *Manager) Get(name string) (*CrewWorker, error) {
 	if err := validateCrewName(name); err != nil {

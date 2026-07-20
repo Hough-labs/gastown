@@ -1,0 +1,476 @@
+From dd773d7211515d5f5ffaee28681ff4ecaeba56e8 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 22:26:56 -0400
+Subject: [PATCH 60/60] feat(crew): daemon liveness watchdog for opt-in crews +
+ rig status surface (feryn-409i)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A crew session (e.g. the iris PR-review crew) can transition to 'stopped'
+silently — parking ALL reviews and merges until a human notices. There was no
+crew liveness watchdog (only witness/refinery are supervised) and crew health
+wasn't surfaced anywhere. Because a stopped crew is indistinguishable from a
+deliberate `gt crew stop` (crew liveness is derived purely from tmux presence),
+auto-restart is opt-in so the daemon never fights an intentional stop.
+
+  - Add an AutoRestart flag to CrewWorker (persisted in crew state), toggled via
+    `gt crew autorestart <name> on|off`. Off by default.
+  - Daemon heartbeat step (after refineries) restarts AutoRestart crews whose
+    session has died, across operational rigs — modeled on ensureWitnessRunning:
+    reuses getPatrolRigs (operational gate), honors the restartTracker
+    crash-loop / backoff guards, and is pressure-gated (a restart spawns a
+    Claude session). Crews without the flag are never touched.
+  - Surface crew liveness as a first-class health signal in `gt rig ls`:
+    "Crew: N (X running, Y stopped)" plus a warning line listing any
+    auto-restart crew whose session is currently down (JSON gains crew_running /
+    crew_stopped / crew_supervised_down).
+
+Tests: SetAutoRestart persistence round-trip through Get/List; unknown-crew
+error. Watchdog mirrors the established, tested witness/refinery restart path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/crew.go              | 19 +++++++
+ internal/cmd/crew_lifecycle.go    | 33 +++++++++++
+ internal/cmd/rig.go               | 62 +++++++++++++++++---
+ internal/crew/autorestart_test.go | 79 ++++++++++++++++++++++++++
+ internal/crew/manager.go          | 22 ++++++++
+ internal/crew/types.go            |  7 +++
+ internal/daemon/daemon.go         | 94 +++++++++++++++++++++++++++++++
+ 7 files changed, 307 insertions(+), 9 deletions(-)
+ create mode 100644 internal/crew/autorestart_test.go
+
+diff --git a/internal/cmd/crew.go b/internal/cmd/crew.go
+index 1435e81c..4d5ccdbc 100644
+--- a/internal/cmd/crew.go
++++ b/internal/cmd/crew.go
+@@ -236,6 +236,24 @@ Examples:
+ 	RunE: runCrewRestart,
+ }
+ 
++var crewAutorestartCmd = &cobra.Command{
++	Use:   "autorestart <name> <on|off>",
++	Short: "Toggle daemon auto-restart supervision for a crew member",
++	Long: `Opt a crew member into (or out of) daemon liveness supervision (feryn-409i).
++
++When ON, the daemon restarts the crew's session if it dies while the rig is
++operational — closing the gap where a silently-stopped crew (e.g. a PR-review
++crew) parks all reviews/merges until a human notices. OFF (the default) means
++the daemon never touches the crew, so a deliberate 'gt crew stop' is respected.
++
++Examples:
++  gt crew autorestart iris on         # supervise the iris crew
++  gt crew autorestart beads/iris on   # explicit rig
++  gt crew autorestart iris off        # stop supervising`,
++	Args: cobra.ExactArgs(2),
++	RunE: runCrewAutorestart,
++}
++
+ var crewRenameCmd = &cobra.Command{
+ 	Use:   "rename <old-name> <new-name>",
+ 	Short: "Rename a crew workspace",
+@@ -418,6 +436,7 @@ func init() {
+ 	crewCmd.AddCommand(crewRenameCmd)
+ 	crewCmd.AddCommand(crewPristineCmd)
+ 	crewCmd.AddCommand(crewRestartCmd)
++	crewCmd.AddCommand(crewAutorestartCmd)
+ 
+ 	// Add --session flag to next/prev commands for tmux key binding support
+ 	// When run via run-shell, tmux session context may be wrong, so we pass it explicitly
+diff --git a/internal/cmd/crew_lifecycle.go b/internal/cmd/crew_lifecycle.go
+index 18bc879d..da8a8a3a 100644
+--- a/internal/cmd/crew_lifecycle.go
++++ b/internal/cmd/crew_lifecycle.go
+@@ -407,6 +407,39 @@ func runCrewStart(cmd *cobra.Command, args []string) error {
+ 	return lastErr
+ }
+ 
++func runCrewAutorestart(cmd *cobra.Command, args []string) error {
++	name := args[0]
++	enabled, err := parseBool(args[1])
++	if err != nil {
++		return fmt.Errorf("invalid on/off value %q (use 'on' or 'off')", args[1])
++	}
++
++	rigOverride := crewRig
++	if rigName, crewName, ok := parseRigSlashName(name); ok {
++		if rigOverride == "" {
++			rigOverride = rigName
++		}
++		name = crewName
++	}
++
++	crewMgr, _, err := getCrewManagerForMember(rigOverride, name)
++	if err != nil {
++		return err
++	}
++	if err := crewMgr.SetAutoRestart(name, enabled); err != nil {
++		return fmt.Errorf("setting auto-restart for %s: %w", name, err)
++	}
++
++	if enabled {
++		fmt.Printf("%s auto-restart enabled for crew %s — the daemon will restart it if its session dies while the rig is operational\n",
++			style.Bold.Render("✓"), name)
++	} else {
++		fmt.Printf("%s auto-restart disabled for crew %s — the daemon will not supervise it\n",
++			style.Bold.Render("✓"), name)
++	}
++	return nil
++}
++
+ func runCrewRestart(cmd *cobra.Command, args []string) error {
+ 	// Handle --all flag
+ 	if crewAll {
+diff --git a/internal/cmd/rig.go b/internal/cmd/rig.go
+index 5505b843..dce62a58 100644
+--- a/internal/cmd/rig.go
++++ b/internal/cmd/rig.go
+@@ -769,6 +769,12 @@ func runRigList(cmd *cobra.Command, args []string) error {
+ 		Refinery    string `json:"refinery"`
+ 		Polecats    int    `json:"polecats"`
+ 		Crew        int    `json:"crew"`
++		CrewRunning int    `json:"crew_running"`
++		CrewStopped int    `json:"crew_stopped"`
++		// CrewSupervisedDown lists auto-restart crews whose session is currently
++		// dead — a first-class health signal (feryn-409i). The daemon will
++		// restart these, but surfacing them makes a silent crew death visible.
++		CrewSupervisedDown []string `json:"crew_supervised_down,omitempty"`
+ 		// sorting fields (not exported to JSON)
+ 		sortPrio int
+ 	}
+@@ -801,15 +807,19 @@ func runRigList(cmd *cobra.Command, args []string) error {
+ 		}
+ 
+ 		summary := r.Summary()
++		crewRunning, crewStopped, crewSupervisedDown := rigCrewLiveness(r, prefix, t)
+ 		rigs = append(rigs, rigInfo{
+-			Name:        name,
+-			BeadsPrefix: prefix,
+-			Status:      strings.ToLower(opState),
+-			Witness:     witnessStatus,
+-			Refinery:    refineryStatus,
+-			Polecats:    summary.PolecatCount,
+-			Crew:        summary.CrewCount,
+-			sortPrio:    rigStatePriority(witnessRunning, refineryRunning, opState),
++			Name:               name,
++			BeadsPrefix:        prefix,
++			Status:             strings.ToLower(opState),
++			Witness:            witnessStatus,
++			Refinery:           refineryStatus,
++			Polecats:           summary.PolecatCount,
++			Crew:               summary.CrewCount,
++			CrewRunning:        crewRunning,
++			CrewStopped:        crewStopped,
++			CrewSupervisedDown: crewSupervisedDown,
++			sortPrio:           rigStatePriority(witnessRunning, refineryRunning, opState),
+ 		})
+ 	}
+ 
+@@ -854,13 +864,47 @@ func runRigList(cmd *cobra.Command, args []string) error {
+ 
+ 		fmt.Printf("   Witness: %s %s  Refinery: %s %s\n",
+ 			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
+-		fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
++		if ri.Crew > 0 {
++			fmt.Printf("   Polecats: %d  Crew: %d (%d running, %d stopped)\n",
++				ri.Polecats, ri.Crew, ri.CrewRunning, ri.CrewStopped)
++		} else {
++			fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
++		}
++		if len(ri.CrewSupervisedDown) > 0 {
++			fmt.Printf("   %s auto-restart crew down: %s (daemon will restart)\n",
++				style.Warning.Render("⚠"), strings.Join(ri.CrewSupervisedDown, ", "))
++		}
+ 		fmt.Println()
+ 	}
+ 
+ 	return nil
+ }
+ 
++// rigCrewLiveness reports how many of a rig's crew sessions are running vs
++// stopped, and the names of any auto-restart crews whose session is currently
++// dead (feryn-409i). Best-effort: a crew-list error yields zero counts.
++func rigCrewLiveness(r *rig.Rig, prefix string, t *tmux.Tmux) (running, stopped int, supervisedDown []string) {
++	workers, err := crew.NewManager(r, git.NewGit(r.Path)).List()
++	if err != nil {
++		return 0, 0, nil
++	}
++	for _, w := range workers {
++		if w == nil {
++			continue
++		}
++		alive, _ := t.HasSession(session.CrewSessionName(prefix, w.Name))
++		if alive {
++			running++
++			continue
++		}
++		stopped++
++		if w.AutoRestart {
++			supervisedDown = append(supervisedDown, w.Name)
++		}
++	}
++	return running, stopped, supervisedDown
++}
++
+ var rigMenuCmd = &cobra.Command{
+ 	Use:    "menu",
+ 	Short:  "Show interactive rig menu in tmux",
+diff --git a/internal/crew/autorestart_test.go b/internal/crew/autorestart_test.go
+new file mode 100644
+index 00000000..1193bff6
+--- /dev/null
++++ b/internal/crew/autorestart_test.go
+@@ -0,0 +1,79 @@
++package crew
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/git"
++	"github.com/steveyegge/gastown/internal/rig"
++)
++
++// setupCrewManagerForTest builds a temp rig with a bare origin and returns a
++// crew manager plus the rig path.
++func setupCrewManagerForTest(t *testing.T) *Manager {
++	t.Helper()
++	tmpDir := t.TempDir()
++	rigPath := filepath.Join(tmpDir, "test-rig")
++	if err := os.MkdirAll(rigPath, 0755); err != nil {
++		t.Fatalf("mkdir rig: %v", err)
++	}
++	bareRepoPath := filepath.Join(tmpDir, "bare-repo.git")
++	if err := runCmd("git", "init", "--bare", bareRepoPath); err != nil {
++		t.Fatalf("init bare repo: %v", err)
++	}
++	r := &rig.Rig{Name: "test-rig", Path: rigPath, GitURL: bareRepoPath}
++	return NewManager(r, git.NewGit(rigPath))
++}
++
++func TestSetAutoRestartRoundTrips(t *testing.T) {
++	mgr := setupCrewManagerForTest(t)
++	if _, err := mgr.Add("iris", false); err != nil {
++		t.Fatalf("Add: %v", err)
++	}
++
++	// Default is off.
++	w, err := mgr.Get("iris")
++	if err != nil {
++		t.Fatalf("Get: %v", err)
++	}
++	if w.AutoRestart {
++		t.Fatal("new crew should default to AutoRestart=false")
++	}
++
++	// Enable and confirm it persists through a fresh Get and List.
++	if err := mgr.SetAutoRestart("iris", true); err != nil {
++		t.Fatalf("SetAutoRestart(true): %v", err)
++	}
++	if w, err = mgr.Get("iris"); err != nil {
++		t.Fatalf("Get after enable: %v", err)
++	}
++	if !w.AutoRestart {
++		t.Fatal("AutoRestart should be true after enabling")
++	}
++	workers, err := mgr.List()
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if len(workers) != 1 || !workers[0].AutoRestart {
++		t.Fatalf("List did not reflect AutoRestart: %+v", workers)
++	}
++
++	// Disable and confirm.
++	if err := mgr.SetAutoRestart("iris", false); err != nil {
++		t.Fatalf("SetAutoRestart(false): %v", err)
++	}
++	if w, err = mgr.Get("iris"); err != nil {
++		t.Fatalf("Get after disable: %v", err)
++	}
++	if w.AutoRestart {
++		t.Fatal("AutoRestart should be false after disabling")
++	}
++}
++
++func TestSetAutoRestartUnknownCrew(t *testing.T) {
++	mgr := setupCrewManagerForTest(t)
++	if err := mgr.SetAutoRestart("ghost", true); err == nil {
++		t.Fatal("expected error setting auto-restart on a non-existent crew")
++	}
++}
+diff --git a/internal/crew/manager.go b/internal/crew/manager.go
+index 95f399a2..f580c6aa 100644
+--- a/internal/crew/manager.go
++++ b/internal/crew/manager.go
+@@ -495,6 +495,28 @@ func (m *Manager) List() ([]*CrewWorker, error) {
+ 	return workers, nil
+ }
+ 
++// SetAutoRestart persists the auto-restart supervision flag for a crew worker
++// (feryn-409i). When enabled, the daemon restarts the crew if its session dies
++// while the rig is operational.
++func (m *Manager) SetAutoRestart(name string, enabled bool) error {
++	if err := validateCrewName(name); err != nil {
++		return err
++	}
++	fl, err := m.lockCrew(name)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = fl.Unlock() }()
++
++	crew, err := m.getLocked(name)
++	if err != nil {
++		return err
++	}
++	crew.AutoRestart = enabled
++	crew.UpdatedAt = time.Now().UTC()
++	return m.saveState(crew)
++}
++
+ // Get returns a specific crew worker by name.
+ func (m *Manager) Get(name string) (*CrewWorker, error) {
+ 	if err := validateCrewName(name); err != nil {
+diff --git a/internal/crew/types.go b/internal/crew/types.go
+index 2fefb5a1..7fbd33eb 100644
+--- a/internal/crew/types.go
++++ b/internal/crew/types.go
+@@ -22,6 +22,13 @@ type CrewWorker struct {
+ 
+ 	// UpdatedAt is when the crew worker was last updated.
+ 	UpdatedAt time.Time `json:"updated_at"`
++
++	// AutoRestart opts this crew worker into daemon liveness supervision: when
++	// true, the daemon restarts the crew if its session dies while the rig is
++	// operational. Off by default so the daemon never fights a deliberate
++	// `gt crew stop`; enable per-crew via `gt crew autorestart <name> on`
++	// (feryn-409i).
++	AutoRestart bool `json:"auto_restart,omitempty"`
+ }
+ 
+ // Summary provides a concise view of crew worker status.
+diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
+index ff426c4a..2bf385dd 100755
+--- a/internal/daemon/daemon.go
++++ b/internal/daemon/daemon.go
+@@ -31,6 +31,7 @@ import (
+ 	"github.com/steveyegge/gastown/internal/estop"
+ 	"github.com/steveyegge/gastown/internal/events"
+ 	"github.com/steveyegge/gastown/internal/feed"
++	"github.com/steveyegge/gastown/internal/crew"
+ 	gitpkg "github.com/steveyegge/gastown/internal/git"
+ 	"github.com/steveyegge/gastown/internal/mayor"
+ 	"github.com/steveyegge/gastown/internal/polecat"
+@@ -958,6 +959,20 @@ func (d *Daemon) heartbeat(state *State) {
+ 		d.killRefinerySessions()
+ 	}
+ 
++	// 5.5. Ensure auto-restart crews are running (feryn-409i).
++	// Only crews that opted in via `gt crew autorestart <name> on` are
++	// supervised — a silent crew death (e.g. the iris review crew) parks all
++	// reviews/merges until a human restarts it. Off-by-default so the daemon
++	// never fights a deliberate `gt crew stop`. Pressure-gated like refineries:
++	// restarting a crew spawns a Claude session.
++	if d.isPatrolActive("crew") {
++		if p := d.checkPressure("refinery"); !p.OK {
++			d.logger.Printf("Deferring crew auto-restart: %s", p.Reason)
++		} else {
++			d.ensureCrewsRunning()
++		}
++	}
++
+ 	// 6. Ensure Mayor is running (restart if dead)
+ 	d.ensureMayorRunning()
+ 
+@@ -1921,6 +1936,85 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
+ 	d.logger.Printf("Refinery session for %s started successfully", rigName)
+ }
+ 
++// ensureCrewsRunning restarts opted-in crews whose sessions have died, across
++// all operational rigs (feryn-409i). A silent crew death (e.g. the iris review
++// crew) otherwise parks all reviews/merges until a human intervenes.
++func (d *Daemon) ensureCrewsRunning() {
++	rigs := d.getPatrolRigs("crew")
++	d.rigPool.runPerRig(d.ctx, rigs, func(ctx context.Context, rigName string) error {
++		d.ensureCrewRunningForRig(rigName)
++		return nil
++	})
++}
++
++// ensureCrewRunningForRig restarts any AutoRestart-opted-in crew in rigName
++// whose session has died. Crews without the flag are left alone, so the daemon
++// never fights a deliberate `gt crew stop`.
++func (d *Daemon) ensureCrewRunningForRig(rigName string) {
++	r := &rig.Rig{
++		Name: rigName,
++		Path: filepath.Join(d.config.TownRoot, rigName),
++	}
++	mgr := crew.NewManager(r, gitpkg.NewGit(r.Path))
++	workers, err := mgr.List()
++	if err != nil {
++		d.logger.Printf("Crew watchdog: listing crew for %s failed: %v", rigName, err)
++		return
++	}
++	for _, w := range workers {
++		if w == nil || !w.AutoRestart {
++			continue
++		}
++		d.ensureCrewMemberRunning(mgr, rigName, w.Name)
++	}
++}
++
++// ensureCrewMemberRunning restarts a single opted-in crew member if its session
++// has died, honoring the same crash-loop / backoff guards used for other
++// supervised agents so a repeatedly-dying crew doesn't spin.
++func (d *Daemon) ensureCrewMemberRunning(mgr *crew.Manager, rigName, crewName string) {
++	sessionName := mgr.SessionName(crewName)
++	running, err := d.tmux.HasSession(sessionName)
++	if err != nil {
++		d.logger.Printf("Crew watchdog: checking session %s: %v", sessionName, err)
++		return
++	}
++	if running {
++		return // Alive — nothing to do.
++	}
++
++	agentID := "crew-" + rigName + "-" + crewName
++	if d.restartTracker != nil {
++		if d.restartTracker.IsInCrashLoop(agentID) {
++			d.logger.Printf("Crew watchdog: %s/%s in crash loop, not restarting (use 'gt daemon clear-backoff %s')", rigName, crewName, agentID)
++			return
++		}
++		if !d.restartTracker.CanRestart(agentID) {
++			d.logger.Printf("Crew watchdog: %s/%s restart in backoff, %s remaining",
++				rigName, crewName, d.restartTracker.GetBackoffRemaining(agentID).Round(time.Second))
++			return
++		}
++	}
++
++	if err := mgr.Start(crewName, crew.StartOptions{Topic: "restart"}); err != nil {
++		if errors.Is(err, crew.ErrSessionRunning) {
++			return // Raced with another starter — fine.
++		}
++		d.logger.Printf("Crew watchdog: error restarting %s/%s: %v", rigName, crewName, err)
++		return
++	}
++
++	if d.restartTracker != nil {
++		d.restartTracker.RecordRestart(agentID)
++		if err := d.restartTracker.Save(); err != nil {
++			d.logger.Printf("Crew watchdog: failed to save restart state: %v", err)
++		}
++	}
++	d.metrics.recordRestart(d.ctx, "crew")
++	telemetry.RecordDaemonRestart(d.ctx, "crew-"+rigName+"-"+crewName)
++	d.logger.Printf("Crew watchdog: restarted %s/%s (auto_restart, session was dead)", rigName, crewName)
++}
++
+ // ensureMayorRunning ensures the Mayor is running.
+ // Uses mayor.Manager for consistent startup behavior.
+ // If the tmux session exists but the agent is dead (zombie), the daemon
+-- 
+2.50.1 (Apple Git-155)
+

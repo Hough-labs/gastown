@@ -22,6 +22,13 @@ type CrewWorker struct {
 
 	// UpdatedAt is when the crew worker was last updated.
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// AutoRestart opts this crew worker into daemon liveness supervision: when
+	// true, the daemon restarts the crew if its session dies while the rig is
+	// operational. Off by default so the daemon never fights a deliberate
+	// `gt crew stop`; enable per-crew via `gt crew autorestart <name> on`
+	// (feryn-409i).
+	AutoRestart bool `json:"auto_restart,omitempty"`
 }
 
 // Summary provides a concise view of crew worker status.

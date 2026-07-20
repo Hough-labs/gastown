@@ -769,6 +769,12 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		Refinery    string `json:"refinery"`
 		Polecats    int    `json:"polecats"`
 		Crew        int    `json:"crew"`
+		CrewRunning int    `json:"crew_running"`
+		CrewStopped int    `json:"crew_stopped"`
+		// CrewSupervisedDown lists auto-restart crews whose session is currently
+		// dead — a first-class health signal (feryn-409i). The daemon will
+		// restart these, but surfacing them makes a silent crew death visible.
+		CrewSupervisedDown []string `json:"crew_supervised_down,omitempty"`
 		// sorting fields (not exported to JSON)
 		sortPrio int
 	}
@@ -801,15 +807,19 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		}
 
 		summary := r.Summary()
+		crewRunning, crewStopped, crewSupervisedDown := rigCrewLiveness(r, prefix, t)
 		rigs = append(rigs, rigInfo{
-			Name:        name,
-			BeadsPrefix: prefix,
-			Status:      strings.ToLower(opState),
-			Witness:     witnessStatus,
-			Refinery:    refineryStatus,
-			Polecats:    summary.PolecatCount,
-			Crew:        summary.CrewCount,
-			sortPrio:    rigStatePriority(witnessRunning, refineryRunning, opState),
+			Name:               name,
+			BeadsPrefix:        prefix,
+			Status:             strings.ToLower(opState),
+			Witness:            witnessStatus,
+			Refinery:           refineryStatus,
+			Polecats:           summary.PolecatCount,
+			Crew:               summary.CrewCount,
+			CrewRunning:        crewRunning,
+			CrewStopped:        crewStopped,
+			CrewSupervisedDown: crewSupervisedDown,
+			sortPrio:           rigStatePriority(witnessRunning, refineryRunning, opState),
 		})
 	}
 
@@ -854,11 +864,45 @@ func runRigList(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("   Witness: %s %s  Refinery: %s %s\n",
 			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
-		fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
+		if ri.Crew > 0 {
+			fmt.Printf("   Polecats: %d  Crew: %d (%d running, %d stopped)\n",
+				ri.Polecats, ri.Crew, ri.CrewRunning, ri.CrewStopped)
+		} else {
+			fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
+		}
+		if len(ri.CrewSupervisedDown) > 0 {
+			fmt.Printf("   %s auto-restart crew down: %s (daemon will restart)\n",
+				style.Warning.Render("⚠"), strings.Join(ri.CrewSupervisedDown, ", "))
+		}
 		fmt.Println()
 	}
 
 	return nil
+}
+
+// rigCrewLiveness reports how many of a rig's crew sessions are running vs
+// stopped, and the names of any auto-restart crews whose session is currently
+// dead (feryn-409i). Best-effort: a crew-list error yields zero counts.
+func rigCrewLiveness(r *rig.Rig, prefix string, t *tmux.Tmux) (running, stopped int, supervisedDown []string) {
+	workers, err := crew.NewManager(r, git.NewGit(r.Path)).List()
+	if err != nil {
+		return 0, 0, nil
+	}
+	for _, w := range workers {
+		if w == nil {
+			continue
+		}
+		alive, _ := t.HasSession(session.CrewSessionName(prefix, w.Name))
+		if alive {
+			running++
+			continue
+		}
+		stopped++
+		if w.AutoRestart {
+			supervisedDown = append(supervisedDown, w.Name)
+		}
+	}
+	return running, stopped, supervisedDown
 }
 
 var rigMenuCmd = &cobra.Command{

@@ -407,6 +407,39 @@ func runCrewStart(cmd *cobra.Command, args []string) error {
 	return lastErr
 }
 
+func runCrewAutorestart(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	enabled, err := parseBool(args[1])
+	if err != nil {
+		return fmt.Errorf("invalid on/off value %q (use 'on' or 'off')", args[1])
+	}
+
+	rigOverride := crewRig
+	if rigName, crewName, ok := parseRigSlashName(name); ok {
+		if rigOverride == "" {
+			rigOverride = rigName
+		}
+		name = crewName
+	}
+
+	crewMgr, _, err := getCrewManagerForMember(rigOverride, name)
+	if err != nil {
+		return err
+	}
+	if err := crewMgr.SetAutoRestart(name, enabled); err != nil {
+		return fmt.Errorf("setting auto-restart for %s: %w", name, err)
+	}
+
+	if enabled {
+		fmt.Printf("%s auto-restart enabled for crew %s — the daemon will restart it if its session dies while the rig is operational\n",
+			style.Bold.Render("✓"), name)
+	} else {
+		fmt.Printf("%s auto-restart disabled for crew %s — the daemon will not supervise it\n",
+			style.Bold.Render("✓"), name)
+	}
+	return nil
+}
+
 func runCrewRestart(cmd *cobra.Command, args []string) error {
 	// Handle --all flag
 	if crewAll {

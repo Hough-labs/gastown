@@ -236,6 +236,24 @@ Examples:
 	RunE: runCrewRestart,
 }
 
+var crewAutorestartCmd = &cobra.Command{
+	Use:   "autorestart <name> <on|off>",
+	Short: "Toggle daemon auto-restart supervision for a crew member",
+	Long: `Opt a crew member into (or out of) daemon liveness supervision (feryn-409i).
+
+When ON, the daemon restarts the crew's session if it dies while the rig is
+operational — closing the gap where a silently-stopped crew (e.g. a PR-review
+crew) parks all reviews/merges until a human notices. OFF (the default) means
+the daemon never touches the crew, so a deliberate 'gt crew stop' is respected.
+
+Examples:
+  gt crew autorestart iris on         # supervise the iris crew
+  gt crew autorestart beads/iris on   # explicit rig
+  gt crew autorestart iris off        # stop supervising`,
+	Args: cobra.ExactArgs(2),
+	RunE: runCrewAutorestart,
+}
+
 var crewRenameCmd = &cobra.Command{
 	Use:   "rename <old-name> <new-name>",
 	Short: "Rename a crew workspace",
@@ -418,6 +436,7 @@ func init() {
 	crewCmd.AddCommand(crewRenameCmd)
 	crewCmd.AddCommand(crewPristineCmd)
 	crewCmd.AddCommand(crewRestartCmd)
+	crewCmd.AddCommand(crewAutorestartCmd)
 
 	// Add --session flag to next/prev commands for tmux key binding support
 	// When run via run-shell, tmux session context may be wrong, so we pass it explicitly
