@@ -1629,6 +1629,66 @@ func (g *Git) IsPullRequestApproved(pr *PullRequestInfo) (bool, error) {
 	return hasApproval, nil
 }
 
+// HasReviewDecisionSince reports whether the PR carries a review decision
+// (APPROVED or CHANGES_REQUESTED — either proves the review was performed)
+// submitted after `since`.
+//
+// Used by the review-only close gate (feryn-19i0): the dispatched reviewer
+// records its verdict on GitHub via `gh pr review`, NOT as a prefixed bead
+// comment, so a review-only bead whose PR advances mid-review finds no bead
+// evidence and forces a manual close + escalation. Checking GitHub directly
+// closes that gap. The `since` bound mirrors the bead-comment gate's
+// post-assignment freshness check so a stale pre-dispatch review does not
+// satisfy a freshly-dispatched review task. COMMENTED / DISMISSED / PENDING
+// reviews are ignored — only an actual decision counts as the review being done.
+func (g *Git) HasReviewDecisionSince(pr *PullRequestInfo, since time.Time) (bool, error) {
+	if pr == nil || (pr.Number == 0 && pr.URL == "") {
+		return false, fmt.Errorf("pull request identity is missing")
+	}
+	args := []string{"pr", "view", pullRequestSelector(pr), "--json", "reviews"}
+	if pr.BaseRepo != "" {
+		args = append(args, "--repo", pr.BaseRepo)
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("gh pr view failed: %w", err)
+	}
+	var result struct {
+		Reviews []struct {
+			State       string `json:"state"`
+			SubmittedAt string `json:"submittedAt"`
+		} `json:"reviews"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
+	}
+	for _, r := range result.Reviews {
+		if r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		submitted, perr := parseGitHubTime(r.SubmittedAt)
+		if perr != nil {
+			continue
+		}
+		if submitted.After(since) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// parseGitHubTime parses a GitHub RFC3339 timestamp, tolerating optional
+// fractional seconds.
+func parseGitHubTime(ts string) (time.Time, error) {
+	ts = strings.TrimSpace(ts)
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, ts)
+}
+
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
 // The method parameter should be "merge", "squash", or "rebase".
 // Returns the merge commit SHA on success.

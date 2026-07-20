@@ -272,9 +272,54 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
 		return fmt.Sprintf("could not verify review evidence for %s: %v", issueID, err), true
 	}
 	if !hasEvidence {
+		// feryn-19i0: the dispatched reviewer records its verdict on GitHub via
+		// `gh pr review`, not as a bead comment, so the bead-comment gate above
+		// finds nothing even when the review genuinely happened (esp. when the PR
+		// head advances mid-review). Fall back to the PR's review decisions before
+		// declaring no evidence. Fails safe: a missing pr_url or any gh error
+		// yields no GitHub evidence and preserves the escalate-and-hold behavior.
+		if reviewOnlyPRHasFreshDecision(attachment, assignmentAt) {
+			return "", false
+		}
 		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
 	}
 	return "", false
+}
+
+// reviewOnlyPRHasFreshDecision reports whether the PR referenced by a
+// review-only bead's pr_url var carries a review decision submitted after the
+// bead was assigned (feryn-19i0). Returns false — never blocks — when pr_url is
+// absent, the cwd cannot be resolved, or gh fails, so the caller falls through
+// to the existing evidence-missing handling rather than false-closing.
+func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, assignmentAt time.Time) bool {
+	if attachment == nil {
+		return false
+	}
+	prURL := attachedVarValue(attachment.AttachedVars, "pr_url")
+	if prURL == "" {
+		return false
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	ok, err := git.NewGit(cwd).HasReviewDecisionSince(&git.PullRequestInfo{URL: prURL}, assignmentAt)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+// attachedVarValue returns the value of a key=value entry in a bead's
+// AttachedVars (formula --var pairs), or "" if absent.
+func attachedVarValue(vars []string, key string) string {
+	prefix := key + "="
+	for _, v := range vars {
+		if strings.HasPrefix(v, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(v, prefix))
+		}
+	}
+	return ""
 }
 
 func loadDoneSourceIssue(bd *beads.Beads, issueID string, issue *beads.Issue) (*beads.Issue, string, bool) {

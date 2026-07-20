@@ -1,0 +1,341 @@
+From 76e8872072c3a849e1148ffa27cfc7da4580d40d Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Sun, 19 Jul 2026 21:59:19 -0400
+Subject: [PATCH 58/58] fix(done): close review-only bead on GitHub review
+ decision, not just bead comments (feryn-19i0)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A review-only bead's close gate looks for a fresh review-evidence comment
+authored by the assignee on the BEAD. But the dispatched reviewer records its
+verdict on GitHub via `gh pr review --approve/--request-changes`, never as a
+prefixed bead comment — so the gate finds no evidence and returns a fatal skip.
+gfork-2cw then force-clears the hook and escalates, leaving the mayor to close
+by hand. This recurred on the feryn stress run (x0v3/#243, e56z), most visibly
+when the PR head advanced mid-review so even a human scanning for evidence at
+the dispatch-time head found nothing.
+
+Add a GitHub-side evidence fallback: when no bead comment satisfies the gate,
+resolve the PR from the review-only bead's pr_url var and check whether the PR
+carries a review decision (APPROVED or CHANGES_REQUESTED — either proves the
+review task was performed) submitted after the bead was assigned. The
+post-assignment bound mirrors the bead-comment freshness rule so a stale
+pre-dispatch review does not satisfy a fresh review task.
+
+New git.HasReviewDecisionSince(pr, since) fetches `gh pr view --json reviews`
+and returns true on any decision review newer than `since`. It fails safe: a
+missing pr_url, unresolvable cwd, or any gh error yields no GitHub evidence and
+preserves the existing escalate-and-hold behavior — the gate never false-closes.
+
+Also handles the CHANGES_REQUESTED recurrence noted in the bead: the review-only
+task is "review this PR", which is complete regardless of verdict, so a posted
+changes-requested review now closes the bead instead of escalating.
+
+Tests: git.HasReviewDecisionSince (fresh/stale/advance windows, non-decision
+reviews ignored); done review-only gate (GitHub approval allows close, stale
+decision rejected, missing pr_url falls through to escalation).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/done.go           | 45 +++++++++++++++++++++++
+ internal/cmd/done_test.go      | 64 ++++++++++++++++++++++++++++++++
+ internal/git/git.go            | 60 ++++++++++++++++++++++++++++++
+ internal/git/pr_lookup_test.go | 67 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 236 insertions(+)
+
+diff --git a/internal/cmd/done.go b/internal/cmd/done.go
+index 5824401d..cbb0cd16 100644
+--- a/internal/cmd/done.go
++++ b/internal/cmd/done.go
+@@ -272,11 +272,56 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
+ 		return fmt.Sprintf("could not verify review evidence for %s: %v", issueID, err), true
+ 	}
+ 	if !hasEvidence {
++		// feryn-19i0: the dispatched reviewer records its verdict on GitHub via
++		// `gh pr review`, not as a bead comment, so the bead-comment gate above
++		// finds nothing even when the review genuinely happened (esp. when the PR
++		// head advances mid-review). Fall back to the PR's review decisions before
++		// declaring no evidence. Fails safe: a missing pr_url or any gh error
++		// yields no GitHub evidence and preserves the escalate-and-hold behavior.
++		if reviewOnlyPRHasFreshDecision(attachment, assignmentAt) {
++			return "", false
++		}
+ 		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
+ 	}
+ 	return "", false
+ }
+ 
++// reviewOnlyPRHasFreshDecision reports whether the PR referenced by a
++// review-only bead's pr_url var carries a review decision submitted after the
++// bead was assigned (feryn-19i0). Returns false — never blocks — when pr_url is
++// absent, the cwd cannot be resolved, or gh fails, so the caller falls through
++// to the existing evidence-missing handling rather than false-closing.
++func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, assignmentAt time.Time) bool {
++	if attachment == nil {
++		return false
++	}
++	prURL := attachedVarValue(attachment.AttachedVars, "pr_url")
++	if prURL == "" {
++		return false
++	}
++	cwd, err := os.Getwd()
++	if err != nil {
++		return false
++	}
++	ok, err := git.NewGit(cwd).HasReviewDecisionSince(&git.PullRequestInfo{URL: prURL}, assignmentAt)
++	if err != nil {
++		return false
++	}
++	return ok
++}
++
++// attachedVarValue returns the value of a key=value entry in a bead's
++// AttachedVars (formula --var pairs), or "" if absent.
++func attachedVarValue(vars []string, key string) string {
++	prefix := key + "="
++	for _, v := range vars {
++		if strings.HasPrefix(v, prefix) {
++			return strings.TrimSpace(strings.TrimPrefix(v, prefix))
++		}
++	}
++	return ""
++}
++
+ func loadDoneSourceIssue(bd *beads.Beads, issueID string, issue *beads.Issue) (*beads.Issue, string, bool) {
+ 	if issueID == "" {
+ 		return nil, "", false
+diff --git a/internal/cmd/done_test.go b/internal/cmd/done_test.go
+index a609bdcc..0d2dccdb 100644
+--- a/internal/cmd/done_test.go
++++ b/internal/cmd/done_test.go
+@@ -176,6 +176,70 @@ func TestReviewOnlyCloseAllowsFreshEvidenceComment(t *testing.T) {
+ 	}
+ }
+ 
++// installReviewGHStub writes a fake `gh` that answers `pr view --json reviews`
++// with the given reviews JSON array, and prepends it to PATH.
++func installReviewGHStub(t *testing.T, reviewsJSON string) {
++	t.Helper()
++	dir := t.TempDir()
++	script := "#!/bin/sh\n" +
++		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
++		"  printf '%s\\n' '{\"reviews\":" + reviewsJSON + "}'\n" +
++		"  exit 0\n" +
++		"fi\n" +
++		"echo 'unexpected gh args' >&2\nexit 1\n"
++	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
++		t.Fatalf("write gh stub: %v", err)
++	}
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
++}
++
++// feryn-19i0: a review-only bead whose reviewer approved on GitHub (not via a
++// bead comment) must close on the strength of that GitHub decision.
++func TestReviewOnlyCloseAllowsFreshGitHubDecision(t *testing.T) {
++	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-07-01T12:05:00Z"}]`)
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
++		Assignee:    "gastown/polecats/nitro",
++		// No satisfying bead comment — evidence must come from GitHub.
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason != "" || fatal {
++		t.Fatalf("fresh GitHub approval should allow close: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
++// A GitHub decision submitted BEFORE the review bead was assigned is stale and
++// must not satisfy the freshly-dispatched review task (mirrors the bead-comment
++// freshness rule).
++func TestReviewOnlyCloseRejectsStaleGitHubDecision(t *testing.T) {
++	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-06-01T00:00:00Z"}]`)
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
++		Assignee:    "gastown/polecats/nitro",
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason == "" || !fatal {
++		t.Fatalf("stale GitHub review must not satisfy evidence: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
++// Without a pr_url var there is nothing to check on GitHub; the gate falls back
++// to the existing evidence-missing escalation.
++func TestReviewOnlyCloseNoPRURLFallsThrough(t *testing.T) {
++	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-07-01T12:05:00Z"}]`)
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
++		Assignee:    "gastown/polecats/nitro",
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason == "" || !fatal {
++		t.Fatalf("missing pr_url should preserve escalation: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
+ func TestReviewOnlyGeneratedCommentsDoNotCountAsEvidence(t *testing.T) {
+ 	issue := &beads.Issue{
+ 		ID:          "gt-review",
+diff --git a/internal/git/git.go b/internal/git/git.go
+index 5acccc97..346051c6 100644
+--- a/internal/git/git.go
++++ b/internal/git/git.go
+@@ -1629,6 +1629,66 @@ func (g *Git) IsPullRequestApproved(pr *PullRequestInfo) (bool, error) {
+ 	return hasApproval, nil
+ }
+ 
++// HasReviewDecisionSince reports whether the PR carries a review decision
++// (APPROVED or CHANGES_REQUESTED — either proves the review was performed)
++// submitted after `since`.
++//
++// Used by the review-only close gate (feryn-19i0): the dispatched reviewer
++// records its verdict on GitHub via `gh pr review`, NOT as a prefixed bead
++// comment, so a review-only bead whose PR advances mid-review finds no bead
++// evidence and forces a manual close + escalation. Checking GitHub directly
++// closes that gap. The `since` bound mirrors the bead-comment gate's
++// post-assignment freshness check so a stale pre-dispatch review does not
++// satisfy a freshly-dispatched review task. COMMENTED / DISMISSED / PENDING
++// reviews are ignored — only an actual decision counts as the review being done.
++func (g *Git) HasReviewDecisionSince(pr *PullRequestInfo, since time.Time) (bool, error) {
++	if pr == nil || (pr.Number == 0 && pr.URL == "") {
++		return false, fmt.Errorf("pull request identity is missing")
++	}
++	args := []string{"pr", "view", pullRequestSelector(pr), "--json", "reviews"}
++	if pr.BaseRepo != "" {
++		args = append(args, "--repo", pr.BaseRepo)
++	}
++	cmd := exec.Command("gh", args...)
++	cmd.Dir = g.workDir
++	out, err := cmd.Output()
++	if err != nil {
++		return false, fmt.Errorf("gh pr view failed: %w", err)
++	}
++	var result struct {
++		Reviews []struct {
++			State       string `json:"state"`
++			SubmittedAt string `json:"submittedAt"`
++		} `json:"reviews"`
++	}
++	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
++		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
++	}
++	for _, r := range result.Reviews {
++		if r.State != "APPROVED" && r.State != "CHANGES_REQUESTED" {
++			continue
++		}
++		submitted, perr := parseGitHubTime(r.SubmittedAt)
++		if perr != nil {
++			continue
++		}
++		if submitted.After(since) {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// parseGitHubTime parses a GitHub RFC3339 timestamp, tolerating optional
++// fractional seconds.
++func parseGitHubTime(ts string) (time.Time, error) {
++	ts = strings.TrimSpace(ts)
++	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
++		return t, nil
++	}
++	return time.Parse(time.RFC3339, ts)
++}
++
+ // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
+ // The method parameter should be "merge", "squash", or "rebase".
+ // Returns the merge commit SHA on success.
+diff --git a/internal/git/pr_lookup_test.go b/internal/git/pr_lookup_test.go
+index f8cbca29..f404da1e 100644
+--- a/internal/git/pr_lookup_test.go
++++ b/internal/git/pr_lookup_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func TestLookupPullRequestRecordedURLSurvivesDeletedHead(t *testing.T) {
+@@ -172,6 +173,72 @@ exit 1
+ 	}
+ }
+ 
++func TestHasReviewDecisionSince(t *testing.T) {
++	// gh returns one CHANGES_REQUESTED at 22:00 and one APPROVED at 22:50.
++	installFakeGH(t, `#!/bin/sh
++if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
++  printf '%s\n' '{"reviews":[{"state":"COMMENTED","submittedAt":"2026-07-19T21:00:00Z"},{"state":"CHANGES_REQUESTED","submittedAt":"2026-07-19T22:00:00Z"},{"state":"APPROVED","submittedAt":"2026-07-19T22:50:38Z"}]}'
++  exit 0
++fi
++printf 'unexpected gh args: %s\n' "$*" >&2
++exit 1
++`)
++	g := NewGit(initTestRepo(t))
++	pr := &PullRequestInfo{Number: 243, URL: "https://github.com/upstream/repo/pull/243"}
++
++	mustParse := func(s string) time.Time {
++		ts, err := time.Parse(time.RFC3339, s)
++		if err != nil {
++			t.Fatalf("parse %q: %v", s, err)
++		}
++		return ts
++	}
++
++	cases := []struct {
++		name  string
++		since string
++		want  bool
++	}{
++		// Assigned before both decisions — the review happened after assignment.
++		{"decision after assignment", "2026-07-19T20:00:00Z", true},
++		// The PR advanced and was re-reviewed; assigned just before the approval.
++		{"approval after advance", "2026-07-19T22:30:00Z", true},
++		// Assigned after the last decision — no fresh review; must not satisfy.
++		{"assigned after last decision", "2026-07-19T23:00:00Z", false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := g.HasReviewDecisionSince(pr, mustParse(tc.since))
++			if err != nil {
++				t.Fatalf("HasReviewDecisionSince: %v", err)
++			}
++			if got != tc.want {
++				t.Fatalf("HasReviewDecisionSince(since=%s) = %v, want %v", tc.since, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestHasReviewDecisionSinceIgnoresNonDecisions(t *testing.T) {
++	// Only COMMENTED/DISMISSED reviews exist — none is a decision, so no evidence.
++	installFakeGH(t, `#!/bin/sh
++if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
++  printf '%s\n' '{"reviews":[{"state":"COMMENTED","submittedAt":"2026-07-19T22:00:00Z"},{"state":"DISMISSED","submittedAt":"2026-07-19T22:30:00Z"}]}'
++  exit 0
++fi
++exit 1
++`)
++	g := NewGit(initTestRepo(t))
++	since, _ := time.Parse(time.RFC3339, "2026-07-19T20:00:00Z")
++	got, err := g.HasReviewDecisionSince(&PullRequestInfo{URL: "https://github.com/upstream/repo/pull/243"}, since)
++	if err != nil {
++		t.Fatalf("HasReviewDecisionSince: %v", err)
++	}
++	if got {
++		t.Fatal("HasReviewDecisionSince = true for comment-only reviews, want false")
++	}
++}
++
+ func installFakeGH(t *testing.T, script string) string {
+ 	t.Helper()
+ 	dir := t.TempDir()
+-- 
+2.50.1 (Apple Git-155)
+

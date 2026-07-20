@@ -176,6 +176,70 @@ func TestReviewOnlyCloseAllowsFreshEvidenceComment(t *testing.T) {
 	}
 }
 
+// installReviewGHStub writes a fake `gh` that answers `pr view --json reviews`
+// with the given reviews JSON array, and prepends it to PATH.
+func installReviewGHStub(t *testing.T, reviewsJSON string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
+		"  printf '%s\\n' '{\"reviews\":" + reviewsJSON + "}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo 'unexpected gh args' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// feryn-19i0: a review-only bead whose reviewer approved on GitHub (not via a
+// bead comment) must close on the strength of that GitHub decision.
+func TestReviewOnlyCloseAllowsFreshGitHubDecision(t *testing.T) {
+	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-07-01T12:05:00Z"}]`)
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
+		Assignee:    "gastown/polecats/nitro",
+		// No satisfying bead comment — evidence must come from GitHub.
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason != "" || fatal {
+		t.Fatalf("fresh GitHub approval should allow close: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+// A GitHub decision submitted BEFORE the review bead was assigned is stale and
+// must not satisfy the freshly-dispatched review task (mirrors the bead-comment
+// freshness rule).
+func TestReviewOnlyCloseRejectsStaleGitHubDecision(t *testing.T) {
+	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-06-01T00:00:00Z"}]`)
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
+		Assignee:    "gastown/polecats/nitro",
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("stale GitHub review must not satisfy evidence: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+// Without a pr_url var there is nothing to check on GitHub; the gate falls back
+// to the existing evidence-missing escalation.
+func TestReviewOnlyCloseNoPRURLFallsThrough(t *testing.T) {
+	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-07-01T12:05:00Z"}]`)
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/nitro",
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("missing pr_url should preserve escalation: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
 func TestReviewOnlyGeneratedCommentsDoNotCountAsEvidence(t *testing.T) {
 	issue := &beads.Issue{
 		ID:          "gt-review",

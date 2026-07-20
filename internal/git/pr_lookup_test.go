@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLookupPullRequestRecordedURLSurvivesDeletedHead(t *testing.T) {
@@ -169,6 +170,72 @@ exit 1
 		if !strings.Contains(log, want) {
 			t.Fatalf("gh log missing %q\nlog:\n%s", want, log)
 		}
+	}
+}
+
+func TestHasReviewDecisionSince(t *testing.T) {
+	// gh returns one CHANGES_REQUESTED at 22:00 and one APPROVED at 22:50.
+	installFakeGH(t, `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"reviews":[{"state":"COMMENTED","submittedAt":"2026-07-19T21:00:00Z"},{"state":"CHANGES_REQUESTED","submittedAt":"2026-07-19T22:00:00Z"},{"state":"APPROVED","submittedAt":"2026-07-19T22:50:38Z"}]}'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+`)
+	g := NewGit(initTestRepo(t))
+	pr := &PullRequestInfo{Number: 243, URL: "https://github.com/upstream/repo/pull/243"}
+
+	mustParse := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("parse %q: %v", s, err)
+		}
+		return ts
+	}
+
+	cases := []struct {
+		name  string
+		since string
+		want  bool
+	}{
+		// Assigned before both decisions — the review happened after assignment.
+		{"decision after assignment", "2026-07-19T20:00:00Z", true},
+		// The PR advanced and was re-reviewed; assigned just before the approval.
+		{"approval after advance", "2026-07-19T22:30:00Z", true},
+		// Assigned after the last decision — no fresh review; must not satisfy.
+		{"assigned after last decision", "2026-07-19T23:00:00Z", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := g.HasReviewDecisionSince(pr, mustParse(tc.since))
+			if err != nil {
+				t.Fatalf("HasReviewDecisionSince: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("HasReviewDecisionSince(since=%s) = %v, want %v", tc.since, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasReviewDecisionSinceIgnoresNonDecisions(t *testing.T) {
+	// Only COMMENTED/DISMISSED reviews exist — none is a decision, so no evidence.
+	installFakeGH(t, `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"reviews":[{"state":"COMMENTED","submittedAt":"2026-07-19T22:00:00Z"},{"state":"DISMISSED","submittedAt":"2026-07-19T22:30:00Z"}]}'
+  exit 0
+fi
+exit 1
+`)
+	g := NewGit(initTestRepo(t))
+	since, _ := time.Parse(time.RFC3339, "2026-07-19T20:00:00Z")
+	got, err := g.HasReviewDecisionSince(&PullRequestInfo{URL: "https://github.com/upstream/repo/pull/243"}, since)
+	if err != nil {
+		t.Fatalf("HasReviewDecisionSince: %v", err)
+	}
+	if got {
+		t.Fatal("HasReviewDecisionSince = true for comment-only reviews, want false")
 	}
 }
 
