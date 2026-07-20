@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -147,6 +148,16 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading polecat capacity: %w", err)
 	}
 
+	daemonCfg := config.LoadOperationalConfig(townRoot).GetDaemonConfig()
+
+	readyCount := 0
+	for _, b := range scheduled {
+		if !b.Blocked {
+			readyCount++
+		}
+	}
+	dispatchStatus := describeDispatchStatus(state.Paused, readyCount, capacitySnapshot, daemonCfg)
+
 	if schedulerStatusJSON {
 		out := struct {
 			Paused         bool                    `json:"paused"`
@@ -156,31 +167,22 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 			ActivePolecats int                     `json:"active_polecats"`
 			Capacity       polecatCapacitySnapshot `json:"capacity"`
 			LastDispatchAt string                  `json:"last_dispatch_at,omitempty"`
+			DispatchStatus string                  `json:"dispatch_status,omitempty"`
 			Beads          []scheduledBeadInfo     `json:"beads"`
 		}{
 			Paused:         state.Paused,
 			PausedBy:       state.PausedBy,
 			ScheduledTotal: len(scheduled),
+			ScheduledReady: readyCount,
 			ActivePolecats: capacitySnapshot.ActiveSessions,
 			Capacity:       capacitySnapshot,
 			LastDispatchAt: state.LastDispatchAt,
+			DispatchStatus: dispatchStatus,
 			Beads:          scheduled,
-		}
-		for _, b := range scheduled {
-			if !b.Blocked {
-				out.ScheduledReady++
-			}
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
-	}
-
-	readyCount := 0
-	for _, b := range scheduled {
-		if !b.Blocked {
-			readyCount++
-		}
 	}
 
 	fmt.Printf("%s\n\n", style.Bold.Render("Scheduler Status"))
@@ -192,7 +194,8 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Scheduled: %d total, %d ready\n", len(scheduled), readyCount)
 	fmt.Printf("  Active:    %d polecats\n", capacitySnapshot.ActiveSessions)
 	if capacitySnapshot.Max > 0 {
-		fmt.Printf("  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d)\n",
+		fmt.Printf(
+			"  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d)\n",
 			capacitySnapshot.Free,
 			capacitySnapshot.Max,
 			capacitySnapshot.Working,
@@ -207,8 +210,53 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 	if state.LastDispatchAt != "" {
 		fmt.Printf("  Last dispatch: %s (%d beads)\n", state.LastDispatchAt, state.LastDispatchCount)
 	}
+	if dispatchStatus != "" {
+		fmt.Printf("  Dispatch:  %s\n", dispatchStatus)
+	}
 
 	return nil
+}
+
+// describeDispatchStatus explains, in operator-facing terms, whether ready
+// scheduled work is about to dispatch or is being held — and why.
+//
+// Dispatch is NOT instantaneous: the daemon attempts it once per heartbeat
+// (recovery_heartbeat_interval, default 3m) and gates it on system pressure
+// (daemon.go dispatchQueuedWork). A freshly-scheduled ready bead therefore sits
+// with idle capacity until the next heartbeat — which reads as a "wedge" to an
+// operator who expects instant dispatch. This surfaces the real reason so that
+// normal cadence isn't mistaken for a stuck scheduler.
+//
+// Returns "" when there is no ready work to describe.
+func describeDispatchStatus(paused bool, readyCount int, snap polecatCapacitySnapshot, daemonCfg *config.DaemonThresholds) string {
+	if readyCount == 0 {
+		return ""
+	}
+	if paused {
+		return "held: scheduler paused"
+	}
+	if snap.Max <= 0 {
+		return "direct-dispatch mode (scheduler.max_polecats=0)"
+	}
+	if snap.Free <= 0 {
+		return fmt.Sprintf("held: no free capacity (%d ready waiting)", readyCount)
+	}
+	// Ready work with free capacity: not stuck — waiting for the next heartbeat.
+	msg := fmt.Sprintf("%d ready — dispatches on next daemon heartbeat (every %s)",
+		readyCount, daemonCfg.RecoveryHeartbeatIntervalD())
+	if pressureGatingEnabled(daemonCfg) {
+		msg += "; may defer under CPU/memory/session pressure"
+	}
+	return msg
+}
+
+// pressureGatingEnabled reports whether the daemon will gate polecat dispatch on
+// system pressure. All thresholds default to 0 (disabled), so this is true only
+// when an operator has explicitly configured a limit.
+func pressureGatingEnabled(cfg *config.DaemonThresholds) bool {
+	return cfg.PressureCPUThresholdV() > 0 ||
+		cfg.PressureMemThresholdGBV() > 0 ||
+		cfg.PressureMaxSessionsV() > 0
 }
 
 func runSchedulerList(cmd *cobra.Command, args []string) error {

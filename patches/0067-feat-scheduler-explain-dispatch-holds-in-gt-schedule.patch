@@ -1,0 +1,267 @@
+From aaae792d3fd7c302f1bde7ec420a30d77f172149 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Mon, 20 Jul 2026 18:00:17 -0400
+Subject: [PATCH 67/67] feat(scheduler): explain dispatch holds in gt scheduler
+ status
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A freshly-scheduled ready bead with idle capacity sits undispatched until
+the next daemon heartbeat (recovery_heartbeat_interval, default 3m) and can
+be further deferred by pressure gating. With no signal for this, operators
+(and the mayor) misread normal cadence as a head-of-line 'wedge' and reach
+for gt scheduler clear.
+
+Add a Dispatch: line (and dispatch_status JSON field) to gt scheduler status
+that states why ready work is or isn't dispatching now: paused, no capacity,
+direct-dispatch mode, or 'N ready — dispatches on next daemon heartbeat
+(every 3m)'. The pressure caveat is shown only when pressure gating is
+actually configured (thresholds default to 0/disabled).
+
+Pure presentation logic derived from data the command already loads plus
+operational config; no change to dispatch behavior. Covered by
+scheduler_dispatch_status_test.go.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/scheduler.go                     | 74 ++++++++++++---
+ .../cmd/scheduler_dispatch_status_test.go     | 94 +++++++++++++++++++
+ 2 files changed, 155 insertions(+), 13 deletions(-)
+ create mode 100644 internal/cmd/scheduler_dispatch_status_test.go
+
+diff --git a/internal/cmd/scheduler.go b/internal/cmd/scheduler.go
+index 083f6095..205da32f 100644
+--- a/internal/cmd/scheduler.go
++++ b/internal/cmd/scheduler.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/spf13/cobra"
+ 	"github.com/steveyegge/gastown/internal/beads"
++	"github.com/steveyegge/gastown/internal/config"
+ 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+ 	"github.com/steveyegge/gastown/internal/session"
+ 	"github.com/steveyegge/gastown/internal/style"
+@@ -147,6 +148,16 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("loading polecat capacity: %w", err)
+ 	}
+ 
++	daemonCfg := config.LoadOperationalConfig(townRoot).GetDaemonConfig()
++
++	readyCount := 0
++	for _, b := range scheduled {
++		if !b.Blocked {
++			readyCount++
++		}
++	}
++	dispatchStatus := describeDispatchStatus(state.Paused, readyCount, capacitySnapshot, daemonCfg)
++
+ 	if schedulerStatusJSON {
+ 		out := struct {
+ 			Paused         bool                    `json:"paused"`
+@@ -156,33 +167,24 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
+ 			ActivePolecats int                     `json:"active_polecats"`
+ 			Capacity       polecatCapacitySnapshot `json:"capacity"`
+ 			LastDispatchAt string                  `json:"last_dispatch_at,omitempty"`
++			DispatchStatus string                  `json:"dispatch_status,omitempty"`
+ 			Beads          []scheduledBeadInfo     `json:"beads"`
+ 		}{
+ 			Paused:         state.Paused,
+ 			PausedBy:       state.PausedBy,
+ 			ScheduledTotal: len(scheduled),
++			ScheduledReady: readyCount,
+ 			ActivePolecats: capacitySnapshot.ActiveSessions,
+ 			Capacity:       capacitySnapshot,
+ 			LastDispatchAt: state.LastDispatchAt,
++			DispatchStatus: dispatchStatus,
+ 			Beads:          scheduled,
+ 		}
+-		for _, b := range scheduled {
+-			if !b.Blocked {
+-				out.ScheduledReady++
+-			}
+-		}
+ 		enc := json.NewEncoder(os.Stdout)
+ 		enc.SetIndent("", "  ")
+ 		return enc.Encode(out)
+ 	}
+ 
+-	readyCount := 0
+-	for _, b := range scheduled {
+-		if !b.Blocked {
+-			readyCount++
+-		}
+-	}
+-
+ 	fmt.Printf("%s\n\n", style.Bold.Render("Scheduler Status"))
+ 	if state.Paused {
+ 		fmt.Printf("  State:    %s (by %s)\n", style.Warning.Render("PAUSED"), state.PausedBy)
+@@ -192,7 +194,8 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
+ 	fmt.Printf("  Scheduled: %d total, %d ready\n", len(scheduled), readyCount)
+ 	fmt.Printf("  Active:    %d polecats\n", capacitySnapshot.ActiveSessions)
+ 	if capacitySnapshot.Max > 0 {
+-		fmt.Printf("  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d)\n",
++		fmt.Printf(
++			"  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d)\n",
+ 			capacitySnapshot.Free,
+ 			capacitySnapshot.Max,
+ 			capacitySnapshot.Working,
+@@ -207,10 +210,55 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
+ 	if state.LastDispatchAt != "" {
+ 		fmt.Printf("  Last dispatch: %s (%d beads)\n", state.LastDispatchAt, state.LastDispatchCount)
+ 	}
++	if dispatchStatus != "" {
++		fmt.Printf("  Dispatch:  %s\n", dispatchStatus)
++	}
+ 
+ 	return nil
+ }
+ 
++// describeDispatchStatus explains, in operator-facing terms, whether ready
++// scheduled work is about to dispatch or is being held — and why.
++//
++// Dispatch is NOT instantaneous: the daemon attempts it once per heartbeat
++// (recovery_heartbeat_interval, default 3m) and gates it on system pressure
++// (daemon.go dispatchQueuedWork). A freshly-scheduled ready bead therefore sits
++// with idle capacity until the next heartbeat — which reads as a "wedge" to an
++// operator who expects instant dispatch. This surfaces the real reason so that
++// normal cadence isn't mistaken for a stuck scheduler.
++//
++// Returns "" when there is no ready work to describe.
++func describeDispatchStatus(paused bool, readyCount int, snap polecatCapacitySnapshot, daemonCfg *config.DaemonThresholds) string {
++	if readyCount == 0 {
++		return ""
++	}
++	if paused {
++		return "held: scheduler paused"
++	}
++	if snap.Max <= 0 {
++		return "direct-dispatch mode (scheduler.max_polecats=0)"
++	}
++	if snap.Free <= 0 {
++		return fmt.Sprintf("held: no free capacity (%d ready waiting)", readyCount)
++	}
++	// Ready work with free capacity: not stuck — waiting for the next heartbeat.
++	msg := fmt.Sprintf("%d ready — dispatches on next daemon heartbeat (every %s)",
++		readyCount, daemonCfg.RecoveryHeartbeatIntervalD())
++	if pressureGatingEnabled(daemonCfg) {
++		msg += "; may defer under CPU/memory/session pressure"
++	}
++	return msg
++}
++
++// pressureGatingEnabled reports whether the daemon will gate polecat dispatch on
++// system pressure. All thresholds default to 0 (disabled), so this is true only
++// when an operator has explicitly configured a limit.
++func pressureGatingEnabled(cfg *config.DaemonThresholds) bool {
++	return cfg.PressureCPUThresholdV() > 0 ||
++		cfg.PressureMemThresholdGBV() > 0 ||
++		cfg.PressureMaxSessionsV() > 0
++}
++
+ func runSchedulerList(cmd *cobra.Command, args []string) error {
+ 	townRoot, err := workspace.FindFromCwdOrError()
+ 	if err != nil {
+diff --git a/internal/cmd/scheduler_dispatch_status_test.go b/internal/cmd/scheduler_dispatch_status_test.go
+new file mode 100644
+index 00000000..0409e5bd
+--- /dev/null
++++ b/internal/cmd/scheduler_dispatch_status_test.go
+@@ -0,0 +1,94 @@
++package cmd
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/steveyegge/gastown/internal/config"
++)
++
++func TestDescribeDispatchStatus(t *testing.T) {
++	// Pressure-disabled daemon config (the default: all thresholds 0).
++	noPressure := &config.DaemonThresholds{}
++
++	cpu := 2.0
++	withPressure := &config.DaemonThresholds{PressureCPUThreshold: &cpu}
++
++	tests := []struct {
++		name       string
++		paused     bool
++		readyCount int
++		snap       polecatCapacitySnapshot
++		cfg        *config.DaemonThresholds
++		want       string // "" means expect empty; otherwise a substring that must appear
++		wantEmpty  bool
++	}{
++		{
++			name:       "no ready work is silent",
++			readyCount: 0,
++			snap:       polecatCapacitySnapshot{Max: 11, Free: 10},
++			cfg:        noPressure,
++			wantEmpty:  true,
++		},
++		{
++			name:       "paused holds dispatch",
++			paused:     true,
++			readyCount: 2,
++			snap:       polecatCapacitySnapshot{Max: 11, Free: 10},
++			cfg:        noPressure,
++			want:       "paused",
++		},
++		{
++			name:       "direct-dispatch mode when max_polecats is zero",
++			readyCount: 1,
++			snap:       polecatCapacitySnapshot{Max: 0, Free: 0},
++			cfg:        noPressure,
++			want:       "direct-dispatch",
++		},
++		{
++			name:       "no free capacity is held, not stuck",
++			readyCount: 3,
++			snap:       polecatCapacitySnapshot{Max: 11, Free: 0},
++			cfg:        noPressure,
++			want:       "no free capacity",
++		},
++		{
++			// The phantom-wedge case: ready work + idle capacity. Must explain
++			// the heartbeat cadence rather than look stuck.
++			name:       "ready with capacity explains heartbeat cadence",
++			readyCount: 1,
++			snap:       polecatCapacitySnapshot{Max: 11, Free: 10},
++			cfg:        noPressure,
++			want:       "next daemon heartbeat",
++		},
++		{
++			name:       "pressure note only when pressure gating configured",
++			readyCount: 1,
++			snap:       polecatCapacitySnapshot{Max: 11, Free: 10},
++			cfg:        withPressure,
++			want:       "pressure",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := describeDispatchStatus(tt.paused, tt.readyCount, tt.snap, tt.cfg)
++			if tt.wantEmpty {
++				if got != "" {
++					t.Fatalf("expected empty status, got %q", got)
++				}
++				return
++			}
++			if !strings.Contains(got, tt.want) {
++				t.Fatalf("status %q does not contain %q", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestDescribeDispatchStatus_NoPressureNoteWhenDisabled(t *testing.T) {
++	got := describeDispatchStatus(false, 1, polecatCapacitySnapshot{Max: 11, Free: 10}, &config.DaemonThresholds{})
++	if strings.Contains(got, "pressure") {
++		t.Fatalf("pressure note should be absent when gating disabled, got %q", got)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

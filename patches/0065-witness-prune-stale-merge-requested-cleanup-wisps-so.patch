@@ -1,7 +1,7 @@
 From a3007adc9270a5b5e2b5f47cbdc92ae1c82509e2 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 14:23:36 -0400
-Subject: [PATCH 65/66] witness: prune stale merge-requested cleanup wisps so
+Subject: [PATCH 65/67] witness: prune stale merge-requested cleanup wisps so
  merged polecats reclaim (feryn-ipm9 follow-up)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
