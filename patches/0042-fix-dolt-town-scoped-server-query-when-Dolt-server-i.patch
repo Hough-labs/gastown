@@ -1,7 +1,7 @@
 From 1ea359af6c62246c060d7bada465992e252d39f1 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sun, 12 Jul 2026 20:41:45 -0400
-Subject: [PATCH 42/67] fix(dolt): town-scoped server query when Dolt server is
+Subject: [PATCH 42/68] fix(dolt): town-scoped server query when Dolt server is
  on loopback
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

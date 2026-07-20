@@ -1,7 +1,7 @@
 From c35b21089d93e38ad52fe49f2a4855303996ecae Mon Sep 17 00:00:00 2001
 From: furiosa <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:31:40 -0400
-Subject: [PATCH 52/67] fix(dolt): reap orphaned embedded sql-server processes
+Subject: [PATCH 52/68] fix(dolt): reap orphaned embedded sql-server processes
  (gfork-d5h)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

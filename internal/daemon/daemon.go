@@ -973,6 +973,18 @@ func (d *Daemon) heartbeat(state *State) {
 		}
 	}
 
+	// 5.6. Drain the review-needed event channel and dispatch iris reviewers
+	// (feryn-8uxb / hq-u9r0k). Reviewer dispatch is event-driven, but it USED to
+	// depend on the Deacon LLM running its review-dispatch patrol step — and the
+	// Deacon parks in await-signal idle after a cycle (observed live: idle ~6h),
+	// so events emitted just after a cycle were never drained and review-required
+	// PRs deadlocked. Running the deterministic drain HERE, in the daemon heartbeat,
+	// makes reviewer dispatch independent of the Deacon LLM ever waking. Cheap when
+	// the channel is empty (a single ls); naturally gated by require_review at the
+	// emit side (review off -> no events -> no-op). Sling admission-control handles
+	// capacity, so no pressure gate is needed.
+	d.drainReviewEvents()
+
 	// 6. Ensure Mayor is running (restart if dead)
 	d.ensureMayorRunning()
 
@@ -3216,5 +3228,41 @@ func (d *Daemon) dispatchQueuedWork() {
 		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
+	}
+}
+
+// drainReviewEvents runs the deterministic review-needed drain (feryn-8uxb /
+// hq-u9r0k) by shelling out to the `refinery-drain-review-events` script, which
+// drains the $town/events/review-needed channel, dedups, creates a review bead,
+// and slings a polecat-iris reviewer per pending PR — independent of the Deacon
+// LLM. Reviewer dispatch used to ride on the Deacon's review-dispatch patrol step,
+// but the Deacon parks in await-signal idle after a cycle (observed live: idle
+// ~6h), so events emitted just after a cycle were never drained and review-required
+// PRs deadlocked. Running the drain here, in the deterministic daemon heartbeat,
+// closes that gap. Cheap when the channel is empty (a single ls) and naturally
+// gated by require_review at the emit side. Best-effort: a missing script (host
+// without the mill toolkit) or a transient failure is logged and never blocks the
+// heartbeat.
+func (d *Daemon) drainReviewEvents() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "refinery-drain-review-events")
+	setSysProcAttr(cmd)
+	cmd.Dir = d.config.TownRoot
+	// Prepend likely bin dirs so the mill script (symlinked into ~/.local/bin) and
+	// its `gt`/`bd` deps resolve even under a minimal daemon PATH. Go's exec uses
+	// the last value for a duplicated env key, so this appended PATH wins.
+	env := append(os.Environ(), "GT_DAEMON=1", "GT_TOWN_ROOT="+d.config.TownRoot)
+	binDirs := filepath.Dir(d.gtPath) + string(os.PathListSeparator) +
+		filepath.Join(os.Getenv("HOME"), ".local", "bin")
+	env = append(env, "PATH="+binDirs+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		d.logger.Printf("review-dispatch drain timed out after 2m")
+	} else if err != nil {
+		d.logger.Printf("review-dispatch drain: %v (output: %s)", err, string(out))
+	} else if len(out) > 0 {
+		d.logger.Printf("review-dispatch drain: %s", string(out))
 	}
 }
