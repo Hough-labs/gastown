@@ -422,6 +422,84 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
 	}
 }
 
+// A missing (empty) persisted cleanup_status must reconcile to clean when the
+// live verdict is SAFE_TO_NUKE — otherwise a completed, cleanly-merged polecat
+// that never recorded its status stays NEEDS_RECOVERY forever, and once every
+// polecat lands in that state the scheduler reclaims nothing (reclaim wedge).
+func TestReconcileCleanupStatusIfSafe_MissingStatusReconciles(t *testing.T) {
+	status := &RecoveryStatus{
+		CleanupStatus: "",
+		Verdict:       "SAFE_TO_NUKE",
+		Branch:        "polecat/ghoul/feryn-o7yo.3+mrtm387s",
+		MQStatus:      "not_required",
+	}
+	// A done polecat awaiting reclaim is the reclaim-wedge case: it lingers with
+	// a missing cleanup_status while the scheduler counts it recovery_blocked.
+	for _, tc := range []struct {
+		name         string
+		polecatState polecat.State
+		agentState   string
+	}{
+		{name: "idle awaiting reuse", polecatState: polecat.StateIdle, agentState: string(beads.AgentStateIdle)},
+		{name: "done awaiting reclaim", polecatState: polecat.StateDone, agentState: string(beads.AgentStateDone)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			updater := &fakeCleanupUpdater{}
+			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-ghoul", &polecat.Polecat{State: tc.polecatState}, &beads.AgentFields{
+				AgentState:    tc.agentState,
+				CleanupStatus: "",
+			})
+
+			if updater.calls != 1 {
+				t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 1", updater.calls)
+			}
+			if updater.id != "gt-gastown-polecat-ghoul" || updater.status != string(polecat.CleanupClean) {
+				t.Fatalf("update = (%q, %q), want clean update for agent", updater.id, updater.status)
+			}
+			if status.CleanupStatus != polecat.CleanupClean || !status.Reconciled {
+				t.Fatalf("status after reconcile = (%q, reconciled=%v), want clean true", status.CleanupStatus, status.Reconciled)
+			}
+			// Reset shared status for the next subtest.
+			status.CleanupStatus = ""
+			status.Reconciled = false
+		})
+	}
+}
+
+// A still-working polecat must never be reconciled even with a missing status:
+// the state gate rejects StateWorking outright.
+func TestReconcileCleanupStatusIfSafe_WorkingStateBlocksMissing(t *testing.T) {
+	if _, ok := cleanupStatusReconcileCandidate(
+		&RecoveryStatus{CleanupStatus: "", Verdict: "SAFE_TO_NUKE", Branch: "polecat/ghoul", MQStatus: "not_required"},
+		&polecat.Polecat{State: polecat.StateWorking},
+		&beads.AgentFields{AgentState: string(beads.AgentStateWorking), CleanupStatus: ""},
+	); ok {
+		t.Fatal("cleanupStatusReconcileCandidate() allowed reconciliation of a working polecat")
+	}
+}
+
+// A missing cleanup_status is still gated by the strict predicates: an unsafe
+// live verdict must never be rewritten to clean.
+func TestReconcileCleanupStatusIfSafe_MissingStatusStillGated(t *testing.T) {
+	status := &RecoveryStatus{
+		CleanupStatus: "",
+		Verdict:       "NEEDS_RECOVERY",
+		NeedsRecovery: true,
+		Branch:        "polecat/ghoul",
+		MQStatus:      "not_submitted",
+	}
+	updater := &fakeCleanupUpdater{}
+	if _, ok := cleanupStatusReconcileCandidate(status, &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
+		AgentState:    string(beads.AgentStateIdle),
+		CleanupStatus: "",
+	}); ok {
+		t.Fatal("cleanupStatusReconcileCandidate() allowed unsafe reconciliation of missing status")
+	}
+	if updater.calls != 0 {
+		t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 0", updater.calls)
+	}
+}
+
 func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
 	status := &RecoveryStatus{
 		CleanupStatus: polecat.CleanupUnpushed,
@@ -615,10 +693,10 @@ func TestActiveMRBlocker(t *testing.T) {
 		want       string
 	}{
 		{name: "empty", want: ""},
-		{name: "closed terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": &beads.Issue{ID: "mr-1", Status: "closed"}, "gt-closed": &beads.Issue{ID: "gt-closed", Status: "closed"}}}, want: ""},
-		{name: "closed unknown source", mrID: "mr-1", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": &beads.Issue{ID: "mr-1", Status: "closed"}}}, want: "active_mr=mr-1 status=closed source_issue=<missing>"},
+		{name: "closed terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": {ID: "mr-1", Status: "closed"}, "gt-closed": {ID: "gt-closed", Status: "closed"}}}, want: ""},
+		{name: "closed unknown source", mrID: "mr-1", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": {ID: "mr-1", Status: "closed"}}}, want: "active_mr=mr-1 status=closed source_issue=<missing>"},
 		{name: "open", mrID: "mr-1", bd: fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "open"}}, want: "active_mr=mr-1 status=open"},
-		{name: "missing terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"gt-closed": &beads.Issue{ID: "gt-closed", Status: "closed"}}}, want: ""},
+		{name: "missing terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"gt-closed": {ID: "gt-closed", Status: "closed"}}}, want: ""},
 		{name: "missing unknown source", mrID: "mr-1", bd: fakeIssueMapShower{}, want: "active_mr=mr-1 status=missing source_issue=<missing>"},
 		{name: "nil issue unknown source", mrID: "mr-1", bd: fakeIssueShower{issue: nil}, want: "active_mr=mr-1 status=missing source_issue=<missing>"},
 		{name: "nil reader", mrID: "mr-1", bd: nil, want: "active_mr=mr-1 status=unverified"},
@@ -845,7 +923,7 @@ func setupRecoveryGitRepo(t *testing.T) string {
 
 func writeRecoveryFile(t *testing.T, path, data string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

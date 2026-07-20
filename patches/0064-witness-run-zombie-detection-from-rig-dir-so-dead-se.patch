@@ -1,7 +1,7 @@
 From 2fc97cc9af11b1f26175343b3d9ab9c1f1082bbc Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 13:55:48 -0400
-Subject: [PATCH 64/65] witness: run zombie detection from rig dir so
+Subject: [PATCH 64/66] witness: run zombie detection from rig dir so
  dead-session polecats recover (feryn-ipm9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

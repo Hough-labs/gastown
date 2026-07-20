@@ -1,7 +1,7 @@
 From ca4c50757953cc1ca9531f40697e86b70c0bef66 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sat, 18 Jul 2026 16:22:26 -0400
-Subject: [PATCH 49/65] fix(polecat): capacity snapshot treats missing-worktree
+Subject: [PATCH 49/66] fix(polecat): capacity snapshot treats missing-worktree
  polecats as reusable (hq-fqap follow-up)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

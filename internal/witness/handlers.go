@@ -925,10 +925,11 @@ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, stri
 
 // polecatSafeToNukeVerdict runs `gt polecat check-recovery --reconcile-cleanup`
 // for the polecat and reports whether the verdict is SAFE_TO_NUKE. The
-// --reconcile-cleanup flag flips a stale dirty cleanup_status to clean when live
-// predicates prove no work is at risk, so a completed polecat whose persisted
-// status lagged behind its real (merged/submitted) state is classified
-// correctly. Returns (false, reason) on a non-safe verdict or a check failure —
+// --reconcile-cleanup flag flips a stale dirty or missing cleanup_status to
+// clean when live predicates prove no work is at risk, so a completed polecat
+// whose persisted status lagged behind (or never recorded) its real
+// (merged/submitted) state is classified correctly. Returns (false, reason) on
+// a non-safe verdict or a check failure —
 // the conservative default, so an ambiguous polecat is never reaped.
 func polecatSafeToNukeVerdict(workDir, rigName, polecatName string) (bool, string) {
 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)

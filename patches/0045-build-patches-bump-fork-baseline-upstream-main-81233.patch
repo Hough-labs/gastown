@@ -1,7 +1,7 @@
 From d57497cd2d0b7c642368d8105ecdaa254e2974f2 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:03:50 -0400
-Subject: [PATCH 45/65] build(patches): bump fork baseline upstream/main
+Subject: [PATCH 45/66] build(patches): bump fork baseline upstream/main
  81233d36 -> 5ffa55a2
 
 Picks up 24 upstream fixes (Jul 9 -> Jul 17) that supersede local

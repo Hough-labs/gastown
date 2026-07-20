@@ -349,7 +349,7 @@ func init() {
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
-	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty cleanup_status to clean when live recovery predicates prove no work is at risk")
+	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty or missing cleanup_status to clean when live recovery predicates prove no work is at risk")
 
 	// Stale flags
 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
@@ -503,7 +503,10 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "warning: failed to list polecats in %s: %v\n", r.Name, err)
 			continue
 		}
-		agents, agentErr := bd.ListAgentBeads()
+		// Agent beads are canonically stored in the town db (all mutations route
+		// through ForAgentBead()); read them there so `gt polecat list` reflects
+		// the same cleanup_status/reuse state the scheduler capacity check acts on.
+		agents, agentErr := bd.ForAgentBead().ListAgentBeads()
 		if agentErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to list agent beads in %s: %v\n", r.Name, agentErr)
 			agents = nil
@@ -1419,10 +1422,30 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		return "", false
 	}
 	previous := polecat.CleanupStatus(fields.CleanupStatus)
-	if previous == "" || previous == polecat.CleanupClean {
+	// A missing (empty) persisted cleanup_status is treated as unsafe by
+	// DecideWorkstate (blocker "cleanup_status=<missing>"), so a completed,
+	// cleanly-merged polecat that never had its status persisted stays
+	// NEEDS_RECOVERY forever — and once every polecat in a rig lands in this
+	// state the scheduler reclaims nothing and ready work starves (reclaim
+	// wedge). Reconcile empty the same as a stale dirty value: the strict
+	// predicates below (idle + live SAFE_TO_NUKE verdict + submitted/not-required
+	// MQ) still gate the rewrite, so we only persist clean when the live
+	// recovery check proves no work is at risk. Only an already-clean status is
+	// a genuine no-op.
+	if previous == polecat.CleanupClean {
 		return previous, false
 	}
-	if p.State != polecat.StateIdle || beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
+	// Reconcile applies to a polecat that has finished its work: idle (awaiting
+	// reuse) or done (awaiting reclaim). A done polecat with a merged/submitted
+	// bead is exactly the reclaim-wedge case — it lingers with a stale/missing
+	// cleanup_status and the scheduler counts it as recovery_blocked forever.
+	// Accepting StateDone is safe because the SAFE_TO_NUKE verdict gate below
+	// already rejects any still-working polecat (session-running / active-work
+	// never yields SAFE_TO_NUKE).
+	polecatReusableState := p.State == polecat.StateIdle || p.State == polecat.StateDone
+	agentReusableState := beads.AgentState(fields.AgentState) == beads.AgentStateIdle ||
+		beads.AgentState(fields.AgentState) == beads.AgentStateDone
+	if !polecatReusableState || !agentReusableState {
 		return previous, false
 	}
 	if status.NeedsRecovery || status.Verdict != "SAFE_TO_NUKE" {

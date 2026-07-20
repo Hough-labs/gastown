@@ -213,7 +213,15 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		}
 
 		rigBeads := beads.New(rigPath)
-		agents, err := rigBeads.ListAgentBeads()
+		// Agent beads (and their cleanup_status) are canonically stored in the TOWN
+		// db: every mutation — gt done's UpdateAgentCleanupStatus, check-recovery's
+		// reconcile, GetAgentBead — routes through ForAgentBead()/agentBeadTarget().
+		// Reading them from the per-rig store (rigBeads.ListAgentBeads()) reads a
+		// DIFFERENT store that never sees those writes, so a reconciled/clean
+		// cleanup_status shows up here as missing → the polecat is misclassified
+		// recovery_blocked and the reclaim wedge never clears. Route to the same
+		// (town) store everything writes so capacity sees the real agent state.
+		agents, err := rigBeads.ForAgentBead().ListAgentBeads()
 		if err != nil {
 			return snapshot, fmt.Errorf("listing agent beads for %s capacity: %w", rigName, err)
 		}
@@ -292,7 +300,7 @@ func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapsh
 
 func acquirePolecatAdmissionLock(townRoot string) (*flock.Flock, error) {
 	lockDir := filepath.Join(townRoot, ".runtime", "locks")
-	if err := os.MkdirAll(lockDir, 0755); err != nil {
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating polecat admission lock dir: %w", err)
 	}
 	lock := flock.New(filepath.Join(lockDir, "polecat-admission.lock"))
@@ -312,7 +320,7 @@ func polecatAdmissionDir(townRoot string) string {
 
 func writePolecatAdmissionReservation(townRoot, rigName, beadID, operation string) (polecatAdmissionReservation, string, error) {
 	dir := polecatAdmissionDir(townRoot)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return polecatAdmissionReservation{}, "", fmt.Errorf("creating polecat admission dir: %w", err)
 	}
 	now := time.Now().UTC()
@@ -331,7 +339,7 @@ func writePolecatAdmissionReservation(townRoot, rigName, beadID, operation strin
 	if err != nil {
 		return polecatAdmissionReservation{}, "", err
 	}
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return polecatAdmissionReservation{}, "", fmt.Errorf("writing polecat admission reservation: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {

@@ -1,0 +1,283 @@
+From 230d439c5a787711f471b36cee8b4ff4428a10c1 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Mon, 20 Jul 2026 16:56:58 -0400
+Subject: [PATCH 66/66] =?UTF-8?q?fix(polecat):=20resolve=20agent-bead=20re?=
+ =?UTF-8?q?claim=20wedge=20=E2=80=94=20read=20cleanup=5Fstatus=20from=20to?=
+ =?UTF-8?q?wn=20store=20+=20reconcile=20empty/done?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Polecat agent beads (and their cleanup_status) are canonically stored in the
+town db: every mutation — gt done's UpdateAgentCleanupStatus, check-recovery's
+--reconcile-cleanup, GetAgentBead — routes through ForAgentBead()/agentBeadTarget().
+But the scheduler capacity snapshot (polecatCapacitySnapshotForTownNoCleanup) and
+`gt polecat list` read them via the UNROUTED beads.New(rigPath).ListAgentBeads(),
+a different store that never sees those writes. So a done polecat with a
+clean/reconciled cleanup_status reads as missing here, is classified
+NEEDS_RECOVERY, counted recovery_blocked, and occupies a slot — Free drops. Once
+every polecat lands in that state the scheduler reclaims nothing and ready work
+starves: the reclaim wedge. Route both reads through ForAgentBead() so capacity
+and list see the same agent state everything writes. (GetAgentBead already routes;
+ListAgentBeads intentionally does not — other callers compare town vs rig — so we
+route at the two polecat-inventory call sites, not the shared method.)
+
+Also harden cleanupStatusReconcileCandidate, which heals a stale cleanup_status
+when live predicates prove SAFE_TO_NUKE: it previously skipped empty/missing
+status and non-idle (done) polecats, so a completed polecat whose status was
+cleared by ResetAgentBeadForReuse could never be reconciled to clean. Reconcile
+empty the same as dirty, and accept StateDone (awaiting reclaim); the SAFE_TO_NUKE
+verdict gate still rejects any still-working polecat.
+
+Validated live: done polecats now classify reusable_idle (recovery: 0) and the
+queue dispatches by reclaiming them instead of wedging.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/polecat.go                     | 31 +++++++-
+ internal/cmd/polecat_capacity.go            | 16 +++-
+ internal/cmd/polecat_check_recovery_test.go | 86 ++++++++++++++++++++-
+ internal/witness/handlers.go                |  9 ++-
+ 4 files changed, 126 insertions(+), 16 deletions(-)
+
+diff --git a/internal/cmd/polecat.go b/internal/cmd/polecat.go
+index 0fe434ac..cd75902a 100644
+--- a/internal/cmd/polecat.go
++++ b/internal/cmd/polecat.go
+@@ -349,7 +349,7 @@ func init() {
+ 
+ 	// Check-recovery flags
+ 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
+-	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty cleanup_status to clean when live recovery predicates prove no work is at risk")
++	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryReconcileCleanup, "reconcile-cleanup", false, "Safely rewrite stale dirty or missing cleanup_status to clean when live recovery predicates prove no work is at risk")
+ 
+ 	// Stale flags
+ 	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
+@@ -503,7 +503,10 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
+ 			fmt.Fprintf(os.Stderr, "warning: failed to list polecats in %s: %v\n", r.Name, err)
+ 			continue
+ 		}
+-		agents, agentErr := bd.ListAgentBeads()
++		// Agent beads are canonically stored in the town db (all mutations route
++		// through ForAgentBead()); read them there so `gt polecat list` reflects
++		// the same cleanup_status/reuse state the scheduler capacity check acts on.
++		agents, agentErr := bd.ForAgentBead().ListAgentBeads()
+ 		if agentErr != nil {
+ 			fmt.Fprintf(os.Stderr, "warning: failed to list agent beads in %s: %v\n", r.Name, agentErr)
+ 			agents = nil
+@@ -1419,10 +1422,30 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
+ 		return "", false
+ 	}
+ 	previous := polecat.CleanupStatus(fields.CleanupStatus)
+-	if previous == "" || previous == polecat.CleanupClean {
++	// A missing (empty) persisted cleanup_status is treated as unsafe by
++	// DecideWorkstate (blocker "cleanup_status=<missing>"), so a completed,
++	// cleanly-merged polecat that never had its status persisted stays
++	// NEEDS_RECOVERY forever — and once every polecat in a rig lands in this
++	// state the scheduler reclaims nothing and ready work starves (reclaim
++	// wedge). Reconcile empty the same as a stale dirty value: the strict
++	// predicates below (idle + live SAFE_TO_NUKE verdict + submitted/not-required
++	// MQ) still gate the rewrite, so we only persist clean when the live
++	// recovery check proves no work is at risk. Only an already-clean status is
++	// a genuine no-op.
++	if previous == polecat.CleanupClean {
+ 		return previous, false
+ 	}
+-	if p.State != polecat.StateIdle || beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
++	// Reconcile applies to a polecat that has finished its work: idle (awaiting
++	// reuse) or done (awaiting reclaim). A done polecat with a merged/submitted
++	// bead is exactly the reclaim-wedge case — it lingers with a stale/missing
++	// cleanup_status and the scheduler counts it as recovery_blocked forever.
++	// Accepting StateDone is safe because the SAFE_TO_NUKE verdict gate below
++	// already rejects any still-working polecat (session-running / active-work
++	// never yields SAFE_TO_NUKE).
++	polecatReusableState := p.State == polecat.StateIdle || p.State == polecat.StateDone
++	agentReusableState := beads.AgentState(fields.AgentState) == beads.AgentStateIdle ||
++		beads.AgentState(fields.AgentState) == beads.AgentStateDone
++	if !polecatReusableState || !agentReusableState {
+ 		return previous, false
+ 	}
+ 	if status.NeedsRecovery || status.Verdict != "SAFE_TO_NUKE" {
+diff --git a/internal/cmd/polecat_capacity.go b/internal/cmd/polecat_capacity.go
+index b921d3fd..3ad26bd2 100644
+--- a/internal/cmd/polecat_capacity.go
++++ b/internal/cmd/polecat_capacity.go
+@@ -213,7 +213,15 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
+ 		}
+ 
+ 		rigBeads := beads.New(rigPath)
+-		agents, err := rigBeads.ListAgentBeads()
++		// Agent beads (and their cleanup_status) are canonically stored in the TOWN
++		// db: every mutation — gt done's UpdateAgentCleanupStatus, check-recovery's
++		// reconcile, GetAgentBead — routes through ForAgentBead()/agentBeadTarget().
++		// Reading them from the per-rig store (rigBeads.ListAgentBeads()) reads a
++		// DIFFERENT store that never sees those writes, so a reconciled/clean
++		// cleanup_status shows up here as missing → the polecat is misclassified
++		// recovery_blocked and the reclaim wedge never clears. Route to the same
++		// (town) store everything writes so capacity sees the real agent state.
++		agents, err := rigBeads.ForAgentBead().ListAgentBeads()
+ 		if err != nil {
+ 			return snapshot, fmt.Errorf("listing agent beads for %s capacity: %w", rigName, err)
+ 		}
+@@ -292,7 +300,7 @@ func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapsh
+ 
+ func acquirePolecatAdmissionLock(townRoot string) (*flock.Flock, error) {
+ 	lockDir := filepath.Join(townRoot, ".runtime", "locks")
+-	if err := os.MkdirAll(lockDir, 0755); err != nil {
++	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+ 		return nil, fmt.Errorf("creating polecat admission lock dir: %w", err)
+ 	}
+ 	lock := flock.New(filepath.Join(lockDir, "polecat-admission.lock"))
+@@ -312,7 +320,7 @@ func polecatAdmissionDir(townRoot string) string {
+ 
+ func writePolecatAdmissionReservation(townRoot, rigName, beadID, operation string) (polecatAdmissionReservation, string, error) {
+ 	dir := polecatAdmissionDir(townRoot)
+-	if err := os.MkdirAll(dir, 0755); err != nil {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return polecatAdmissionReservation{}, "", fmt.Errorf("creating polecat admission dir: %w", err)
+ 	}
+ 	now := time.Now().UTC()
+@@ -331,7 +339,7 @@ func writePolecatAdmissionReservation(townRoot, rigName, beadID, operation strin
+ 	if err != nil {
+ 		return polecatAdmissionReservation{}, "", err
+ 	}
+-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
++	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+ 		return polecatAdmissionReservation{}, "", fmt.Errorf("writing polecat admission reservation: %w", err)
+ 	}
+ 	if err := os.Rename(tmpPath, path); err != nil {
+diff --git a/internal/cmd/polecat_check_recovery_test.go b/internal/cmd/polecat_check_recovery_test.go
+index f4425728..c92f6938 100644
+--- a/internal/cmd/polecat_check_recovery_test.go
++++ b/internal/cmd/polecat_check_recovery_test.go
+@@ -422,6 +422,84 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
+ 	}
+ }
+ 
++// A missing (empty) persisted cleanup_status must reconcile to clean when the
++// live verdict is SAFE_TO_NUKE — otherwise a completed, cleanly-merged polecat
++// that never recorded its status stays NEEDS_RECOVERY forever, and once every
++// polecat lands in that state the scheduler reclaims nothing (reclaim wedge).
++func TestReconcileCleanupStatusIfSafe_MissingStatusReconciles(t *testing.T) {
++	status := &RecoveryStatus{
++		CleanupStatus: "",
++		Verdict:       "SAFE_TO_NUKE",
++		Branch:        "polecat/ghoul/feryn-o7yo.3+mrtm387s",
++		MQStatus:      "not_required",
++	}
++	// A done polecat awaiting reclaim is the reclaim-wedge case: it lingers with
++	// a missing cleanup_status while the scheduler counts it recovery_blocked.
++	for _, tc := range []struct {
++		name         string
++		polecatState polecat.State
++		agentState   string
++	}{
++		{name: "idle awaiting reuse", polecatState: polecat.StateIdle, agentState: string(beads.AgentStateIdle)},
++		{name: "done awaiting reclaim", polecatState: polecat.StateDone, agentState: string(beads.AgentStateDone)},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			updater := &fakeCleanupUpdater{}
++			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-ghoul", &polecat.Polecat{State: tc.polecatState}, &beads.AgentFields{
++				AgentState:    tc.agentState,
++				CleanupStatus: "",
++			})
++
++			if updater.calls != 1 {
++				t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 1", updater.calls)
++			}
++			if updater.id != "gt-gastown-polecat-ghoul" || updater.status != string(polecat.CleanupClean) {
++				t.Fatalf("update = (%q, %q), want clean update for agent", updater.id, updater.status)
++			}
++			if status.CleanupStatus != polecat.CleanupClean || !status.Reconciled {
++				t.Fatalf("status after reconcile = (%q, reconciled=%v), want clean true", status.CleanupStatus, status.Reconciled)
++			}
++			// Reset shared status for the next subtest.
++			status.CleanupStatus = ""
++			status.Reconciled = false
++		})
++	}
++}
++
++// A still-working polecat must never be reconciled even with a missing status:
++// the state gate rejects StateWorking outright.
++func TestReconcileCleanupStatusIfSafe_WorkingStateBlocksMissing(t *testing.T) {
++	if _, ok := cleanupStatusReconcileCandidate(
++		&RecoveryStatus{CleanupStatus: "", Verdict: "SAFE_TO_NUKE", Branch: "polecat/ghoul", MQStatus: "not_required"},
++		&polecat.Polecat{State: polecat.StateWorking},
++		&beads.AgentFields{AgentState: string(beads.AgentStateWorking), CleanupStatus: ""},
++	); ok {
++		t.Fatal("cleanupStatusReconcileCandidate() allowed reconciliation of a working polecat")
++	}
++}
++
++// A missing cleanup_status is still gated by the strict predicates: an unsafe
++// live verdict must never be rewritten to clean.
++func TestReconcileCleanupStatusIfSafe_MissingStatusStillGated(t *testing.T) {
++	status := &RecoveryStatus{
++		CleanupStatus: "",
++		Verdict:       "NEEDS_RECOVERY",
++		NeedsRecovery: true,
++		Branch:        "polecat/ghoul",
++		MQStatus:      "not_submitted",
++	}
++	updater := &fakeCleanupUpdater{}
++	if _, ok := cleanupStatusReconcileCandidate(status, &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
++		AgentState:    string(beads.AgentStateIdle),
++		CleanupStatus: "",
++	}); ok {
++		t.Fatal("cleanupStatusReconcileCandidate() allowed unsafe reconciliation of missing status")
++	}
++	if updater.calls != 0 {
++		t.Fatalf("UpdateAgentCleanupStatus calls = %d, want 0", updater.calls)
++	}
++}
++
+ func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
+ 	status := &RecoveryStatus{
+ 		CleanupStatus: polecat.CleanupUnpushed,
+@@ -615,10 +693,10 @@ func TestActiveMRBlocker(t *testing.T) {
+ 		want       string
+ 	}{
+ 		{name: "empty", want: ""},
+-		{name: "closed terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": &beads.Issue{ID: "mr-1", Status: "closed"}, "gt-closed": &beads.Issue{ID: "gt-closed", Status: "closed"}}}, want: ""},
+-		{name: "closed unknown source", mrID: "mr-1", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": &beads.Issue{ID: "mr-1", Status: "closed"}}}, want: "active_mr=mr-1 status=closed source_issue=<missing>"},
++		{name: "closed terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": {ID: "mr-1", Status: "closed"}, "gt-closed": {ID: "gt-closed", Status: "closed"}}}, want: ""},
++		{name: "closed unknown source", mrID: "mr-1", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"mr-1": {ID: "mr-1", Status: "closed"}}}, want: "active_mr=mr-1 status=closed source_issue=<missing>"},
+ 		{name: "open", mrID: "mr-1", bd: fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "open"}}, want: "active_mr=mr-1 status=open"},
+-		{name: "missing terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"gt-closed": &beads.Issue{ID: "gt-closed", Status: "closed"}}}, want: ""},
++		{name: "missing terminal source", mrID: "mr-1", sourceHint: "gt-closed", bd: fakeIssueMapShower{issues: map[string]*beads.Issue{"gt-closed": {ID: "gt-closed", Status: "closed"}}}, want: ""},
+ 		{name: "missing unknown source", mrID: "mr-1", bd: fakeIssueMapShower{}, want: "active_mr=mr-1 status=missing source_issue=<missing>"},
+ 		{name: "nil issue unknown source", mrID: "mr-1", bd: fakeIssueShower{issue: nil}, want: "active_mr=mr-1 status=missing source_issue=<missing>"},
+ 		{name: "nil reader", mrID: "mr-1", bd: nil, want: "active_mr=mr-1 status=unverified"},
+@@ -845,7 +923,7 @@ func setupRecoveryGitRepo(t *testing.T) string {
+ 
+ func writeRecoveryFile(t *testing.T, path, data string) {
+ 	t.Helper()
+-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
++	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ }
+diff --git a/internal/witness/handlers.go b/internal/witness/handlers.go
+index d208824b..5c1770fa 100644
+--- a/internal/witness/handlers.go
++++ b/internal/witness/handlers.go
+@@ -925,10 +925,11 @@ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, stri
+ 
+ // polecatSafeToNukeVerdict runs `gt polecat check-recovery --reconcile-cleanup`
+ // for the polecat and reports whether the verdict is SAFE_TO_NUKE. The
+-// --reconcile-cleanup flag flips a stale dirty cleanup_status to clean when live
+-// predicates prove no work is at risk, so a completed polecat whose persisted
+-// status lagged behind its real (merged/submitted) state is classified
+-// correctly. Returns (false, reason) on a non-safe verdict or a check failure —
++// --reconcile-cleanup flag flips a stale dirty or missing cleanup_status to
++// clean when live predicates prove no work is at risk, so a completed polecat
++// whose persisted status lagged behind (or never recorded) its real
++// (merged/submitted) state is classified correctly. Returns (false, reason) on
++// a non-safe verdict or a check failure —
+ // the conservative default, so an ambiguous polecat is never reaped.
+ func polecatSafeToNukeVerdict(workDir, rigName, polecatName string) (bool, string) {
+ 	output, err := slotOpenRecoveryCheck(workDir, rigName, polecatName)
+-- 
+2.50.1 (Apple Git-155)
+
