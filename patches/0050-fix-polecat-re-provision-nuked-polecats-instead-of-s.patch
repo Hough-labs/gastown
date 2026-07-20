@@ -1,7 +1,7 @@
 From acd167500e7ae628aa7b17799be046c2bb67b40a Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sat, 18 Jul 2026 17:07:47 -0400
-Subject: [PATCH 50/56] fix(polecat): re-provision nuked polecats instead of
+Subject: [PATCH 50/57] fix(polecat): re-provision nuked polecats instead of
  stranding them as free capacity (hq-c899)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -144,5 +145,89 @@ func TestIsScheduledWorkBeadReadyFailsClosedForBlockedUnknown(t *testing.T) {
 	info := beadStatusInfo{Status: "open"}
 	if isScheduledWorkBeadReady("gt-ready", info, true, nil, map[string]bool{"gt-ready": true}) {
 		t.Fatalf("blocked-unknown source must not be scheduler-ready")
+	}
+}
+
+// setupRoutedTownWithMRStub builds a minimal routed town (gt- → gastown rig)
+// and installs a bd stub whose SQL merge-request query returns hasOpenMR-many
+// open MRs for the given source issue. Used to drive the scheduler-path open-MR
+// dispatch guard (feryn-zqm7). Returns the town root.
+func setupRoutedTownWithMRStub(t *testing.T, sourceIssue string, hasOpenMR bool) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX bd stub")
+	}
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir rig beads: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"),
+		[]byte(`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	sqlRows := "[]"
+	showRows := "[]"
+	if hasOpenMR {
+		// A clean open MR (no retry/conflict/close_reason) → blockingOpenMR blocks.
+		sqlRows = fmt.Sprintf(`[{"id":"gt-wisp-mr","title":"Merge: %s","description":"branch: polecat/test/%s@abc\ntarget: main\nsource_issue: %s\nrig: gastown\n","status":"open","priority":1,"assignee":"","created_at":"2026-06-29T00:00:00Z","updated_at":"2026-06-29T00:00:00Z","created_by":"tester","labels_csv":"gt:merge-request"}]`,
+			sourceIssue, sourceIssue, sourceIssue)
+		// ListMergeRequests hydrates each MR via ShowMultiple (bd show <id>).
+		showRows = fmt.Sprintf(`[{"id":"gt-wisp-mr","title":"Merge: %s","description":"branch: polecat/test/%s@abc\ntarget: main\nsource_issue: %s\nrig: gastown\n","status":"open","priority":1,"created_at":"2026-06-29T00:00:00Z","updated_at":"2026-06-29T00:00:00Z","ephemeral":true,"labels":["gt:merge-request"],"dependencies":[],"dependency_count":0}]`,
+			sourceIssue, sourceIssue, sourceIssue)
+	}
+	script := `#!/bin/sh
+if [ "${1:-}" = "--allow-stale" ]; then
+  if [ "${2:-}" = "version" ]; then
+    echo "Error: unknown flag: --allow-stale" >&2
+    exit 0
+  fi
+  shift
+fi
+case "${1:-}" in
+  list) printf '%s\n' '[]'; exit 0 ;;
+  sql)  printf '%s\n' '` + sqlRows + `'; exit 0 ;;
+  show) printf '%s\n' '` + showRows + `'; exit 0 ;;
+  version) echo "bd test"; exit 0 ;;
+  *) printf '%s\n' '[]'; exit 0 ;;
+esac
+`
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return townRoot
+}
+
+// TestValidatePendingBeadForDispatchHoldsOnOpenMR verifies the scheduler
+// deferred-dispatch path enforces the open-MR guard (gfork-649/dk6) that the
+// direct sling path enforces at sling.go:651. A bead whose work is already
+// submitted (clean open MR) must be held — not dispatched into a duplicate
+// polecat (feryn-zqm7). TargetRig is left empty so the assertion isolates the
+// new MR guard from the cross-rig prefix check that follows it.
+func TestValidatePendingBeadForDispatchHoldsOnOpenMR(t *testing.T) {
+	townRoot := setupRoutedTownWithMRStub(t, "gt-work", true)
+	err := validatePendingBeadForDispatch(townRoot, capacity.PendingBead{WorkBeadID: "gt-work"}, false)
+	if !errors.Is(err, capacity.ErrOpenMRDispatchHeld) {
+		t.Fatalf("expected ErrOpenMRDispatchHeld for a bead with an open MR, got %v", err)
+	}
+}
+
+// TestValidatePendingBeadForDispatchPassesWithoutOpenMR is the negative case:
+// no open MR → the guard passes and (with no target rig) validation returns nil.
+func TestValidatePendingBeadForDispatchPassesWithoutOpenMR(t *testing.T) {
+	townRoot := setupRoutedTownWithMRStub(t, "gt-work", false)
+	if err := validatePendingBeadForDispatch(townRoot, capacity.PendingBead{WorkBeadID: "gt-work"}, false); err != nil {
+		t.Fatalf("expected nil for a bead with no open MR, got %v", err)
 	}
 }

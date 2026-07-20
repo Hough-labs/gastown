@@ -23,6 +23,17 @@ func (e *ErrOnSuccessFailed) Unwrap() error { return e.Err }
 // resolves `gt-` prefixes (gt-el4 / gastownhall/gastown#3800).
 var ErrCrossRigPrefix = errors.New("cross-rig prefix dispatch refused")
 
+// ErrOpenMRDispatchHeld is returned when a scheduled bead already has a clean
+// open merge request awaiting merge/review (gfork-649) or was rejected within
+// the resubmit grace window (gfork-dk6). The direct `gt sling` path enforces
+// this same guard (openMRDispatchBlock) but the deferred scheduler path did not
+// — a duplicate polecat could be spawned against work the refinery owns
+// (feryn-zqm7). Unlike ErrCrossRigPrefix this is a *transient hold*, not a
+// misroute: the dispatch cycle leaves the context queued and does NOT record a
+// dispatch failure (no circuit-break), so the bead dispatches normally once the
+// MR merges (bead closes and leaves the ready set) or the grace window elapses.
+var ErrOpenMRDispatchHeld = errors.New("open merge request awaiting merge/review — dispatch held")
+
 // BeadIDPrefix returns the prefix of a bead ID — the substring before the
 // first '-'. Returns "" if the ID has no dash.
 //

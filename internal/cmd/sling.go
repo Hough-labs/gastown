@@ -647,7 +647,12 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// clean open MR means the refinery owns completion; MRs with
 	// conflict/retry evidence are legitimate takeover targets (GH#gt-zqvj)
 	// and pass through.
-	if !slingForce {
+	//
+	// Skip in dry-run: the guard reads MR beads (bd list/show), and --dry-run
+	// must stay a cheap, lookup-free preview (TestSlingDryRunSkipsConvoyLookup).
+	// The real dispatch still enforces the guard here and — for deferred slings —
+	// on the scheduler path via validatePendingBeadForDispatch (feryn-zqm7).
+	if !slingForce && !slingDryRun {
 		if mrID, blocked := openMRDispatchBlock(townRoot, beadID); blocked {
 			return fmt.Errorf("refusing to sling bead %s: open merge request %s is awaiting merge/review\nThe work is already submitted — the refinery closes the bead when the PR merges.\nIf the MR is stale, reject it first (gt mq reject %s) or use --force", beadID, mrID, mrID)
 		}

@@ -262,6 +262,14 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 				fmt.Fprintf(os.Stderr, "%s Capacity full while dispatching %s; leaving context queued: %v\n",
 					style.Dim.Render("○"), b.WorkBeadID, err)
 				return
+			} else if errors.Is(err, capacity.ErrOpenMRDispatchHeld) {
+				// Transient hold (gfork-649/dk6, feryn-zqm7): the work is already
+				// submitted or resubmitting. Leave the context queued and do NOT
+				// record a dispatch failure — circuit-breaking a legitimate
+				// context here would drop the sling before the MR resolves.
+				fmt.Fprintf(os.Stderr, "%s Held dispatch of %s (open MR awaiting merge/review); leaving context queued\n",
+					style.Dim.Render("○"), b.WorkBeadID)
+				return
 			} else {
 				_ = events.LogFeed(events.TypeSchedulerDispatchFailed, actor,
 					events.SchedulerDispatchFailedPayload(b.WorkBeadID, b.TargetRig, err.Error()))
@@ -764,6 +772,22 @@ func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) cap
 }
 
 func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
+	// Open-MR dispatch guard (gfork-649 / gfork-dk6, feryn-zqm7). Mirror the
+	// direct-sling guard at sling.go:651 on the deferred scheduler path: a bead
+	// whose work is already submitted (clean open MR) or just rejected (within
+	// the resubmit grace window) must not spawn a duplicate polecat. This is a
+	// transient hold — ErrOpenMRDispatchHeld leaves the context queued without
+	// recording a dispatch failure (see the OnFailure handler in
+	// dispatchScheduledWork). openMRDispatchBlock resolves the rig DB from the
+	// bead prefix and fails OPEN on lookup errors, so it runs before the
+	// target-rig check below and covers auto-resolved (no explicit rig) beads too.
+	if mrID, blocked := openMRDispatchBlock(townRoot, b.WorkBeadID); blocked {
+		fmt.Fprintf(os.Stderr,
+			"%s dispatch_held reason=open_mr bead=%s target_rig=%s mr=%s\n",
+			style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, mrID)
+		return capacity.ErrOpenMRDispatchHeld
+	}
+
 	// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does not match the
 	// target rig's registered prefix must not be dispatched — the polecat would
 	// land in a rig DB that cannot resolve the bead and hang in prime.
