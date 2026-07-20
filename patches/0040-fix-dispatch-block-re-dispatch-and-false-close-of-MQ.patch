@@ -1,7 +1,7 @@
 From 1ab0737e9ffbce41f78971a0b0fd0f9f8b57e9fc Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 11 Jul 2026 00:50:00 -0400
-Subject: [PATCH 40/62] fix(dispatch): block re-dispatch and false-close of
+Subject: [PATCH 40/63] fix(dispatch): block re-dispatch and false-close of
  MQ-submitted beads (gfork-649)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

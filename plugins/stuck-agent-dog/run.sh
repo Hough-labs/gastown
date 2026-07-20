@@ -345,8 +345,47 @@ if [ "$TOTAL_ISSUES" -ge "$MASS_DEATH_THRESHOLD" ]; then
   MASS_DEATH=1
   log ""
   log "MASS DEATH: $TOTAL_ISSUES agents down — escalating instead of restarting"
-  gt escalate "Mass agent death: $TOTAL_ISSUES agents down" \
-    -s CRITICAL 2>/dev/null || true
+
+  # feryn-l0ga: this escalation used to fire with an EMPTY body and NO
+  # --fingerprint, so (1) the mayor had to investigate blind which agents were
+  # "down", and (2) every 5m patrol that re-observed the same persistent
+  # crashed/stuck set spawned a BRAND-NEW CRITICAL escalation — a self-
+  # perpetuating storm (restarts are suppressed below, so the condition never
+  # self-clears, so it re-fires forever). A stable --fingerprint collapses the
+  # repeated detections into a single open escalation (same dedup the sibling
+  # deacon escalation already uses), and the body now names the offending
+  # agents + per-agent reason so the response is actionable.
+  {
+    echo "$TOTAL_ISSUES agent(s) down (>= mass-death threshold $MASS_DEATH_THRESHOLD)."
+    echo "Per-agent restarts are SUPPRESSED this cycle to avoid a restart storm."
+    echo "A count this high often means a systemic cause (OOM, dolt outage, host pressure) rather than independent crashes — investigate that first."
+    echo ""
+    echo "Crashed (session dead, work still on hook):"
+    if [ "${#CRASHED[@]}" -eq 0 ]; then
+      echo "  (none)"
+    else
+      for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
+        IFS='|' read -r C_SESSION C_RIG C_PCAT C_HOOK <<< "$ENTRY"
+        echo "  - $C_RIG/polecats/$C_PCAT (session=$C_SESSION, hook=$C_HOOK): session-dead"
+      done
+    fi
+    echo ""
+    echo "Stuck/zombie (runtime dead, work still on hook):"
+    if [ "${#STUCK[@]}" -eq 0 ]; then
+      echo "  (none)"
+    else
+      for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
+        IFS='|' read -r S_SESSION S_RIG S_PCAT S_HOOK S_REASON <<< "$ENTRY"
+        echo "  - $S_RIG/polecats/$S_PCAT (session=$S_SESSION, hook=$S_HOOK): ${S_REASON:-zombie}"
+      done
+    fi
+    echo ""
+    echo "Action: rule out a systemic cause, then recover the stranded work (gt deacon redispatch <bead> or witness recovery). Restarts stay suppressed until this clears; close the escalation once capacity is restored."
+  } | gt escalate "Mass agent death: $TOTAL_ISSUES agents down" \
+    -s CRITICAL \
+    --source "plugin:stuck-agent-dog" \
+    --fingerprint "stuck-agent-dog:mass-death" \
+    --stdin 2>/dev/null || true
 fi
 
 # --- Take action --------------------------------------------------------------

@@ -1,7 +1,7 @@
 From 75b73788ae828a713ef7916f332399d4918099fc Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 19:41:51 -0400
-Subject: [PATCH 33/62] fix(done): close review-only reviewer's attached wisp
+Subject: [PATCH 33/63] fix(done): close review-only reviewer's attached wisp
  on no-MR completion (gfork-4sz)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
