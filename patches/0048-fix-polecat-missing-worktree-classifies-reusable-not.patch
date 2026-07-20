@@ -1,7 +1,7 @@
 From 8b0a3b7ce9ed5b2b5c52912c52d2c569f78dac77 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sat, 18 Jul 2026 16:17:20 -0400
-Subject: [PATCH 48/64] fix(polecat): missing worktree classifies reusable, not
+Subject: [PATCH 48/65] fix(polecat): missing worktree classifies reusable, not
  NEEDS_RECOVERY (hq-fqap)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

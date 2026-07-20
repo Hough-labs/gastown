@@ -1,0 +1,206 @@
+From 80846b1edf8b3110abb70aa6e2ddea6419c4357a Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Mon, 20 Jul 2026 14:23:36 -0400
+Subject: [PATCH 65/65] witness: prune stale merge-requested cleanup wisps so
+ merged polecats reclaim (feryn-ipm9 follow-up)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hasPendingMR's Check 1 treated ANY open merge-requested cleanup wisp as a pending
+MR and refused to reclaim the polecat (the gt-6a9d reap guard). But nothing closes
+that wisp after the merge lands: createCleanupWisp makes it at POLECAT_DONE, the
+refinery merges, gt mq post-merge closes the MR bead + source issue — but the
+cleanup wisp stays open forever. The reap then refuses to nuke the (fully done)
+polecat every patrol, permanently wedging its slot. Observed live on feryn: all 11
+slots pinned by stale hq-wisp-* cleanup wisps whose source beads were already
+closed; check-recovery said SAFE_TO_NUKE while the reap said "MR pending" — the
+exact divergence, since check-recovery (DecideWorkstate) never consults the wisp.
+
+Fix: a merge-requested wisp only blocks reclaim while its source issue is still
+unmerged. The source issue closing is the authoritative "merge landed" signal
+(gt mq post-merge closes it only after a successful merge). mergeRequestedWispPendingIssue
+parses each open merge-requested wisp's "Issue: <id>", and when that issue is
+closed/reaped it closes the stale wisp in-place (breaking the deadlock and stopping
+the leak) instead of counting it pending. Fails safe on any lookup/parse error
+(stays pending) so a transient failure never trades a false "merge done" for lost
+work. Applied to both hasPendingMR and hasPendingMRFromSnapshot.
+
+Test: TestHasPendingMRPrunesStaleMergeRequestedWisp (closed source issue → not
+pending + wisp closed). Full witness package green.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/witness/handlers.go      | 87 ++++++++++++++++++++++++++++---
+ internal/witness/handlers_test.go | 43 +++++++++++++++
+ 2 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/internal/witness/handlers.go b/internal/witness/handlers.go
+index e6f2debf..d208824b 100644
+--- a/internal/witness/handlers.go
++++ b/internal/witness/handlers.go
+@@ -645,6 +645,75 @@ func findCleanupWisp(bd *BdCli, workDir, polecatName string) (string, error) {
+ 	return "", nil
+ }
+ 
++// parseCleanupWispIssue extracts the "Issue: <id>" line createCleanupWisp writes
++// into a cleanup wisp's description. Returns "" when no such line is present.
++func parseCleanupWispIssue(description string) string {
++	for _, line := range strings.Split(description, "\n") {
++		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Issue:"); ok {
++			return strings.TrimSpace(rest)
++		}
++	}
++	return ""
++}
++
++// mergeRequestedWispPendingIssue reports whether this polecat has an OPEN
++// merge-requested cleanup wisp whose source issue is still unmerged — i.e. a
++// genuine pending merge that must block reclaim.
++//
++// A merge-requested wisp whose source issue has already CLOSED is STALE: the
++// merge landed (`gt mq post-merge` closes the source issue only after a
++// successful merge) but nothing ever closed the wisp. Left open, that stale wisp
++// wedges the polecat's slot forever — the reap's hasPendingMR guard (gt-6a9d)
++// refuses to nuke while ANY open merge-requested wisp exists, so the slot never
++// reclaims and the wisp keeps re-blocking every patrol (feryn-ipm9 follow-up;
++// observed live on feryn with 11 slots pinned by stale hq-wisp-* cleanup wisps).
++// This closes each stale wisp it finds (breaking the deadlock and stopping the
++// leak from accumulating) and returns true only when a wisp with a still-open
++// source issue remains. Fails safe on any lookup/parse error (returns true →
++// keep blocking) so a transient failure never trades a false "merge done" for
++// lost work.
++func mergeRequestedWispPendingIssue(bd *BdCli, workDir, polecatName string) bool {
++	output, err := bd.Exec(workDir, "list",
++		"--label", fmt.Sprintf("polecat:%s,state:merge-requested", polecatName),
++		"--status", "open",
++		"--json",
++	)
++	if err != nil {
++		return true // lookup failed — fail safe, keep blocking
++	}
++	if output == "" || output == "[]" || output == "null" {
++		return false // no merge-requested wisp — nothing pending from this signal
++	}
++	var items []struct {
++		ID          string `json:"id"`
++		Description string `json:"description"`
++	}
++	if err := json.Unmarshal([]byte(output), &items); err != nil {
++		return true // parse failed — fail safe
++	}
++
++	pending := false
++	for _, w := range items {
++		issueID := parseCleanupWispIssue(w.Description)
++		if issueID == "" {
++			pending = true // cannot identify the source issue — cannot prove stale
++			continue
++		}
++		status, found := getBeadStatus(bd, workDir, issueID)
++		// getBeadStatus returns (status,true) on a good lookup — "closed" for a
++		// merged issue, "" for one already reaped after completion. Both mean the
++		// merge landed, so the wisp is stale. (found=false is a lookup error —
++		// leave it pending.)
++		if found && (status == "closed" || status == "") {
++			_, _ = bd.Exec(workDir, "close", w.ID, "--reason",
++				fmt.Sprintf("stale merge-requested cleanup wisp: source issue %s already closed (merge landed) — closing so polecat %s can reclaim (feryn-ipm9 follow-up)", issueID, polecatName))
++			continue
++		}
++		pending = true // source issue still open (or unknown) — real pending merge
++	}
++	return pending
++}
++
+ // agentBeadResponse is used to parse the bd show --json response for agent beads.
+ type agentBeadResponse struct {
+ 	Description string `json:"description"`
+@@ -3587,9 +3656,12 @@ func findAllCleanupWisps(bd *BdCli, workDir, polecatName string) []string {
+ // processed by the refinery. Nuking would delete the remote branch and orphan the MR.
+ // See: gt-6a9d
+ func hasPendingMR(bd *BdCli, workDir, rigName, polecatName, agentBeadID string) bool {
+-	// Check 1: Cleanup wisp with merge-requested state (created by HandlePolecatDone)
+-	wispID, wispErr := findCleanupWisp(bd, workDir, polecatName)
+-	if wispErr != nil || wispID != "" {
++	// Check 1: an OPEN merge-requested cleanup wisp (created by HandlePolecatDone)
++	// blocks reclaim — but ONLY while its source issue is still unmerged. A wisp
++	// whose source issue already closed is stale (merge landed, wisp never closed)
++	// and is pruned in-place rather than wedging the slot forever (feryn-ipm9
++	// follow-up: the gt-6a9d reap-guard deadlock).
++	if mergeRequestedWispPendingIssue(bd, workDir, polecatName) {
+ 		return true
+ 	}
+ 
+@@ -3602,9 +3674,12 @@ func hasPendingMR(bd *BdCli, workDir, rigName, polecatName, agentBeadID string)
+ // hasPendingMRFromSnapshot checks for a pending MR using a pre-fetched ActiveMR
+ // value from the agent bead snapshot, avoiding a redundant bd show call. (gt-2gra)
+ func hasPendingMRFromSnapshot(bd *BdCli, workDir, rigName, polecatName string, snap *agentBeadSnapshot) bool {
+-	// Check 1: Cleanup wisp with merge-requested state (created by HandlePolecatDone)
+-	wispID, wispErr := findCleanupWisp(bd, workDir, polecatName)
+-	if wispErr != nil || wispID != "" {
++	// Check 1: an OPEN merge-requested cleanup wisp (created by HandlePolecatDone)
++	// blocks reclaim — but ONLY while its source issue is still unmerged. A wisp
++	// whose source issue already closed is stale (merge landed, wisp never closed)
++	// and is pruned in-place rather than wedging the slot forever (feryn-ipm9
++	// follow-up: the gt-6a9d reap-guard deadlock).
++	if mergeRequestedWispPendingIssue(bd, workDir, polecatName) {
+ 		return true
+ 	}
+ 
+diff --git a/internal/witness/handlers_test.go b/internal/witness/handlers_test.go
+index 0809cba6..7ff0eb5a 100644
+--- a/internal/witness/handlers_test.go
++++ b/internal/witness/handlers_test.go
+@@ -1085,6 +1085,49 @@ func TestHasPendingMRCleanupWispFailsClosed(t *testing.T) {
+ 	}
+ }
+ 
++// A merge-requested cleanup wisp whose source issue has already closed is STALE
++// (the merge landed, but nothing closed the wisp). hasPendingMR must NOT treat it
++// as a pending MR — otherwise the reap's gt-6a9d guard wedges the polecat's slot
++// forever — and must close the stale wisp so it stops re-blocking. (feryn-ipm9
++// follow-up)
++func TestHasPendingMRPrunesStaleMergeRequestedWisp(t *testing.T) {
++	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
++	var closed []string
++	bd, _ := mockBd(
++		func(args []string) (string, error) {
++			if len(args) == 0 {
++				return "", nil
++			}
++			switch args[0] {
++			case "list":
++				// Open merge-requested cleanup wisp; its source issue gt-src merged.
++				return `[{"id":"gt-cleanup","description":"Verify and cleanup polecat nux\nIssue: gt-src\nBranch: polecat/nux/gt-src+mr"}]`, nil
++			case "close":
++				closed = append(closed, args[1])
++				return "", nil
++			case "show":
++				switch args[1] {
++				case "gt-src":
++					return `[{"id":"gt-src","status":"closed"}]`, nil // merge landed
++				case "gt-agent":
++					return `[{"active_mr":"gt-mr","description":"active_mr: gt-mr\nlast_source_issue: gt-src\n"}]`, nil
++				case "gt-mr":
++					return "", errors.New("not found") // MR merged/gone → Check 2 not pending
++				}
++			}
++			return "", errors.New("not found")
++		},
++		func(args []string) error { return nil },
++	)
++
++	if got := hasPendingMR(bd, workDir, "gastown", "nux", "gt-agent"); got {
++		t.Fatalf("hasPendingMR() = true, want false: a merge-requested wisp whose source issue is closed is stale (merge landed), not pending")
++	}
++	if len(closed) != 1 || closed[0] != "gt-cleanup" {
++		t.Fatalf("stale wisp not closed: closed=%v, want [gt-cleanup]", closed)
++	}
++}
++
+ func TestTerminalSafeDoneSnapshot(t *testing.T) {
+ 	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+ 	bd, _ := mockBd(
+-- 
+2.50.1 (Apple Git-155)
+

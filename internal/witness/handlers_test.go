@@ -1085,6 +1085,49 @@ func TestHasPendingMRCleanupWispFailsClosed(t *testing.T) {
 	}
 }
 
+// A merge-requested cleanup wisp whose source issue has already closed is STALE
+// (the merge landed, but nothing closed the wisp). hasPendingMR must NOT treat it
+// as a pending MR — otherwise the reap's gt-6a9d guard wedges the polecat's slot
+// forever — and must close the stale wisp so it stops re-blocking. (feryn-ipm9
+// follow-up)
+func TestHasPendingMRPrunesStaleMergeRequestedWisp(t *testing.T) {
+	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+	var closed []string
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 {
+				return "", nil
+			}
+			switch args[0] {
+			case "list":
+				// Open merge-requested cleanup wisp; its source issue gt-src merged.
+				return `[{"id":"gt-cleanup","description":"Verify and cleanup polecat nux\nIssue: gt-src\nBranch: polecat/nux/gt-src+mr"}]`, nil
+			case "close":
+				closed = append(closed, args[1])
+				return "", nil
+			case "show":
+				switch args[1] {
+				case "gt-src":
+					return `[{"id":"gt-src","status":"closed"}]`, nil // merge landed
+				case "gt-agent":
+					return `[{"active_mr":"gt-mr","description":"active_mr: gt-mr\nlast_source_issue: gt-src\n"}]`, nil
+				case "gt-mr":
+					return "", errors.New("not found") // MR merged/gone → Check 2 not pending
+				}
+			}
+			return "", errors.New("not found")
+		},
+		func(args []string) error { return nil },
+	)
+
+	if got := hasPendingMR(bd, workDir, "gastown", "nux", "gt-agent"); got {
+		t.Fatalf("hasPendingMR() = true, want false: a merge-requested wisp whose source issue is closed is stale (merge landed), not pending")
+	}
+	if len(closed) != 1 || closed[0] != "gt-cleanup" {
+		t.Fatalf("stale wisp not closed: closed=%v, want [gt-cleanup]", closed)
+	}
+}
+
 func TestTerminalSafeDoneSnapshot(t *testing.T) {
 	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
 	bd, _ := mockBd(

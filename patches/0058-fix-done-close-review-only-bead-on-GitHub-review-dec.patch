@@ -1,7 +1,7 @@
 From e38017a6c615c53fc5f5843cbd8830d43c531366 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 21:59:19 -0400
-Subject: [PATCH 58/64] fix(done): close review-only bead on GitHub review
+Subject: [PATCH 58/65] fix(done): close review-only bead on GitHub review
  decision, not just bead comments (feryn-19i0)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

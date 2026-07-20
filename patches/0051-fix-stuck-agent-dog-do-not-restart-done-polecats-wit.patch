@@ -1,7 +1,7 @@
 From 0bd5f4cb235a8d4c9a780413a91aa32b411c5fc6 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sat, 18 Jul 2026 17:19:47 -0400
-Subject: [PATCH 51/64] fix(stuck-agent-dog): do not restart done polecats with
+Subject: [PATCH 51/65] fix(stuck-agent-dog): do not restart done polecats with
  an open MR (hq-2eqe)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
