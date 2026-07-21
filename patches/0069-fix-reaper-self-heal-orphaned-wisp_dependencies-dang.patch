@@ -1,0 +1,443 @@
+From 8f2e9143538f4e57c9e0757500cbca8404839134 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Tue, 21 Jul 2026 10:52:30 -0400
+Subject: [PATCH 69/69] fix(reaper): self-heal orphaned wisp_dependencies
+ (dangling parent refs)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wisp compaction/purge deletes wisps without cascade-deleting their reverse
+wisp_dependencies rows; batchDeleteRows only reverse-deletes edges for parents
+purged in the SAME run, so pre-existing/compaction-created orphans were never
+removable. The reaper re-flagged them as dangling_parent_ref every scan and
+HIGH-escalated the same non-impacting condition forever (20+ times during a
+14h e-stop), drowning real alerts.
+
+Add reaper.Repair(): batch-deletes wisp_dependencies rows whose declared internal
+parent (wisp via depends_on_wisp_id OR issue via depends_on_issue_id) exists in
+neither table, mirroring Scan's dangling detection but as a superset (also cleans
+orphaned 'blocks' edges). Batched by primary key (multi-table DELETE can't LIMIT),
+autocommit-off + COMMIT + DOLT_COMMIT like Purge. Wired into the daemon reaper
+cycle (self-heals automatically → scan stays clean → no escalation spam), the
+`gt reaper run` full cycle, and a new `gt reaper repair` subcommand (--dry-run,
+--json). TestRepairMatchesDanglingDetection guards against repair/detection drift
+(which would loop the anomaly forever).
+
+Validated live: injected synthetic orphan -> scan count=1 -> gt reaper repair
+deleted=1 -> scan clean. Data backfill already cleared 854 pre-existing orphans
+(hq 395, feryn 459); both DBs now scan anomalies=null.
+
+Closes hq-6f1x, hq-c074.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/reaper.go         | 102 +++++++++++++++++++++++++++--
+ internal/daemon/wisp_reaper.go |  35 +++++++++-
+ internal/reaper/reaper.go      | 116 +++++++++++++++++++++++++++++++++
+ internal/reaper/reaper_test.go |  38 +++++++++++
+ 4 files changed, 285 insertions(+), 6 deletions(-)
+
+diff --git a/internal/cmd/reaper.go b/internal/cmd/reaper.go
+index 0030678f..24949557 100644
+--- a/internal/cmd/reaper.go
++++ b/internal/cmd/reaper.go
+@@ -478,6 +478,89 @@ Returns the count of closed issues. Use --dry-run to preview.`,
+ 	},
+ }
+ 
++var reaperRepairCmd = &cobra.Command{
++	Use:   "repair",
++	Short: "Delete orphaned dependency edges (dangling parent refs)",
++	Long: `Delete wisp_dependencies rows whose declared internal parent (wisp or issue)
++no longer exists — the "dangling_parent_ref" anomaly reported by scan.
++
++These accumulate when wisps are purged or compacted without cascade-deleting
++their reverse dependency rows (hq-6f1x); before this repair path the reaper could
++only remove edges for parents purged in the same run, so pre-existing orphans were
++re-flagged forever and spammed HIGH escalations (hq-c074).
++
++When --db is provided, repairs a single database. When omitted, auto-discovers
++all databases on the Dolt server and repairs each one. Use --dry-run to preview.`,
++	RunE: func(cmd *cobra.Command, args []string) error {
++		databases := reaperDatabaseNames()
++
++		var results []*reaper.RepairResult
++		for i, dbName := range databases {
++			if err := waitBeforeReaperDatabase(i); err != nil {
++				return err
++			}
++			if err := reaper.ValidateDBName(dbName); err != nil {
++				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
++				continue
++			}
++
++			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
++			if err != nil {
++				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
++				continue
++			}
++
++			if ok, err := reaper.HasReaperSchema(db); err != nil {
++				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
++				db.Close()
++				continue
++			} else if !ok {
++				db.Close()
++				continue
++			}
++
++			result, err := reaper.Repair(db, dbName, reaperDryRun)
++			db.Close()
++			if err != nil {
++				fmt.Fprintf(os.Stderr, "%s: repair error: %v\n", dbName, err)
++				continue
++			}
++			results = append(results, result)
++		}
++
++		if reaperJSON {
++			fmt.Println(reaper.FormatJSON(results))
++		} else {
++			total := 0
++			for _, r := range results {
++				prefix := ""
++				n := r.OrphansDeleted
++				if r.DryRun {
++					prefix = "[DRY RUN] would "
++					n = r.Candidates
++				}
++				if n > 0 {
++					fmt.Printf("%s: %srepair %d orphaned dependency edges\n",
++						r.Database, prefix, n)
++				}
++				for _, a := range r.Anomalies {
++					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
++				}
++				total += r.OrphansDeleted
++			}
++			if len(results) > 1 {
++				prefix := ""
++				if reaperDryRun {
++					prefix = "[DRY RUN] "
++				}
++				fmt.Printf("\n%sRepair summary (%d databases): %d orphaned dependency edges\n",
++					prefix, len(results), total)
++			}
++		}
++		return nil
++	},
++}
++
+ var reaperRunCmd = &cobra.Command{
+ 	Use:   "run",
+ 	Short: "Run full reaper cycle across all databases",
+@@ -505,7 +588,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
+ 			return fmt.Errorf("invalid --stale-age: %w", err)
+ 		}
+ 
+-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen int
++		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen, totalDepsRepaired int
+ 
+ 		for i, dbName := range databases {
+ 			if err := waitBeforeReaperDatabase(i); err != nil {
+@@ -562,6 +645,15 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
+ 				totalMailPurged += purgeResult.MailPurged
+ 			}
+ 
++			// Repair orphaned dependency edges (hq-6f1x/hq-c074) — self-heals
++			// dangling parent refs left by purge/compaction so scan stays clean.
++			repairResult, err := reaper.Repair(db, dbName, reaperDryRun)
++			if err != nil {
++				fmt.Printf("%s: repair error: %v\n", dbName, err)
++			} else {
++				totalDepsRepaired += repairResult.OrphansDeleted
++			}
++
+ 			// Auto-close
+ 			closeResult, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
+ 			if err != nil {
+@@ -590,6 +682,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
+ 		}
+ 		fmt.Println()
+ 		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
++		fmt.Printf("  Repaired:  %d orphaned dependency edges\n", totalDepsRepaired)
+ 		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
+ 		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
+ 
+@@ -604,18 +697,18 @@ func init() {
+ 	// client outputs, not endpoint authority.
+ 	defaultHost, defaultPort := defaultReaperEndpoint()
+ 
+-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd, reaperDatabasesCmd} {
++	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperRunCmd, reaperDatabasesCmd} {
+ 		cmd.Flags().StringVar(&reaperDB, "db", "", "Database name (required for single-db commands)")
+ 		cmd.Flags().StringVar(&reaperHost, "host", defaultHost, "Dolt server host (env: GT_DOLT_HOST)")
+ 		cmd.Flags().IntVar(&reaperPort, "port", defaultPort, "Dolt server port (env: GT_DOLT_PORT)")
+ 		cmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "Report what would happen without acting")
+ 	}
+-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd} {
++	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperRunCmd} {
+ 		cmd.Flags().StringVar(&reaperDBDelay, "db-delay", "250ms", "Delay between databases to reduce Dolt load")
+ 	}
+ 
+ 	// JSON output flag for single-db commands
+-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperDatabasesCmd} {
++	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperDatabasesCmd} {
+ 		cmd.Flags().BoolVar(&reaperJSON, "json", false, "Output as JSON")
+ 	}
+ 
+@@ -636,6 +729,7 @@ func init() {
+ 	reaperCmd.AddCommand(reaperReapCmd)
+ 	reaperCmd.AddCommand(reaperPurgeCmd)
+ 	reaperCmd.AddCommand(reaperAutoCloseCmd)
++	reaperCmd.AddCommand(reaperRepairCmd)
+ 	reaperCmd.AddCommand(reaperRunCmd)
+ 
+ 	rootCmd.AddCommand(reaperCmd)
+diff --git a/internal/daemon/wisp_reaper.go b/internal/daemon/wisp_reaper.go
+index 737f0ba8..df1404bb 100644
+--- a/internal/daemon/wisp_reaper.go
++++ b/internal/daemon/wisp_reaper.go
+@@ -160,6 +160,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
+ 	port := d.doltServerPort()
+ 	dryRun := config.DryRun
+ 	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
++	var totalDepsRepaired int
+ 
+ 	// Step 2: Reap
+ 	reapErrors := 0
+@@ -236,6 +237,36 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
+ 		mol.closeStep("purge")
+ 	}
+ 
++	// Step 3a: Repair orphaned dependency edges (hq-6f1x/hq-c074). Self-heals
++	// wisp_dependencies rows whose parent was purged/compacted without cascade,
++	// so the next scan reports clean instead of re-escalating dangling_parent_ref.
++	for _, dbName := range databases {
++		if err := reaper.ValidateDBName(dbName); err != nil {
++			continue
++		}
++		db, err := reaper.OpenDB(host, port, dbName, 30*time.Second, 30*time.Second)
++		if err != nil {
++			continue
++		}
++		if ok, _ := reaper.HasReaperSchema(db); !ok {
++			db.Close()
++			continue
++		}
++		result, err := reaper.Repair(db, dbName, dryRun)
++		db.Close()
++		if err != nil {
++			d.logger.Printf("wisp_reaper: %s: repair error: %v", dbName, err)
++			continue
++		}
++		totalDepsRepaired += result.OrphansDeleted
++		if result.OrphansDeleted > 0 {
++			d.logger.Printf("wisp_reaper: %s: repaired %d orphaned dependency edges", dbName, result.OrphansDeleted)
++		}
++		for _, a := range result.Anomalies {
++			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
++		}
++	}
++
+ 	// Step 3b: Close plugin receipts (fast-track — 1h instead of 7d stale age)
+ 	pluginReceiptAge := 1 * time.Hour
+ 	var totalPluginClosed int
+@@ -331,8 +362,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
+ 	if totalMoleculeSteps > 0 {
+ 		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
+ 	}
+-	summary += fmt.Sprintf(" purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+-		totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
++	summary += fmt.Sprintf(" purged=%d mail_purged=%d deps_repaired=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
++		totalPurged, totalMailPurged, totalDepsRepaired, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+ 	d.logger.Printf("%s", summary)
+ 	mol.closeStep("report")
+ }
+diff --git a/internal/reaper/reaper.go b/internal/reaper/reaper.go
+index 5a31f1e1..26712e2a 100644
+--- a/internal/reaper/reaper.go
++++ b/internal/reaper/reaper.go
+@@ -128,6 +128,15 @@ type PurgeResult struct {
+ 	Anomalies   []Anomaly `json:"anomalies,omitempty"`
+ }
+ 
++// RepairResult holds the results of a dependency-repair operation.
++type RepairResult struct {
++	Database       string    `json:"database"`
++	OrphansDeleted int       `json:"orphans_deleted"`
++	Candidates     int       `json:"candidates,omitempty"`
++	DryRun         bool      `json:"dry_run,omitempty"`
++	Anomalies      []Anomaly `json:"anomalies,omitempty"`
++}
++
+ // ClosedEntry records an individual issue closure with details for logging.
+ type ClosedEntry struct {
+ 	ID       string `json:"id"`
+@@ -715,6 +724,113 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
+ 	return totalDeleted, nil
+ }
+ 
++// Repair removes orphaned wisp_dependencies edges whose declared internal parent
++// (a wisp via depends_on_wisp_id, or an issue via depends_on_issue_id) no longer
++// exists. These accumulate when wisps are purged or compacted without cascade-
++// deleting their reverse dependency rows (hq-6f1x); batchDeleteRows only reverse-
++// deletes edges for parents purged in the SAME run, so pre-existing orphans were
++// never removable and the scan re-flagged them as dangling_parent_ref forever,
++// spamming HIGH escalations (hq-c074). Running Repair each cycle self-heals them
++// so the scan reports clean and no escalation fires. Safe: an edge is deleted only
++// when its declared internal target exists in NEITHER wisps NOR issues, and never
++// touches external refs (depends_on_external).
++func Repair(db *sql.DB, dbName string, dryRun bool) (*RepairResult, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
++	defer cancel()
++
++	result := &RepairResult{Database: dbName, DryRun: dryRun}
++
++	// Count orphaned edges. Mirrors the dangling-parent detection in Scan but is
++	// not restricted to type='parent-child' — orphaned 'blocks' edges are equally
++	// dead (their target wisp/issue is gone) and accumulate the same way.
++	orphanWhere := `wd.depends_on_external IS NULL
++		AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL)
++		AND pw.id IS NULL AND pi.id IS NULL`
++	orphanFrom := `wisp_dependencies wd
++		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id
++		LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id`
++
++	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", orphanFrom, orphanWhere)
++	if err := db.QueryRowContext(ctx, countQuery).Scan(&result.Candidates); err != nil {
++		if isTableNotFound(err) {
++			return result, nil // wisps/issues/wisp_dependencies not on this server
++		}
++		return nil, fmt.Errorf("count orphaned deps: %w", err)
++	}
++	if result.Candidates == 0 || dryRun {
++		return result, nil
++	}
++
++	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
++		return nil, fmt.Errorf("disable autocommit: %w", err)
++	}
++	defer func() {
++		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
++	}()
++
++	// Batch by id: multi-table DELETE does not support LIMIT, so collect a bounded
++	// set of orphan ids per iteration and delete them by primary key.
++	selectQuery := fmt.Sprintf("SELECT wd.id FROM %s WHERE %s LIMIT %d", orphanFrom, orphanWhere, DefaultBatchSize)
++	for {
++		idRows, err := db.QueryContext(ctx, selectQuery)
++		if err != nil {
++			return result, fmt.Errorf("select orphan batch: %w", err)
++		}
++		var ids []string
++		for idRows.Next() {
++			var id string
++			if err := idRows.Scan(&id); err != nil {
++				idRows.Close()
++				return result, fmt.Errorf("scan orphan id: %w", err)
++			}
++			ids = append(ids, id)
++		}
++		idRows.Close()
++
++		if len(ids) == 0 {
++			break
++		}
++
++		placeholders := make([]string, len(ids))
++		args := make([]interface{}, len(ids))
++		for i, id := range ids {
++			placeholders[i] = "?"
++			args[i] = id
++		}
++		delQuery := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE id IN (%s)", strings.Join(placeholders, ","))
++		res, err := db.ExecContext(ctx, delQuery, args...)
++		if err != nil {
++			return result, fmt.Errorf("delete orphan batch: %w", err)
++		}
++		affected, _ := res.RowsAffected()
++		result.OrphansDeleted += int(affected)
++		if len(ids) < DefaultBatchSize {
++			break
++		}
++	}
++
++	if result.OrphansDeleted > 0 {
++		// Flush SQL transaction to working set before DOLT_COMMIT.
++		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
++			result.Anomalies = append(result.Anomalies, Anomaly{
++				Type:    "sql_commit_failed",
++				Message: fmt.Sprintf("sql commit after repair failed: %v", err),
++			})
++			return result, nil
++		}
++		commitMsg := fmt.Sprintf("reaper: repair %d orphaned wisp_dependencies from %s", result.OrphansDeleted, dbName)
++		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
++			// Non-fatal — log but continue.
++			result.Anomalies = append(result.Anomalies, Anomaly{
++				Type:    "dolt_commit_failed",
++				Message: fmt.Sprintf("dolt commit after repair failed: %v", err),
++			})
++		}
++	}
++
++	return result, nil
++}
++
+ // AutoClose closes issues that have been open with no updates past staleAge.
+ // Excludes P0/P1 priority, epics, hooked/pinned issues, standing-order labels,
+ // and issues with active dependencies.
+diff --git a/internal/reaper/reaper_test.go b/internal/reaper/reaper_test.go
+index 1fa8b530..d6348a5c 100644
+--- a/internal/reaper/reaper_test.go
++++ b/internal/reaper/reaper_test.go
+@@ -177,6 +177,44 @@ func TestReaperQueriesUseTypedDependencyColumns(t *testing.T) {
+ 	}
+ }
+ 
++// TestRepairMatchesDanglingDetection guards the critical invariant behind the
++// self-heal repair pass (hq-6f1x/hq-c074): Repair must delete AT LEAST every row
++// that Scan flags as dangling_parent_ref, using the SAME typed-column predicate.
++// If the two drift, repair would delete a different set than scan detects and the
++// dangling_parent_ref anomaly would loop forever (escalation spam). Repair uses a
++// superset predicate (no type='parent-child' restriction) so 'blocks' orphans are
++// also cleaned — but it must share scan's core "parent absent from both tables"
++// condition, the external-ref guard, and typed joins.
++func TestRepairMatchesDanglingDetection(t *testing.T) {
++	data, err := os.ReadFile("reaper.go")
++	if err != nil {
++		t.Fatalf("read reaper.go: %v", err)
++	}
++	source := string(data)
++	repairBody := sourceBetween(t, source, "func Repair(", "// AutoClose closes issues")
++
++	for _, want := range []string{
++		"LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id",
++		"LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id",
++		"pw.id IS NULL AND pi.id IS NULL",
++		"wd.depends_on_external IS NULL",
++		"wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL",
++	} {
++		if !strings.Contains(repairBody, want) {
++			t.Fatalf("Repair orphan predicate missing %q — it must match Scan's dangling detection or the anomaly loops", want)
++		}
++	}
++	if strings.Contains(repairBody, "depends_on_id") {
++		t.Fatal("Repair must not use the legacy depends_on_id column")
++	}
++	if !strings.Contains(repairBody, "CALL DOLT_COMMIT(") {
++		t.Fatal("Repair must DOLT_COMMIT its deletes so the self-heal persists in history")
++	}
++	if !strings.Contains(repairBody, "DELETE FROM wisp_dependencies WHERE id IN") {
++		t.Fatal("Repair should batch-delete orphans by primary key (multi-table DELETE cannot use LIMIT)")
++	}
++}
++
+ // TestReapQueryNoDatabaseNameInjection verifies that the Reap function's batch
+ // SELECT query does not inject the database name into the SQL string. Previously,
+ // dbName was passed as a Sprintf arg but the format string didn't use it, causing
+-- 
+2.50.1 (Apple Git-155)
+

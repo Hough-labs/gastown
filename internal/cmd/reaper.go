@@ -478,6 +478,89 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 	},
 }
 
+var reaperRepairCmd = &cobra.Command{
+	Use:   "repair",
+	Short: "Delete orphaned dependency edges (dangling parent refs)",
+	Long: `Delete wisp_dependencies rows whose declared internal parent (wisp or issue)
+no longer exists — the "dangling_parent_ref" anomaly reported by scan.
+
+These accumulate when wisps are purged or compacted without cascade-deleting
+their reverse dependency rows (hq-6f1x); before this repair path the reaper could
+only remove edges for parents purged in the same run, so pre-existing orphans were
+re-flagged forever and spammed HIGH escalations (hq-c074).
+
+When --db is provided, repairs a single database. When omitted, auto-discovers
+all databases on the Dolt server and repairs each one. Use --dry-run to preview.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		databases := reaperDatabaseNames()
+
+		var results []*reaper.RepairResult
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
+			if err := reaper.ValidateDBName(dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
+				continue
+			}
+
+			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
+				continue
+			}
+
+			if ok, err := reaper.HasReaperSchema(db); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
+				db.Close()
+				continue
+			} else if !ok {
+				db.Close()
+				continue
+			}
+
+			result, err := reaper.Repair(db, dbName, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: repair error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, result)
+		}
+
+		if reaperJSON {
+			fmt.Println(reaper.FormatJSON(results))
+		} else {
+			total := 0
+			for _, r := range results {
+				prefix := ""
+				n := r.OrphansDeleted
+				if r.DryRun {
+					prefix = "[DRY RUN] would "
+					n = r.Candidates
+				}
+				if n > 0 {
+					fmt.Printf("%s: %srepair %d orphaned dependency edges\n",
+						r.Database, prefix, n)
+				}
+				for _, a := range r.Anomalies {
+					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+				}
+				total += r.OrphansDeleted
+			}
+			if len(results) > 1 {
+				prefix := ""
+				if reaperDryRun {
+					prefix = "[DRY RUN] "
+				}
+				fmt.Printf("\n%sRepair summary (%d databases): %d orphaned dependency edges\n",
+					prefix, len(results), total)
+			}
+		}
+		return nil
+	},
+}
+
 var reaperRunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Run full reaper cycle across all databases",
@@ -505,7 +588,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen int
+		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen, totalDepsRepaired int
 
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
@@ -562,6 +645,15 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 				totalMailPurged += purgeResult.MailPurged
 			}
 
+			// Repair orphaned dependency edges (hq-6f1x/hq-c074) — self-heals
+			// dangling parent refs left by purge/compaction so scan stays clean.
+			repairResult, err := reaper.Repair(db, dbName, reaperDryRun)
+			if err != nil {
+				fmt.Printf("%s: repair error: %v\n", dbName, err)
+			} else {
+				totalDepsRepaired += repairResult.OrphansDeleted
+			}
+
 			// Auto-close
 			closeResult, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
 			if err != nil {
@@ -590,6 +682,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 		}
 		fmt.Println()
 		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
+		fmt.Printf("  Repaired:  %d orphaned dependency edges\n", totalDepsRepaired)
 		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
 		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
 
@@ -604,18 +697,18 @@ func init() {
 	// client outputs, not endpoint authority.
 	defaultHost, defaultPort := defaultReaperEndpoint()
 
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperRunCmd, reaperDatabasesCmd} {
 		cmd.Flags().StringVar(&reaperDB, "db", "", "Database name (required for single-db commands)")
 		cmd.Flags().StringVar(&reaperHost, "host", defaultHost, "Dolt server host (env: GT_DOLT_HOST)")
 		cmd.Flags().IntVar(&reaperPort, "port", defaultPort, "Dolt server port (env: GT_DOLT_PORT)")
 		cmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "Report what would happen without acting")
 	}
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperRunCmd} {
 		cmd.Flags().StringVar(&reaperDBDelay, "db-delay", "250ms", "Delay between databases to reduce Dolt load")
 	}
 
 	// JSON output flag for single-db commands
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRepairCmd, reaperDatabasesCmd} {
 		cmd.Flags().BoolVar(&reaperJSON, "json", false, "Output as JSON")
 	}
 
@@ -636,6 +729,7 @@ func init() {
 	reaperCmd.AddCommand(reaperReapCmd)
 	reaperCmd.AddCommand(reaperPurgeCmd)
 	reaperCmd.AddCommand(reaperAutoCloseCmd)
+	reaperCmd.AddCommand(reaperRepairCmd)
 	reaperCmd.AddCommand(reaperRunCmd)
 
 	rootCmd.AddCommand(reaperCmd)

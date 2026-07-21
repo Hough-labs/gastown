@@ -160,6 +160,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	port := d.doltServerPort()
 	dryRun := config.DryRun
 	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
+	var totalDepsRepaired int
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -234,6 +235,36 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		mol.failStep("purge", fmt.Sprintf("%d databases had purge errors", purgeErrors))
 	} else {
 		mol.closeStep("purge")
+	}
+
+	// Step 3a: Repair orphaned dependency edges (hq-6f1x/hq-c074). Self-heals
+	// wisp_dependencies rows whose parent was purged/compacted without cascade,
+	// so the next scan reports clean instead of re-escalating dangling_parent_ref.
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB(host, port, dbName, 30*time.Second, 30*time.Second)
+		if err != nil {
+			continue
+		}
+		if ok, _ := reaper.HasReaperSchema(db); !ok {
+			db.Close()
+			continue
+		}
+		result, err := reaper.Repair(db, dbName, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: repair error: %v", dbName, err)
+			continue
+		}
+		totalDepsRepaired += result.OrphansDeleted
+		if result.OrphansDeleted > 0 {
+			d.logger.Printf("wisp_reaper: %s: repaired %d orphaned dependency edges", dbName, result.OrphansDeleted)
+		}
+		for _, a := range result.Anomalies {
+			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
+		}
 	}
 
 	// Step 3b: Close plugin receipts (fast-track — 1h instead of 7d stale age)
@@ -331,8 +362,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	if totalMoleculeSteps > 0 {
 		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
 	}
-	summary += fmt.Sprintf(" purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	summary += fmt.Sprintf(" purged=%d mail_purged=%d deps_repaired=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalPurged, totalMailPurged, totalDepsRepaired, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
 	d.logger.Printf("%s", summary)
 	mol.closeStep("report")
 }

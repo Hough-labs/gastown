@@ -177,6 +177,44 @@ func TestReaperQueriesUseTypedDependencyColumns(t *testing.T) {
 	}
 }
 
+// TestRepairMatchesDanglingDetection guards the critical invariant behind the
+// self-heal repair pass (hq-6f1x/hq-c074): Repair must delete AT LEAST every row
+// that Scan flags as dangling_parent_ref, using the SAME typed-column predicate.
+// If the two drift, repair would delete a different set than scan detects and the
+// dangling_parent_ref anomaly would loop forever (escalation spam). Repair uses a
+// superset predicate (no type='parent-child' restriction) so 'blocks' orphans are
+// also cleaned — but it must share scan's core "parent absent from both tables"
+// condition, the external-ref guard, and typed joins.
+func TestRepairMatchesDanglingDetection(t *testing.T) {
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	source := string(data)
+	repairBody := sourceBetween(t, source, "func Repair(", "// AutoClose closes issues")
+
+	for _, want := range []string{
+		"LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id",
+		"LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id",
+		"pw.id IS NULL AND pi.id IS NULL",
+		"wd.depends_on_external IS NULL",
+		"wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL",
+	} {
+		if !strings.Contains(repairBody, want) {
+			t.Fatalf("Repair orphan predicate missing %q — it must match Scan's dangling detection or the anomaly loops", want)
+		}
+	}
+	if strings.Contains(repairBody, "depends_on_id") {
+		t.Fatal("Repair must not use the legacy depends_on_id column")
+	}
+	if !strings.Contains(repairBody, "CALL DOLT_COMMIT(") {
+		t.Fatal("Repair must DOLT_COMMIT its deletes so the self-heal persists in history")
+	}
+	if !strings.Contains(repairBody, "DELETE FROM wisp_dependencies WHERE id IN") {
+		t.Fatal("Repair should batch-delete orphans by primary key (multi-table DELETE cannot use LIMIT)")
+	}
+}
+
 // TestReapQueryNoDatabaseNameInjection verifies that the Reap function's batch
 // SELECT query does not inject the database name into the SQL string. Previously,
 // dbName was passed as a Sprintf arg but the format string didn't use it, causing

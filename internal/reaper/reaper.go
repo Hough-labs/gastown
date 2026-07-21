@@ -128,6 +128,15 @@ type PurgeResult struct {
 	Anomalies   []Anomaly `json:"anomalies,omitempty"`
 }
 
+// RepairResult holds the results of a dependency-repair operation.
+type RepairResult struct {
+	Database       string    `json:"database"`
+	OrphansDeleted int       `json:"orphans_deleted"`
+	Candidates     int       `json:"candidates,omitempty"`
+	DryRun         bool      `json:"dry_run,omitempty"`
+	Anomalies      []Anomaly `json:"anomalies,omitempty"`
+}
+
 // ClosedEntry records an individual issue closure with details for logging.
 type ClosedEntry struct {
 	ID       string `json:"id"`
@@ -713,6 +722,113 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	}
 
 	return totalDeleted, nil
+}
+
+// Repair removes orphaned wisp_dependencies edges whose declared internal parent
+// (a wisp via depends_on_wisp_id, or an issue via depends_on_issue_id) no longer
+// exists. These accumulate when wisps are purged or compacted without cascade-
+// deleting their reverse dependency rows (hq-6f1x); batchDeleteRows only reverse-
+// deletes edges for parents purged in the SAME run, so pre-existing orphans were
+// never removable and the scan re-flagged them as dangling_parent_ref forever,
+// spamming HIGH escalations (hq-c074). Running Repair each cycle self-heals them
+// so the scan reports clean and no escalation fires. Safe: an edge is deleted only
+// when its declared internal target exists in NEITHER wisps NOR issues, and never
+// touches external refs (depends_on_external).
+func Repair(db *sql.DB, dbName string, dryRun bool) (*RepairResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
+	defer cancel()
+
+	result := &RepairResult{Database: dbName, DryRun: dryRun}
+
+	// Count orphaned edges. Mirrors the dangling-parent detection in Scan but is
+	// not restricted to type='parent-child' — orphaned 'blocks' edges are equally
+	// dead (their target wisp/issue is gone) and accumulate the same way.
+	orphanWhere := `wd.depends_on_external IS NULL
+		AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL)
+		AND pw.id IS NULL AND pi.id IS NULL`
+	orphanFrom := `wisp_dependencies wd
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id
+		LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id`
+
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", orphanFrom, orphanWhere)
+	if err := db.QueryRowContext(ctx, countQuery).Scan(&result.Candidates); err != nil {
+		if isTableNotFound(err) {
+			return result, nil // wisps/issues/wisp_dependencies not on this server
+		}
+		return nil, fmt.Errorf("count orphaned deps: %w", err)
+	}
+	if result.Candidates == 0 || dryRun {
+		return result, nil
+	}
+
+	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+		return nil, fmt.Errorf("disable autocommit: %w", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
+	}()
+
+	// Batch by id: multi-table DELETE does not support LIMIT, so collect a bounded
+	// set of orphan ids per iteration and delete them by primary key.
+	selectQuery := fmt.Sprintf("SELECT wd.id FROM %s WHERE %s LIMIT %d", orphanFrom, orphanWhere, DefaultBatchSize)
+	for {
+		idRows, err := db.QueryContext(ctx, selectQuery)
+		if err != nil {
+			return result, fmt.Errorf("select orphan batch: %w", err)
+		}
+		var ids []string
+		for idRows.Next() {
+			var id string
+			if err := idRows.Scan(&id); err != nil {
+				idRows.Close()
+				return result, fmt.Errorf("scan orphan id: %w", err)
+			}
+			ids = append(ids, id)
+		}
+		idRows.Close()
+
+		if len(ids) == 0 {
+			break
+		}
+
+		placeholders := make([]string, len(ids))
+		args := make([]interface{}, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		delQuery := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE id IN (%s)", strings.Join(placeholders, ","))
+		res, err := db.ExecContext(ctx, delQuery, args...)
+		if err != nil {
+			return result, fmt.Errorf("delete orphan batch: %w", err)
+		}
+		affected, _ := res.RowsAffected()
+		result.OrphansDeleted += int(affected)
+		if len(ids) < DefaultBatchSize {
+			break
+		}
+	}
+
+	if result.OrphansDeleted > 0 {
+		// Flush SQL transaction to working set before DOLT_COMMIT.
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after repair failed: %v", err),
+			})
+			return result, nil
+		}
+		commitMsg := fmt.Sprintf("reaper: repair %d orphaned wisp_dependencies from %s", result.OrphansDeleted, dbName)
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			// Non-fatal — log but continue.
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after repair failed: %v", err),
+			})
+		}
+	}
+
+	return result, nil
 }
 
 // AutoClose closes issues that have been open with no updates past staleAge.

@@ -1,7 +1,7 @@
 From dd54f0a601aa097c617d70db032fcbb1e0a0650f Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 17:13:17 -0400
-Subject: [PATCH 56/68] fix(dispatch): scan only registered rigs for sling
+Subject: [PATCH 56/69] fix(dispatch): scan only registered rigs for sling
  contexts
 
 beadsSearchDirs scanned every top-level town dir with a .beads subdir,

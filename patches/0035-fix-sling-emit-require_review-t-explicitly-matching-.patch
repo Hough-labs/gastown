@@ -1,7 +1,7 @@
 From b33efa770e1222feb6774c12d727cafed507341e Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 19:52:30 -0400
-Subject: [PATCH 35/68] fix(sling): emit require_review=%t explicitly, matching
+Subject: [PATCH 35/69] fix(sling): emit require_review=%t explicitly, matching
  patrol path (gfork-a84)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

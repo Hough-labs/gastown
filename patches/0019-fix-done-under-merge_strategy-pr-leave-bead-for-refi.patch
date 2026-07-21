@@ -1,7 +1,7 @@
 From d67e9b76cd843cbcee7446b5402037283915470b Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 4 Jun 2026 16:41:51 -0400
-Subject: [PATCH 19/68] fix(done): under merge_strategy=pr, leave bead for
+Subject: [PATCH 19/69] fix(done): under merge_strategy=pr, leave bead for
  refinery to close on PR merge (hq-6wd2)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

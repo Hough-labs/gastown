@@ -1,7 +1,7 @@
 From dab65d8cc6837fd483f0f8e25a3334df09c0d13c Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 4 Jul 2026 14:43:27 -0400
-Subject: [PATCH 27/68] =?UTF-8?q?perf(agents):=20trim=20per-cycle=20contex?=
+Subject: [PATCH 27/69] =?UTF-8?q?perf(agents):=20trim=20per-cycle=20contex?=
  =?UTF-8?q?t=20intake=20=E2=80=94=20mail=20cursor=20+=20mid-weight=20patro?=
  =?UTF-8?q?l=20prime=20+=20nudge=20de-dup?=
 MIME-Version: 1.0
