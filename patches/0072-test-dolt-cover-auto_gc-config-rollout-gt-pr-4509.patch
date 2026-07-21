@@ -1,0 +1,180 @@
+From 9797aa8813c7f68869dfa0158358516c31bf00e8 Mon Sep 17 00:00:00 2001
+From: coder <thalia.geraghty@fiserv.com>
+Date: Fri, 17 Jul 2026 15:54:01 +0000
+Subject: [PATCH 72/73] test(dolt): cover auto_gc config rollout (gt-pr-4509)
+
+(cherry picked from commit b4f9d7cad7022c8641be48a02cbdc209043f8eec)
+---
+ docs/design/dolt-storage.md                  | 19 ++++-
+ internal/daemon/dolt_endpoint_config_test.go | 75 ++++++++++++++++++++
+ internal/doltserver/doltserver_test.go       |  7 ++
+ 3 files changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/docs/design/dolt-storage.md b/docs/design/dolt-storage.md
+index 7bc4e198..523f80b9 100644
+--- a/docs/design/dolt-storage.md
++++ b/docs/design/dolt-storage.md
+@@ -239,9 +239,9 @@ but insufficient. DELETE + rebase + gc is the full pipeline.
+ 
+ **Critical update** (Tim Sehn, 2026-02-28): All compaction operations —
+ `DOLT_RESET --soft`, `DOLT_REBASE()`, `dolt_gc()` — are **safe on a
+-running server**. No downtime or maintenance window is needed. Auto-GC
+-has been ON by default since Dolt 1.75.0. Flatten is trivially cheap
+-(pointer moves, not data writes). Can run daily or more frequently.
++running server**. Routine compaction does not need downtime. Auto-GC has
++been ON by default since Dolt 1.75.0. Flatten is trivially cheap (pointer
++moves, not data writes). Can run daily or more frequently.
+ 
+ Reference: https://www.dolthub.com/blog/2026-01-28-everybody-rebase/
+ 
+@@ -394,6 +394,19 @@ first, gc second.
+ triggers when the journal file (`.dolt/noms/vvvv...`) reaches 50MB. No
+ manual gc or server stop is required — the server handles it.
+ 
++Gas Town managed Dolt configs should keep `auto_gc_behavior` enabled with
++`archive_level: 1` so the sql-server does not retain every old chunk index
++and grow RSS indefinitely. The config is regenerated only when the managed
++Dolt server starts; a deployed change takes effect on the next Dolt restart.
++Set `GT_DOLT_AUTO_GC=off` before that restart to emit `enable: false` and
++`archive_level: 0` as an operational rollback switch.
++
++If auto-GC was disabled long enough for a database to bloat, schedule one
++explicit `dolt gc --full --archive-level=1` in a maintenance window to reset
++the storage/RSS baseline. That one-time reclaim is an operator action, not a
++hidden daemon task; after it completes, auto-GC handles ongoing chunk
++reclamation.
++
+ ```sql
+ -- Manual gc (safe on a running server, no need to stop)
+ CALL dolt_gc();
+diff --git a/internal/daemon/dolt_endpoint_config_test.go b/internal/daemon/dolt_endpoint_config_test.go
+index 3db75c09..297f239e 100644
+--- a/internal/daemon/dolt_endpoint_config_test.go
++++ b/internal/daemon/dolt_endpoint_config_test.go
+@@ -5,6 +5,8 @@ import (
+ 	"path/filepath"
+ 	"testing"
+ 	"time"
++
++	"gopkg.in/yaml.v3"
+ )
+ 
+ func TestNewDoltServerManagerNormalizesManagedEndpointFromTownConfig(t *testing.T) {
+@@ -121,6 +123,32 @@ func TestApplyConfiguredDoltHostEnvClearsManagedConfigWithoutHost(t *testing.T)
+ 	}
+ }
+ 
++func TestWriteDaemonDoltConfigAutoGC(t *testing.T) {
++	t.Run("default enabled", func(t *testing.T) {
++		unsetEnv(t, "GT_DOLT_AUTO_GC")
++
++		got := writeAndReadDaemonAutoGC(t)
++		if !got.Enable {
++			t.Fatalf("auto_gc_behavior.enable = false, want true")
++		}
++		if got.ArchiveLevel != 1 {
++			t.Fatalf("auto_gc_behavior.archive_level = %d, want 1", got.ArchiveLevel)
++		}
++	})
++
++	t.Run("kill switch disabled", func(t *testing.T) {
++		t.Setenv("GT_DOLT_AUTO_GC", "disabled")
++
++		got := writeAndReadDaemonAutoGC(t)
++		if got.Enable {
++			t.Fatalf("GT_DOLT_AUTO_GC=disabled: auto_gc_behavior.enable = true, want false")
++		}
++		if got.ArchiveLevel != 0 {
++			t.Fatalf("GT_DOLT_AUTO_GC=disabled: auto_gc_behavior.archive_level = %d, want 0", got.ArchiveLevel)
++		}
++	})
++}
++
+ func writeManagedDoltConfig(t *testing.T, townRoot, content string) {
+ 	t.Helper()
+ 	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+@@ -132,6 +160,53 @@ func writeManagedDoltConfig(t *testing.T, townRoot, content string) {
+ 	}
+ }
+ 
++func writeAndReadDaemonAutoGC(t *testing.T) struct {
++	Enable       bool `yaml:"enable"`
++	ArchiveLevel int  `yaml:"archive_level"`
++} {
++	t.Helper()
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	cfg := &DoltServerConfig{Port: 3307, DataDir: dir}
++	if err := writeDaemonDoltConfig(cfg, configPath); err != nil {
++		t.Fatalf("writeDaemonDoltConfig: %v", err)
++	}
++	data, err := os.ReadFile(configPath)
++	if err != nil {
++		t.Fatalf("reading daemon Dolt config: %v", err)
++	}
++
++	var parsed struct {
++		Behavior struct {
++			AutoGCBehavior struct {
++				Enable       bool `yaml:"enable"`
++				ArchiveLevel int  `yaml:"archive_level"`
++			} `yaml:"auto_gc_behavior"`
++		} `yaml:"behavior"`
++	}
++	if err := yaml.Unmarshal(data, &parsed); err != nil {
++		t.Fatalf("generated daemon config is invalid YAML: %v\n%s", err, data)
++	}
++	return parsed.Behavior.AutoGCBehavior
++}
++
++func unsetEnv(t *testing.T, key string) {
++	t.Helper()
++
++	old, hadOld := os.LookupEnv(key)
++	if err := os.Unsetenv(key); err != nil {
++		t.Fatalf("unset %s: %v", key, err)
++	}
++	t.Cleanup(func() {
++		if hadOld {
++			_ = os.Setenv(key, old)
++		} else {
++			_ = os.Unsetenv(key)
++		}
++	})
++}
++
+ func assertProcessEnv(t *testing.T, key, want string) {
+ 	t.Helper()
+ 	if got := os.Getenv(key); got != want {
+diff --git a/internal/doltserver/doltserver_test.go b/internal/doltserver/doltserver_test.go
+index 377be27e..fc5cfc1f 100644
+--- a/internal/doltserver/doltserver_test.go
++++ b/internal/doltserver/doltserver_test.go
+@@ -4240,9 +4240,13 @@ func TestDefaultConfig_ManagedDefaultsAndEnvOverrides(t *testing.T) {
+ 	if config.DoltStatsEnabled != "0" {
+ 		t.Errorf("DoltStatsEnabled = %q, want 0", config.DoltStatsEnabled)
+ 	}
++	if config.AutoGC != "on" {
++		t.Errorf("AutoGC = %q, want on", config.AutoGC)
++	}
+ 
+ 	t.Setenv("GT_DOLT_STATS_ENABLED", "omit")
+ 	t.Setenv("GT_DOLT_EVENT_SCHEDULER", "omit")
++	t.Setenv("GT_DOLT_AUTO_GC", "off")
+ 	config = DefaultConfig(townRoot)
+ 	if config.DoltStatsEnabled != "omit" {
+ 		t.Errorf("DoltStatsEnabled = %q, want omit", config.DoltStatsEnabled)
+@@ -4250,6 +4254,9 @@ func TestDefaultConfig_ManagedDefaultsAndEnvOverrides(t *testing.T) {
+ 	if config.EventScheduler != "omit" {
+ 		t.Errorf("EventScheduler = %q, want omit", config.EventScheduler)
+ 	}
++	if config.AutoGC != "off" {
++		t.Errorf("AutoGC = %q, want off", config.AutoGC)
++	}
+ }
+ 
+ func TestBuildDoltSQLCmd_Local(t *testing.T) {
+-- 
+2.50.1 (Apple Git-155)
+

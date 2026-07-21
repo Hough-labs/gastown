@@ -1,7 +1,7 @@
 From bac230df3c3edcfdd975a1aa39ccf90034ec70a3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 3 Jul 2026 18:53:08 -0400
-Subject: [PATCH 23/70] chore(beads): configure fork tracker as
+Subject: [PATCH 23/73] chore(beads): configure fork tracker as
  gastown-fork/gfork
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

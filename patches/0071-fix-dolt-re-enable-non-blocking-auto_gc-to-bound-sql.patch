@@ -1,0 +1,227 @@
+From 77fbda1b67b646391618f04419e81b300a80bf80 Mon Sep 17 00:00:00 2001
+From: bear <72461227+seanbearden@users.noreply.github.com>
+Date: Wed, 15 Jul 2026 09:25:48 -0700
+Subject: [PATCH 71/73] fix(dolt): re-enable non-blocking auto_gc to bound
+ sql-server RSS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The managed Dolt sql-server had auto_gc disabled in both config generators
+(after lockups on the old blocking call dolt_gc() path), so storage GC never
+ran: every commit's chunks accumulated and Dolt kept + mmap'd each table file's
+index, growing RSS far beyond on-disk size until the host OOM-cycled it
+(band-aided by the RSS watchdog).
+
+Re-enable auto_gc {enable: true, archive_level: 1} in both generators
+(internal/doltserver/doltserver.go + internal/daemon/dolt.go). Dolt's
+non-blocking auto-GC is default-on since 1.75 (we run 1.83.2), distinct from
+the old blocking path that caused the earlier lockups. Validated off-prod on a
+copy of hq: one-time gc --full reclaimed 98.6% on disk; auto_gc under churn kept
+RSS in a bounded sawtooth, non-blocking, no lockups. The stats-V2 fix
+(dolt_stats_enabled: 0) is separate and untouched.
+
+Add a GT_DOLT_AUTO_GC kill-switch (on|off) to both generators so auto_gc can be
+disabled at the next Dolt restart without a source revert+rebuild — a runtime
+escape hatch given the old lockup history. Mirrors GT_DOLT_STATS_ENABLED.
+
+A one-time `dolt gc --full --archive-level=1` on the live DBs (maintenance
+window) resets the RSS baseline; auto_gc then keeps it bounded. (hq-excy9g)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 376b8267ea75f91ce0ed42822529d5d3fbf054da)
+---
+ internal/daemon/dolt.go                | 15 ++++++--
+ internal/doltserver/doltserver.go      | 27 +++++++++++--
+ internal/doltserver/doltserver_test.go | 52 ++++++++++++++++++++++++--
+ 3 files changed, 82 insertions(+), 12 deletions(-)
+
+diff --git a/internal/daemon/dolt.go b/internal/daemon/dolt.go
+index ec031b6c..55aef75d 100644
+--- a/internal/daemon/dolt.go
++++ b/internal/daemon/dolt.go
+@@ -868,6 +868,15 @@ func writeDaemonDoltConfig(cfg *DoltServerConfig, configPath string) error {
+ 			systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(stats))
+ 		}
+ 	}
++	// Non-blocking storage GC bounds the sql-server's RSS (hq-excy9g); on by
++	// default. GT_DOLT_AUTO_GC=off (or false/0/disabled) disables it at the next
++	// Dolt restart without a source revert+rebuild — the runtime escape hatch.
++	autoGcBlock := "  auto_gc_behavior:\n    enable: true\n    archive_level: 1\n"
++	if v, ok := os.LookupEnv("GT_DOLT_AUTO_GC"); ok {
++		if vv := strings.ToLower(strings.TrimSpace(v)); vv == "off" || vv == "false" || vv == "0" || vv == "disabled" {
++			autoGcBlock = "  auto_gc_behavior:\n    enable: false\n    archive_level: 0\n"
++		}
++	}
+ 	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town daemon
+ # Do not edit manually; overwritten on each daemon-managed server start.
+ 
+@@ -883,14 +892,12 @@ data_dir: %q
+ 
+ behavior:
+   dolt_transaction_commit: false
+-%s  auto_gc_behavior:
+-    enable: false
+-    archive_level: 0
+-%s`,
++%s%s%s`,
+ 		cfg.Port,
+ 		hostLine,
+ 		cfg.DataDir,
+ 		eventSchedulerLine,
++		autoGcBlock,
+ 		systemVariablesBlock,
+ 	)
+ 	return os.WriteFile(configPath, []byte(content), 0600)
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index 01d2d3a5..5f7a0fb2 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -265,6 +265,12 @@ type Config struct {
+ 	// config. Default is "0" to avoid background stats workers during high-churn
+ 	// agent workloads. Set to "omit" to leave the variable out of config.yaml.
+ 	DoltStatsEnabled string
++
++	// AutoGC controls Dolt's non-blocking storage GC (auto_gc_behavior) in managed
++	// config. Default "on" keeps the sql-server's RSS bounded (hq-excy9g). Set to
++	// "off" (or false/0/disabled), typically via GT_DOLT_AUTO_GC, to disable it
++	// without a source revert+rebuild — a runtime escape hatch.
++	AutoGC string
+ }
+ 
+ // DefaultConfig returns the default Dolt server configuration.
+@@ -295,6 +301,7 @@ func DefaultConfig(townRoot string) *Config {
+ 		LogLevel:         "warning",
+ 		EventScheduler:   "OFF",
+ 		DoltStatsEnabled: "0",
++		AutoGC:           "on",
+ 	}
+ 
+ 	// Optional override for the idle-session timeout. Negative values disable
+@@ -328,6 +335,9 @@ func DefaultConfig(townRoot string) *Config {
+ 	if stats, ok := os.LookupEnv("GT_DOLT_STATS_ENABLED"); ok {
+ 		config.DoltStatsEnabled = stats
+ 	}
++	if autoGc, ok := os.LookupEnv("GT_DOLT_AUTO_GC"); ok {
++		config.AutoGC = autoGc
++	}
+ 
+ 	if u := os.Getenv("GT_DOLT_USER"); u != "" {
+ 		config.User = u
+@@ -1874,12 +1884,23 @@ func writeServerConfig(config *Config, configPath string) error {
+ 		systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(config.DoltStatsEnabled))
+ 	}
+ 
++	// Non-blocking storage GC keeps the managed sql-server's RSS bounded (hq-excy9g);
++	// enabled by default. GT_DOLT_AUTO_GC=off (or false/0/disabled) turns it off at
++	// runtime (next Dolt restart) without a source revert+rebuild — the escape hatch
++	// given the old blocking-GC lockup history. Dolt's non-blocking auto-GC is
++	// default-on since 1.75.
++	autoGcBlock := "  auto_gc_behavior:\n    enable: true\n    archive_level: 1\n"
++	if v := strings.ToLower(strings.TrimSpace(config.AutoGC)); v == "off" || v == "false" || v == "0" || v == "disabled" {
++		autoGcBlock = "  auto_gc_behavior:\n    enable: false\n    archive_level: 0\n"
++	}
++
+ 	content := fmt.Sprintf(
+ 		`# Dolt SQL server configuration — managed by Gas Town (gt dolt start)
+ # Do not edit manually; changes are overwritten on each server start.
+ # To customize, set Gas Town environment variables:
+ #   GT_DOLT_PORT, GT_DOLT_HOST, GT_DOLT_USER, GT_DOLT_PASSWORD, GT_DOLT_LOGLEVEL
+ #   GT_DOLT_EVENT_SCHEDULER (OFF, ON, omit), GT_DOLT_STATS_ENABLED (0, 1, omit)
++#   GT_DOLT_AUTO_GC (on, off)
+ 
+ log_level: %s
+ 
+@@ -1890,10 +1911,7 @@ data_dir: "%s"
+ 
+ behavior:
+   dolt_transaction_commit: false
+-%s  auto_gc_behavior:
+-    enable: false
+-    archive_level: 0
+-%s`,
++%s%s%s`,
+ 		config.LogLevel,
+ 		config.Port,
+ 		hostLine,
+@@ -1902,6 +1920,7 @@ behavior:
+ 		writeTimeoutLine,
+ 		filepath.ToSlash(config.DataDir),
+ 		eventSchedulerLine,
++		autoGcBlock,
+ 		systemVariablesBlock,
+ 	)
+ 
+diff --git a/internal/doltserver/doltserver_test.go b/internal/doltserver/doltserver_test.go
+index a60d62de..377be27e 100644
+--- a/internal/doltserver/doltserver_test.go
++++ b/internal/doltserver/doltserver_test.go
+@@ -4753,17 +4753,61 @@ func TestWriteServerConfig_Defaults(t *testing.T) {
+ 	if parsed.Behavior.EventScheduler == nil || *parsed.Behavior.EventScheduler != "OFF" {
+ 		t.Fatalf("behavior.event_scheduler = %v, want OFF", parsed.Behavior.EventScheduler)
+ 	}
+-	if parsed.Behavior.AutoGCBehavior.Enable {
+-		t.Error("behavior.auto_gc_behavior.enable = true, want false")
++	if !parsed.Behavior.AutoGCBehavior.Enable {
++		t.Error("behavior.auto_gc_behavior.enable = false, want true (non-blocking auto_gc re-enabled, hq-excy9g)")
+ 	}
+-	if parsed.Behavior.AutoGCBehavior.ArchiveLevel != 0 {
+-		t.Errorf("behavior.auto_gc_behavior.archive_level = %d, want 0", parsed.Behavior.AutoGCBehavior.ArchiveLevel)
++	if parsed.Behavior.AutoGCBehavior.ArchiveLevel != 1 {
++		t.Errorf("behavior.auto_gc_behavior.archive_level = %d, want 1", parsed.Behavior.AutoGCBehavior.ArchiveLevel)
+ 	}
+ 	if parsed.SystemVariables.DoltStatsEnabled == nil || *parsed.SystemVariables.DoltStatsEnabled != 0 {
+ 		t.Fatalf("system_variables.dolt_stats_enabled = %v, want 0", parsed.SystemVariables.DoltStatsEnabled)
+ 	}
+ }
+ 
++// TestWriteServerConfig_AutoGCDisabled verifies the GT_DOLT_AUTO_GC kill-switch:
++// AutoGC="off" emits auto_gc_behavior {enable:false, archive_level:0} so auto_gc can
++// be disabled at runtime without a source revert+rebuild (hq-excy9g escape hatch).
++func TestWriteServerConfig_AutoGCDisabled(t *testing.T) {
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++
++	config := &Config{
++		Port:           3307,
++		DataDir:        dir,
++		MaxConnections: 1000,
++		ReadTimeoutMs:  DefaultReadTimeoutMs,
++		WriteTimeoutMs: DefaultWriteTimeoutMs,
++		LogLevel:       "warning",
++		AutoGC:         "off",
++	}
++
++	if err := writeServerConfig(config, configPath); err != nil {
++		t.Fatalf("writeServerConfig: %v", err)
++	}
++	data, err := os.ReadFile(configPath)
++	if err != nil {
++		t.Fatalf("reading config: %v", err)
++	}
++
++	var parsed struct {
++		Behavior struct {
++			AutoGCBehavior struct {
++				Enable       bool `yaml:"enable"`
++				ArchiveLevel int  `yaml:"archive_level"`
++			} `yaml:"auto_gc_behavior"`
++		} `yaml:"behavior"`
++	}
++	if err := yaml.Unmarshal(data, &parsed); err != nil {
++		t.Fatalf("generated config is invalid YAML: %v\n%s", err, data)
++	}
++	if parsed.Behavior.AutoGCBehavior.Enable {
++		t.Error("AutoGC=off: auto_gc_behavior.enable = true, want false")
++	}
++	if parsed.Behavior.AutoGCBehavior.ArchiveLevel != 0 {
++		t.Errorf("AutoGC=off: archive_level = %d, want 0", parsed.Behavior.AutoGCBehavior.ArchiveLevel)
++	}
++}
++
+ func TestWriteServerConfig_NoHost(t *testing.T) {
+ 	dir := t.TempDir()
+ 	configPath := filepath.Join(dir, "config.yaml")
+-- 
+2.50.1 (Apple Git-155)
+

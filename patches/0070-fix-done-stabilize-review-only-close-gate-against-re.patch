@@ -1,7 +1,7 @@
-From 2baef0a06bd33660ecc7ceb283432cf93f66af8d Mon Sep 17 00:00:00 2001
+From 7ea683e268f91d38428c0cd9e6b04ed6a73696ab Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Tue, 21 Jul 2026 11:16:15 -0400
-Subject: [PATCH 70/70] fix(done): stabilize review-only close gate against
+Subject: [PATCH 70/73] fix(done): stabilize review-only close gate against
  renovate head moves (feryn-5sa6)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

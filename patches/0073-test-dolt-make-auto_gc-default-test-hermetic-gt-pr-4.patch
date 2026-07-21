@@ -1,0 +1,28 @@
+From 032cc25c5ec541c183ba4023550108fff89ebd15 Mon Sep 17 00:00:00 2001
+From: coder <thalia.geraghty@fiserv.com>
+Date: Mon, 20 Jul 2026 14:34:03 +0000
+Subject: [PATCH 73/73] test(dolt): make auto_gc default test hermetic
+ (gt-pr-4509)
+
+(cherry picked from commit 6a02d50565f0ca93ff92071eac2e6a196d1984a6)
+---
+ internal/doltserver/doltserver_test.go | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/internal/doltserver/doltserver_test.go b/internal/doltserver/doltserver_test.go
+index fc5cfc1f..b7ad5b9e 100644
+--- a/internal/doltserver/doltserver_test.go
++++ b/internal/doltserver/doltserver_test.go
+@@ -4232,6 +4232,9 @@ func TestDefaultConfig_IgnoreConfigUsesEnvPort(t *testing.T) {
+ func TestDefaultConfig_ManagedDefaultsAndEnvOverrides(t *testing.T) {
+ 	townRoot := t.TempDir()
+ 	t.Setenv("GT_DOLT_PORT", "")
++	unsetEnv(t, "GT_DOLT_STATS_ENABLED")
++	unsetEnv(t, "GT_DOLT_EVENT_SCHEDULER")
++	unsetEnv(t, "GT_DOLT_AUTO_GC")
+ 
+ 	config := DefaultConfig(townRoot)
+ 	if config.EventScheduler != "OFF" {
+-- 
+2.50.1 (Apple Git-155)
+

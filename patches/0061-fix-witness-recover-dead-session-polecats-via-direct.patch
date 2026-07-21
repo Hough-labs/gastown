@@ -1,7 +1,7 @@
 From 22e9f624507c9124d32363eabb3a541e3bdbe739 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 22:55:46 -0400
-Subject: [PATCH 61/70] fix(witness): recover dead-session polecats via
+Subject: [PATCH 61/73] fix(witness): recover dead-session polecats via
  direct-tracking work bead (feryn-lxc6)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

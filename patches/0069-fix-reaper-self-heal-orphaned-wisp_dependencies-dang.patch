@@ -1,7 +1,7 @@
 From 9566f0bcc6efba1e68c0a6ab3e2e50effef68a2f Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Tue, 21 Jul 2026 10:52:30 -0400
-Subject: [PATCH 69/70] fix(reaper): self-heal orphaned wisp_dependencies
+Subject: [PATCH 69/73] fix(reaper): self-heal orphaned wisp_dependencies
  (dangling parent refs)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

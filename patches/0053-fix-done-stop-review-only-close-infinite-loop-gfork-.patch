@@ -1,7 +1,7 @@
 From 7840bdc992175e01bb0b2a9766674c3a3ff7e983 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:44:38 -0400
-Subject: [PATCH 53/70] fix(done): stop review-only close infinite loop
+Subject: [PATCH 53/73] fix(done): stop review-only close infinite loop
  (gfork-2cw)
 
 Review-only work is not anchored to the worktree HEAD, but the done
