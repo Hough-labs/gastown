@@ -1,7 +1,7 @@
 From 9797aa8813c7f68869dfa0158358516c31bf00e8 Mon Sep 17 00:00:00 2001
 From: coder <thalia.geraghty@fiserv.com>
 Date: Fri, 17 Jul 2026 15:54:01 +0000
-Subject: [PATCH 72/74] test(dolt): cover auto_gc config rollout (gt-pr-4509)
+Subject: [PATCH 72/75] test(dolt): cover auto_gc config rollout (gt-pr-4509)
 
 (cherry picked from commit b4f9d7cad7022c8641be48a02cbdc209043f8eec)
 ---

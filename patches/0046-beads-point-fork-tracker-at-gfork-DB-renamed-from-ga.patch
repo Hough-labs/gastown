@@ -1,7 +1,7 @@
 From 00d095523cbbb4448515059d42b8ace6557738f3 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Sat, 18 Jul 2026 15:03:21 -0400
-Subject: [PATCH 46/74] beads: point fork tracker at gfork DB (renamed from
+Subject: [PATCH 46/75] beads: point fork tracker at gfork DB (renamed from
  gastown-fork)
 
 The fork's beads DB was consolidated from 'gastown-fork' to 'gfork' so

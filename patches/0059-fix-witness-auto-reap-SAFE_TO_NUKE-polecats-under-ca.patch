@@ -1,7 +1,7 @@
 From 94812b1d160a45cad0310166b395d74283118fce Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 22:11:27 -0400
-Subject: [PATCH 59/74] fix(witness): auto-reap SAFE_TO_NUKE polecats under
+Subject: [PATCH 59/75] fix(witness): auto-reap SAFE_TO_NUKE polecats under
  capacity pressure (feryn-355z)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

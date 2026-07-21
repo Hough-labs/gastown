@@ -1,7 +1,7 @@
 From fb4fe8a17ad80243547575b57e50a5feba7577cd Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sun, 19 Jul 2026 16:51:58 -0400
-Subject: [PATCH 54/74] fix(dispatch): hold re-dispatch during post-reject
+Subject: [PATCH 54/75] fix(dispatch): hold re-dispatch during post-reject
  resubmit window (gfork-dk6)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 769457311f7070b0a83d4342092da159560efa50 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 18:00:17 -0400
-Subject: [PATCH 67/74] feat(scheduler): explain dispatch holds in gt scheduler
+Subject: [PATCH 67/75] feat(scheduler): explain dispatch holds in gt scheduler
  status
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

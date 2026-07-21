@@ -1,0 +1,228 @@
+From e2c8123c5f5f15b8f38b1ddaddb790111e196c87 Mon Sep 17 00:00:00 2001
+From: mayor <git@hough.ink>
+Date: Tue, 21 Jul 2026 16:25:25 -0400
+Subject: [PATCH 75/75] fix(done): close review-only bead when its PR merged
+ mid-close (gfork-21p)
+
+Add a "PR already MERGED -> close cleanly" short-circuit to the review-only
+close gate, before the "no fresh review evidence" escalation. This is the
+PR-merge-completes-during-close variant, distinct from 0070's renovate-rebase
+variant (feryn-5sa6).
+
+Root cause: when a PR merges DURING `gt done` (observed merge and escalate ~1s
+apart), two checks break together. currentReviewEvidenceHead() reads the
+reviewer's LOCAL worktree HEAD, which has advanced to the merge commit and no
+longer matches the approved PR head, so the head-anchored bead-comment evidence
+check misses. The reviewOnlyPRHasFreshDecision() GitHub fallback then races
+merge finalization and fails safe to false. Together they emit a spurious
+"ESCALATE: review-only close loop <id>" for a review that plainly succeeded.
+
+A merged PR trivially proves the review passed: merge safety is enforced
+INDEPENDENTLY by the merge gate (git.IsPullRequestApproved / refinery
+rejectMRBeforeMerge), so review-only close does not need strict fresh evidence
+once the PR is merged. New git.IsPullRequestMerged queries PR state directly
+(mirrors HasReviewDecisionSince, no target-repo resolution); reviewOnlyPRMerged
+wires it into the gate via the attached pr_url and fails safe to escalate on any
+absent-URL / cwd / gh error. CHANGES_REQUESTED PRs never reach MERGED, so that
+gate is intact.
+
+Tests (red->green verified): a review-only bead whose PR merges during close
+(head advanced to the merge commit, no fresh evidence, decision query races to
+empty) now CLOSES instead of escalating; an unmerged PR with no evidence still
+escalates. Both fail against the pre-fix gate for the right reason.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ internal/cmd/done.go      | 39 +++++++++++++++++++++
+ internal/cmd/done_test.go | 71 +++++++++++++++++++++++++++++++++++++++
+ internal/git/git.go       | 35 +++++++++++++++++++
+ 3 files changed, 145 insertions(+)
+
+diff --git a/internal/cmd/done.go b/internal/cmd/done.go
+index 737bd44d..b06a5632 100644
+--- a/internal/cmd/done.go
++++ b/internal/cmd/done.go
+@@ -293,6 +293,20 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
+ 		if reviewOnlyPRHasFreshDecision(attachment, reviewDecisionFreshnessBaseline(issue, assignmentAt)) {
+ 			return "", false
+ 		}
++		// gfork-21p: when the PR MERGES during `gt done` (observed ~1s between
++		// merge and escalate), two things break the checks above: the local
++		// worktree HEAD advances to the merge commit so the head-anchored
++		// evidence comment no longer matches, and reviewOnlyPRHasFreshDecision
++		// races merge finalization on GitHub and fails safe to false. A merged PR
++		// trivially proves the review passed — merge safety is enforced
++		// independently by the merge gate (git.IsPullRequestApproved / refinery
++		// rejectMRBeforeMerge; see done.go's decision-freshness note above) — so
++		// close the review task cleanly instead of false-escalating. This is the
++		// PR-merge-completes-during-close variant distinct from 0070's renovate
++		// rebase; CHANGES_REQUESTED PRs never reach MERGED, so that gate is intact.
++		if reviewOnlyPRMerged(attachment) {
++			return "", false
++		}
+ 		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
+ 	}
+ 	return "", false
+@@ -350,6 +364,31 @@ func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, since time
+ 	return ok
+ }
+ 
++// reviewOnlyPRMerged reports whether the PR referenced by a review-only bead's
++// pr_url var has already MERGED. A merged PR is proof the review passed, so the
++// review-only close gate can close the task cleanly without fresh bead-comment
++// evidence (gfork-21p). Returns false — never closes on this basis — when
++// pr_url is absent, the cwd cannot be resolved, or the gh lookup fails, so the
++// caller falls through to the escalate-and-hold path rather than false-closing.
++func reviewOnlyPRMerged(attachment *beads.AttachmentFields) bool {
++	if attachment == nil {
++		return false
++	}
++	prURL := attachedVarValue(attachment.AttachedVars, "pr_url")
++	if prURL == "" {
++		return false
++	}
++	cwd, err := os.Getwd()
++	if err != nil {
++		return false
++	}
++	merged, err := git.NewGit(cwd).IsPullRequestMerged(&git.PullRequestInfo{URL: prURL})
++	if err != nil {
++		return false
++	}
++	return merged
++}
++
+ // attachedVarValue returns the value of a key=value entry in a bead's
+ // AttachedVars (formula --var pairs), or "" if absent.
+ func attachedVarValue(vars []string, key string) string {
+diff --git a/internal/cmd/done_test.go b/internal/cmd/done_test.go
+index c0dbe276..3445a0a6 100644
+--- a/internal/cmd/done_test.go
++++ b/internal/cmd/done_test.go
+@@ -304,6 +304,77 @@ func TestReviewDecisionFreshnessBaseline(t *testing.T) {
+ 	}
+ }
+ 
++// installMergedRacePRGHStub writes a fake `gh` that reproduces the PR-merge race
++// at close time: the review-decision query (`pr view --json reviews`) returns no
++// decisions (as if the query raced merge finalization), while the merged-state
++// query (`pr view --json state`) reports MERGED. Prepended to PATH.
++func installMergedRacePRGHStub(t *testing.T) {
++	t.Helper()
++	dir := t.TempDir()
++	// `gh pr view <selector> --json <fields>`: $4 == "--json", $5 == fields.
++	script := "#!/bin/sh\n" +
++		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
++		"  case \"$*\" in\n" +
++		"    *state*) printf '%s\\n' '{\"state\":\"MERGED\"}'; exit 0 ;;\n" +
++		"    *reviews*) printf '%s\\n' '{\"reviews\":[]}'; exit 0 ;;\n" +
++		"  esac\n" +
++		"fi\n" +
++		"echo 'unexpected gh args' >&2\nexit 1\n"
++	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
++		t.Fatalf("write gh stub: %v", err)
++	}
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
++}
++
++// gfork-21p: a review-only bead whose PR MERGES during `gt done` must CLOSE, not
++// escalate. The merge advances the local HEAD (so the head-anchored comment
++// evidence misses) and the GitHub review-decision fallback races merge
++// finalization and finds nothing — yet the PR is merged, which proves the review
++// passed. The merged-state short-circuit closes the task cleanly.
++func TestReviewOnlyCloseAllowsMergedPRDuringCloseRace(t *testing.T) {
++	installMergedRacePRGHStub(t)
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		CreatedAt:   "2026-07-01T12:00:00Z",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
++		Assignee:    "gastown/polecats/nitro",
++		// No fresh bead-comment evidence; head advanced to the merge commit.
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "mergecommit")
++	if reason != "" || fatal {
++		t.Fatalf("merged PR must close the review task, not escalate: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
++// A review-only bead whose PR is NOT merged and carries no fresh evidence must
++// still escalate — the merged short-circuit must not weaken the gate for open
++// PRs (e.g. a genuine CHANGES_REQUESTED that never reached MERGED).
++func TestReviewOnlyCloseUnmergedNoEvidenceStillEscalates(t *testing.T) {
++	dir := t.TempDir()
++	script := "#!/bin/sh\n" +
++		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
++		"  case \"$*\" in\n" +
++		"    *state*) printf '%s\\n' '{\"state\":\"OPEN\"}'; exit 0 ;;\n" +
++		"    *reviews*) printf '%s\\n' '{\"reviews\":[]}'; exit 0 ;;\n" +
++		"  esac\n" +
++		"fi\n" +
++		"echo 'unexpected gh args' >&2\nexit 1\n"
++	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
++		t.Fatalf("write gh stub: %v", err)
++	}
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
++	issue := &beads.Issue{
++		ID:          "gt-review",
++		CreatedAt:   "2026-07-01T12:00:00Z",
++		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
++		Assignee:    "gastown/polecats/nitro",
++	}
++	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
++	if reason == "" || !fatal {
++		t.Fatalf("unmerged PR with no evidence must still escalate: reason=%q fatal=%v", reason, fatal)
++	}
++}
++
+ // Without a pr_url var there is nothing to check on GitHub; the gate falls back
+ // to the existing evidence-missing escalation.
+ func TestReviewOnlyCloseNoPRURLFallsThrough(t *testing.T) {
+diff --git a/internal/git/git.go b/internal/git/git.go
+index 346051c6..38fc66cc 100644
+--- a/internal/git/git.go
++++ b/internal/git/git.go
+@@ -1679,6 +1679,41 @@ func (g *Git) HasReviewDecisionSince(pr *PullRequestInfo, since time.Time) (bool
+ 	return false, nil
+ }
+ 
++// IsPullRequestMerged reports whether the PR has been merged on GitHub.
++//
++// Used by the review-only close gate (gfork-21p): when a PR merges DURING
++// `gt done`, the reviewer's local worktree HEAD advances to the merge commit
++// (so the head-anchored bead-comment evidence check misses) and the
++// HasReviewDecisionSince fallback races merge finalization and fails safe to
++// false — together producing a spurious "no fresh review evidence" escalation
++// for a review that plainly succeeded. A merged PR is proof the review passed:
++// the merge gate (IsPullRequestApproved / refinery rejectMRBeforeMerge)
++// enforces approval independently before any merge. Kept deliberately narrow
++// (state only) and mirrors HasReviewDecisionSince's direct-selector query so it
++// needs no target-repo resolution.
++func (g *Git) IsPullRequestMerged(pr *PullRequestInfo) (bool, error) {
++	if pr == nil || (pr.Number == 0 && pr.URL == "") {
++		return false, fmt.Errorf("pull request identity is missing")
++	}
++	args := []string{"pr", "view", pullRequestSelector(pr), "--json", "state"}
++	if pr.BaseRepo != "" {
++		args = append(args, "--repo", pr.BaseRepo)
++	}
++	cmd := exec.Command("gh", args...)
++	cmd.Dir = g.workDir
++	out, err := cmd.Output()
++	if err != nil {
++		return false, fmt.Errorf("gh pr view failed: %w", err)
++	}
++	var result struct {
++		State string `json:"state"`
++	}
++	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
++		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
++	}
++	return strings.EqualFold(result.State, "MERGED"), nil
++}
++
+ // parseGitHubTime parses a GitHub RFC3339 timestamp, tolerating optional
+ // fractional seconds.
+ func parseGitHubTime(ts string) (time.Time, error) {
+-- 
+2.50.1 (Apple Git-155)
+

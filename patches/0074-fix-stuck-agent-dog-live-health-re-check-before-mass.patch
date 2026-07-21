@@ -1,7 +1,7 @@
 From 96fee49dac41ef2ed52b56631dcfe1630cf27447 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Tue, 21 Jul 2026 15:16:41 -0400
-Subject: [PATCH 74/74] fix(stuck-agent-dog): live-health re-check before
+Subject: [PATCH 74/75] fix(stuck-agent-dog): live-health re-check before
  mass-death escalation (gfork-nzv)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
