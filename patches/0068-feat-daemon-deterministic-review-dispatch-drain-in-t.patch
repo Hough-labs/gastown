@@ -1,7 +1,7 @@
 From 7f9b5560c67943f1310ca7dd5a0a09a1b14c1f44 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 19:42:43 -0400
-Subject: [PATCH 68/73] feat(daemon): deterministic review-dispatch drain in
+Subject: [PATCH 68/74] feat(daemon): deterministic review-dispatch drain in
  the heartbeat (feryn-8uxb / hq-u9r0k)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

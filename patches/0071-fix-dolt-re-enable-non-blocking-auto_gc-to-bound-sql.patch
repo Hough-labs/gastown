@@ -1,7 +1,7 @@
 From 77fbda1b67b646391618f04419e81b300a80bf80 Mon Sep 17 00:00:00 2001
 From: bear <72461227+seanbearden@users.noreply.github.com>
 Date: Wed, 15 Jul 2026 09:25:48 -0700
-Subject: [PATCH 71/73] fix(dolt): re-enable non-blocking auto_gc to bound
+Subject: [PATCH 71/74] fix(dolt): re-enable non-blocking auto_gc to bound
  sql-server RSS
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

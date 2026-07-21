@@ -1,7 +1,7 @@
 From 6e30e95bf02b7f4ff27a5b477ffc606f0d7b631d Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 12:14:01 -0400
-Subject: [PATCH 62/73] witness: run orphaned-bead recovery on every patrol
+Subject: [PATCH 62/74] witness: run orphaned-bead recovery on every patrol
  scan (feryn-ktm0)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

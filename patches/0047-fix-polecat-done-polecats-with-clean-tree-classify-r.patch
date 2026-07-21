@@ -1,7 +1,7 @@
 From 4a1cbcc85c0173314aeeb10bd66084d4a13e68e4 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Sat, 18 Jul 2026 16:00:01 -0400
-Subject: [PATCH 47/73] fix(polecat): done polecats with clean tree classify
+Subject: [PATCH 47/74] fix(polecat): done polecats with clean tree classify
  reusable, not NEEDS_RECOVERY (hq-z7j0)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

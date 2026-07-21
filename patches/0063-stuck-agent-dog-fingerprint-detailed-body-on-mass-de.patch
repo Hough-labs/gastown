@@ -1,7 +1,7 @@
 From be0d3b0ad6782b3633dc8b4c84dca160c978cb27 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 13:44:32 -0400
-Subject: [PATCH 63/73] stuck-agent-dog: fingerprint + detailed body on
+Subject: [PATCH 63/74] stuck-agent-dog: fingerprint + detailed body on
  mass-death escalation (feryn-l0ga)
 
 The mass-death escalation fired with an EMPTY body and NO --fingerprint, so

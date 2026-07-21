@@ -1,7 +1,7 @@
 From 16b93a6c811a4ea338c76673f4cd63c649988d80 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Wed, 8 Jul 2026 19:49:37 -0400
-Subject: [PATCH 34/73] fix(refinery): Engineer.LoadConfig reads
+Subject: [PATCH 34/74] fix(refinery): Engineer.LoadConfig reads
  settings/config.json, not rig-root (gfork-hgx)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

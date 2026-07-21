@@ -1,0 +1,334 @@
+From 96fee49dac41ef2ed52b56631dcfe1630cf27447 Mon Sep 17 00:00:00 2001
+From: Hunter B Hough <git@hough.ink>
+Date: Tue, 21 Jul 2026 15:16:41 -0400
+Subject: [PATCH 74/74] fix(stuck-agent-dog): live-health re-check before
+ mass-death escalation (gfork-nzv)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Graft upstream 329633fc's pre-escalation re-check onto the fork's run.sh. When
+the raw crashed+stuck count hits the mass-death threshold, re-probe each
+candidate's live health and escalate only on the still-confirmed-down count.
+The enumeration scan is not instantaneous across a large town, and an agent the
+witness restarts mid-scan must not drag the whole town into a CRITICAL
+escalation that SUPPRESSES the very restarts that would recover it. Recovered
+agents drop out of CRASHED/STUCK, so they are neither escalated nor needlessly
+restarted.
+
+Reconciled onto OUR structure, not a straight cherry-pick: upstream's version
+lacks the check-recovery "done != crashed" guard (polecat_completed_not_crashed,
+hq-2eqe) and our detailed, fingerprinted escalation body (feryn-l0ga). The
+re-check adapts upstream's confirm_polecat_outages to our helpers
+(rig_hook_bead/bead_restartable) and reuses the completed-work exemption, so a
+done-but-MR-pending polecat is still exempt during the re-check too.
+
+Deliberately NOT pulled: upstream's operational-rig enumeration filter and the
+0e3812a6/bd76c2cb doc-contract commits — separate concerns, bigger blast radius,
+tracked separately.
+
+Tests: run_test.sh gains a suppression test (agents recover mid-scan -> below
+threshold -> no escalation, still-down agent restarts) and a persistent-death
+regression test. Red-green verified: the suppression test fails against the
+pre-reconcile run.sh for the right reason. 58 assertions pass; shellcheck clean.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/stuck-agent-dog/plugin.md   |  22 +++-
+ plugins/stuck-agent-dog/run.sh      | 159 ++++++++++++++++++++--------
+ plugins/stuck-agent-dog/run_test.sh |  43 +++++++-
+ 3 files changed, 176 insertions(+), 48 deletions(-)
+
+diff --git a/plugins/stuck-agent-dog/plugin.md b/plugins/stuck-agent-dog/plugin.md
+index ff66a0b6..d1121e8f 100644
+--- a/plugins/stuck-agent-dog/plugin.md
++++ b/plugins/stuck-agent-dog/plugin.md
+@@ -264,14 +264,28 @@ issue (Dolt outage, OOM, etc.). Escalate instead of blindly restarting all.
+ The executable script checks this before per-agent actions and skips all
+ restart/kill loops for that cycle.
+ 
++Because the enumeration scan is not instantaneous and the witness may restart a
++crashed polecat mid-scan, the script re-probes each candidate's live health once
++the raw threshold is reached and escalates only on the still-confirmed-down
++count. Agents that recovered during the scan drop out and restart normally
++instead of dragging the town into a restart-suppressing CRITICAL escalation on
++stale data.
++
+ ```bash
+ TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
+ MASS_DEATH=0
+ if [ "$TOTAL_ISSUES" -ge "${GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD:-3}" ]; then
+-  MASS_DEATH=1
+-  echo "MASS DEATH: $TOTAL_ISSUES agents down in same cycle — escalating"
+-  gt escalate "Mass agent death: $TOTAL_ISSUES agents down" -s CRITICAL
+-  echo "Skipping per-agent restart/kill actions during mass-death escalation"
++  confirm_polecat_outages                         # re-probe live health
++  CRASHED=(...confirmed...); STUCK=(...confirmed...)
++  CONFIRMED_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
++  if [ "$CONFIRMED_TOTAL" -ge "${GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD:-3}" ]; then
++    MASS_DEATH=1
++    echo "MASS DEATH: $CONFIRMED_TOTAL agents down confirmed — escalating"
++    gt escalate "Mass agent death: $CONFIRMED_TOTAL agents down" -s CRITICAL
++    echo "Skipping per-agent restart/kill actions during mass-death escalation"
++  else
++    echo "NOTICE: candidates dropped to $CONFIRMED_TOTAL after re-check; no escalation"
++  fi
+ fi
+ ```
+ 
+diff --git a/plugins/stuck-agent-dog/run.sh b/plugins/stuck-agent-dog/run.sh
+index c29377fc..bc895d64 100755
+--- a/plugins/stuck-agent-dog/run.sh
++++ b/plugins/stuck-agent-dog/run.sh
+@@ -193,6 +193,64 @@ session_health_status() {
+   printf '%s\n' "$status"
+ }
+ 
++# --- Mass-death re-check ------------------------------------------------------
++# Before firing a CRITICAL mass-death escalation (which SUPPRESSES every restart
++# this cycle), re-probe each candidate's live health. The enumeration scan is not
++# instantaneous across a large town, and the witness may restart a crashed
++# polecat mid-scan; without a second look the dog escalates on stale data and
++# then wedges the whole town by suppressing the very restarts that would recover
++# it. Only agents STILL confirmed down after the re-check count toward mass death;
++# recovered ones fall out of CRASHED/STUCK so they are neither escalated nor
++# needlessly restarted. Ported from upstream 329633fc, adapted to reuse this
++# fork's helpers (rig_hook_bead/bead_restartable) and the check-recovery
++# "done != crashed" guard (polecat_completed_not_crashed, hq-2eqe) that upstream
++# lacks — so the re-check inherits the same completed-work exemption as the scan.
++confirm_current_polecat_outage() {
++  local session="$1" rig="$2" pcat="$3" health_status="" hook_bead=""
++
++  health_status=$(session_health_status "$session" || true)
++  case "$health_status" in
++    session-dead|session_dead|agent-dead|agent_dead)
++      if polecat_completed_not_crashed "$rig" "$pcat"; then
++        log "  NOTICE: $session completed work (MR pending or reusable) — not a crash"
++        return 0
++      fi
++      hook_bead=$(rig_hook_bead "$rig" "$pcat")
++      [ -n "$hook_bead" ] || return 0
++      bead_restartable "$session" "$rig" "$hook_bead" || return 0
++      case "$health_status" in
++        session-dead|session_dead) CONFIRMED_CRASHED+=("$session|$rig|$pcat|$hook_bead") ;;
++        *) CONFIRMED_STUCK+=("$session|$rig|$pcat|$hook_bead|agent_dead") ;;
++      esac
++      ;;
++    healthy|agent-hung|agent_hung)
++      log "  NOTICE: $session recovered before mass-death escalation (health=$health_status)"
++      ;;
++    *)
++      log "  NOTICE: $session not confirmed before mass-death escalation (health=${health_status:-unknown})"
++      ;;
++  esac
++}
++
++confirm_polecat_outages() {
++  local entry="" session="" rig="" pcat="" _hook="" _reason=""
++
++  CONFIRMED_CRASHED=()
++  CONFIRMED_STUCK=()
++
++  for entry in ${CRASHED[@]+"${CRASHED[@]}"}; do
++    [ -n "$entry" ] || continue
++    IFS='|' read -r session rig pcat _hook <<< "$entry"
++    confirm_current_polecat_outage "$session" "$rig" "$pcat"
++  done
++
++  for entry in ${STUCK[@]+"${STUCK[@]}"}; do
++    [ -n "$entry" ] || continue
++    IFS='|' read -r session rig pcat _hook _reason <<< "$entry"
++    confirm_current_polecat_outage "$session" "$rig" "$pcat"
++  done
++}
++
+ # --- Enumerate agents ---------------------------------------------------------
+ 
+ log "=== Checking agent health ==="
+@@ -342,50 +400,65 @@ fi
+ TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
+ MASS_DEATH=0
+ if [ "$TOTAL_ISSUES" -ge "$MASS_DEATH_THRESHOLD" ]; then
+-  MASS_DEATH=1
++  # Re-probe live health before escalating (see confirm_polecat_outages above):
++  # an agent the witness restarts mid-scan must not drag the whole town into a
++  # restart-suppressing CRITICAL escalation on stale enumeration data. Rebuild
++  # CRASHED/STUCK from only the still-down set so a recovered agent is neither
++  # escalated here nor needlessly restarted in the action section below.
+   log ""
+-  log "MASS DEATH: $TOTAL_ISSUES agents down — escalating instead of restarting"
+-
+-  # feryn-l0ga: this escalation used to fire with an EMPTY body and NO
+-  # --fingerprint, so (1) the mayor had to investigate blind which agents were
+-  # "down", and (2) every 5m patrol that re-observed the same persistent
+-  # crashed/stuck set spawned a BRAND-NEW CRITICAL escalation — a self-
+-  # perpetuating storm (restarts are suppressed below, so the condition never
+-  # self-clears, so it re-fires forever). A stable --fingerprint collapses the
+-  # repeated detections into a single open escalation (same dedup the sibling
+-  # deacon escalation already uses), and the body now names the offending
+-  # agents + per-agent reason so the response is actionable.
+-  {
+-    echo "$TOTAL_ISSUES agent(s) down (>= mass-death threshold $MASS_DEATH_THRESHOLD)."
+-    echo "Per-agent restarts are SUPPRESSED this cycle to avoid a restart storm."
+-    echo "A count this high often means a systemic cause (OOM, dolt outage, host pressure) rather than independent crashes — investigate that first."
+-    echo ""
+-    echo "Crashed (session dead, work still on hook):"
+-    if [ "${#CRASHED[@]}" -eq 0 ]; then
+-      echo "  (none)"
+-    else
+-      for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
+-        IFS='|' read -r C_SESSION C_RIG C_PCAT C_HOOK <<< "$ENTRY"
+-        echo "  - $C_RIG/polecats/$C_PCAT (session=$C_SESSION, hook=$C_HOOK): session-dead"
+-      done
+-    fi
+-    echo ""
+-    echo "Stuck/zombie (runtime dead, work still on hook):"
+-    if [ "${#STUCK[@]}" -eq 0 ]; then
+-      echo "  (none)"
+-    else
+-      for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
+-        IFS='|' read -r S_SESSION S_RIG S_PCAT S_HOOK S_REASON <<< "$ENTRY"
+-        echo "  - $S_RIG/polecats/$S_PCAT (session=$S_SESSION, hook=$S_HOOK): ${S_REASON:-zombie}"
+-      done
+-    fi
+-    echo ""
+-    echo "Action: rule out a systemic cause, then recover the stranded work (gt deacon redispatch <bead> or witness recovery). Restarts stay suppressed until this clears; close the escalation once capacity is restored."
+-  } | gt escalate "Mass agent death: $TOTAL_ISSUES agents down" \
+-    -s CRITICAL \
+-    --source "plugin:stuck-agent-dog" \
+-    --fingerprint "stuck-agent-dog:mass-death" \
+-    --stdin 2>/dev/null || true
++  log "Mass-death candidate threshold reached ($TOTAL_ISSUES); re-checking live health before escalation"
++  confirm_polecat_outages
++  CRASHED=(${CONFIRMED_CRASHED[@]+"${CONFIRMED_CRASHED[@]}"})
++  STUCK=(${CONFIRMED_STUCK[@]+"${CONFIRMED_STUCK[@]}"})
++  CONFIRMED_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
++
++  if [ "$CONFIRMED_TOTAL" -lt "$MASS_DEATH_THRESHOLD" ]; then
++    log "NOTICE: mass-death candidates dropped to $CONFIRMED_TOTAL after live re-check; no CRITICAL escalation — any still-down agents restart normally below"
++  else
++    MASS_DEATH=1
++    log "MASS DEATH: $CONFIRMED_TOTAL agents down confirmed — escalating instead of restarting"
++
++    # feryn-l0ga: this escalation used to fire with an EMPTY body and NO
++    # --fingerprint, so (1) the mayor had to investigate blind which agents were
++    # "down", and (2) every 5m patrol that re-observed the same persistent
++    # crashed/stuck set spawned a BRAND-NEW CRITICAL escalation — a self-
++    # perpetuating storm (restarts are suppressed below, so the condition never
++    # self-clears, so it re-fires forever). A stable --fingerprint collapses the
++    # repeated detections into a single open escalation (same dedup the sibling
++    # deacon escalation already uses), and the body now names the offending
++    # agents + per-agent reason so the response is actionable.
++    {
++      echo "$CONFIRMED_TOTAL agent(s) confirmed down after a live re-check (>= mass-death threshold $MASS_DEATH_THRESHOLD)."
++      echo "Per-agent restarts are SUPPRESSED this cycle to avoid a restart storm."
++      echo "A count this high often means a systemic cause (OOM, dolt outage, host pressure) rather than independent crashes — investigate that first."
++      echo ""
++      echo "Crashed (session dead, work still on hook):"
++      if [ "${#CRASHED[@]}" -eq 0 ]; then
++        echo "  (none)"
++      else
++        for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
++          IFS='|' read -r C_SESSION C_RIG C_PCAT C_HOOK <<< "$ENTRY"
++          echo "  - $C_RIG/polecats/$C_PCAT (session=$C_SESSION, hook=$C_HOOK): session-dead"
++        done
++      fi
++      echo ""
++      echo "Stuck/zombie (runtime dead, work still on hook):"
++      if [ "${#STUCK[@]}" -eq 0 ]; then
++        echo "  (none)"
++      else
++        for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
++          IFS='|' read -r S_SESSION S_RIG S_PCAT S_HOOK S_REASON <<< "$ENTRY"
++          echo "  - $S_RIG/polecats/$S_PCAT (session=$S_SESSION, hook=$S_HOOK): ${S_REASON:-zombie}"
++        done
++      fi
++      echo ""
++      echo "Action: rule out a systemic cause, then recover the stranded work (gt deacon redispatch <bead> or witness recovery). Restarts stay suppressed until this clears; close the escalation once capacity is restored."
++    } | gt escalate "Mass agent death: $CONFIRMED_TOTAL agents down" \
++      -s CRITICAL \
++      --source "plugin:stuck-agent-dog" \
++      --fingerprint "stuck-agent-dog:mass-death" \
++      --stdin 2>/dev/null || true
++  fi
+ fi
+ 
+ # --- Take action --------------------------------------------------------------
+diff --git a/plugins/stuck-agent-dog/run_test.sh b/plugins/stuck-agent-dog/run_test.sh
+index 20e1af81..afb7a7d3 100644
+--- a/plugins/stuck-agent-dog/run_test.sh
++++ b/plugins/stuck-agent-dog/run_test.sh
+@@ -133,6 +133,13 @@ case "${1:-}" in
+       if [ -f "$TEST_STATE/health/$session" ]; then
+         status=$(tr -d '\n' < "$TEST_STATE/health/$session")
+       fi
++      # Re-check simulation: after the first probe of a session, switch to its
++      # "health_after" status if one is set. Models an agent that recovers
++      # between the enumeration scan and the pre-escalation live re-check.
++      prior=$(grep -c "^$session --" "$TEST_STATE/health_calls.log" 2>/dev/null || true)
++      if [ "${prior:-0}" -ge 1 ] && [ -f "$TEST_STATE/health_after/$session" ]; then
++        status=$(tr -d '\n' < "$TEST_STATE/health_after/$session")
++      fi
+       printf '%s --max-inactivity %s\n' "$session" "$max_inactivity" >> "$TEST_STATE/health_calls.log"
+       healthy=false
+       zombie=false
+@@ -252,7 +259,7 @@ setup_case() {
+   export GT_TOWN_ROOT="$TEST_TMP/town"
+   local bin_dir="$TEST_TMP/bin"
+ 
+-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
++  mkdir -p "$TEST_STATE/health" "$TEST_STATE/health_after" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
+   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
+   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
+   : > "$TEST_STATE/mail.log"
+@@ -419,6 +426,38 @@ test_mass_death_skips_actions() {
+   assert_file_contains "$TEST_STATE/output.log" "Skipping per-agent restart/kill actions" "mass death: action loops skipped"
+ }
+ 
++test_mass_death_recheck_suppresses_recovered() {
++  setup_case
++  # Three polecats look dead during the enumeration scan...
++  add_polecat alpha agent-dead
++  add_polecat beta agent-dead
++  add_polecat gamma agent-dead
++  # ...but two recover (e.g. the witness restarted them) by the time the
++  # pre-escalation live re-check runs.
++  printf 'healthy\n' > "$TEST_STATE/health_after/gt-beta"
++  printf 'healthy\n' > "$TEST_STATE/health_after/gt-gamma"
++  run_script
++
++  assert_file_empty "$TEST_STATE/escalate.log" "recheck: recovered agents drop below threshold, no mass-death escalation"
++  assert_file_contains "$TEST_STATE/output.log" "dropped to 1 after live re-check" "recheck: logged the drop below threshold"
++  assert_file_contains "$TEST_STATE/output.log" "recovered before mass-death escalation" "recheck: noted the recovered agents"
++  # The one still-down agent is restarted normally instead of being suppressed.
++  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/alpha" "recheck: still-down agent restarted normally"
++}
++
++test_mass_death_recheck_confirms_persistent() {
++  setup_case
++  # All three remain dead through the re-check (no health_after overrides).
++  add_polecat alpha agent-dead
++  add_polecat beta agent-dead
++  add_polecat gamma agent-dead
++  run_script
++
++  assert_line_count "$TEST_STATE/escalate.log" 1 "persistent mass death: one escalation after re-check"
++  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 agents down" "persistent mass death: confirmed count in title"
++  assert_file_empty "$TEST_STATE/mail.log" "persistent mass death: restarts suppressed"
++}
++
+ test_healthy_runtime opencode
+ test_healthy_runtime bun
+ test_healthy_runtime node
+@@ -433,6 +472,8 @@ test_needs_recovery_still_restarts
+ test_open_active_mr_skips_restart
+ test_merged_active_mr_does_not_skip
+ test_mass_death_skips_actions
++test_mass_death_recheck_suppresses_recovered
++test_mass_death_recheck_confirms_persistent
+ 
+ printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+ [ "$FAIL" -eq 0 ]
+-- 
+2.50.1 (Apple Git-155)
+

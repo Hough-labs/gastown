@@ -1,7 +1,7 @@
 From 1b6ae968f84a94cca9dd7e49d887309eddb34cfb Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Thu, 9 Jul 2026 15:41:48 -0400
-Subject: [PATCH 36/73] test(prime): reconcile refinery carve-out assertion
+Subject: [PATCH 36/74] test(prime): reconcile refinery carve-out assertion
  with upstream safety-stop gate
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
