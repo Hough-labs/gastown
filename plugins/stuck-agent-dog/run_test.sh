@@ -133,6 +133,13 @@ case "${1:-}" in
       if [ -f "$TEST_STATE/health/$session" ]; then
         status=$(tr -d '\n' < "$TEST_STATE/health/$session")
       fi
+      # Re-check simulation: after the first probe of a session, switch to its
+      # "health_after" status if one is set. Models an agent that recovers
+      # between the enumeration scan and the pre-escalation live re-check.
+      prior=$(grep -c "^$session --" "$TEST_STATE/health_calls.log" 2>/dev/null || true)
+      if [ "${prior:-0}" -ge 1 ] && [ -f "$TEST_STATE/health_after/$session" ]; then
+        status=$(tr -d '\n' < "$TEST_STATE/health_after/$session")
+      fi
       printf '%s --max-inactivity %s\n' "$session" "$max_inactivity" >> "$TEST_STATE/health_calls.log"
       healthy=false
       zombie=false
@@ -252,7 +259,7 @@ setup_case() {
   export GT_TOWN_ROOT="$TEST_TMP/town"
   local bin_dir="$TEST_TMP/bin"
 
-  mkdir -p "$TEST_STATE/health" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
+  mkdir -p "$TEST_STATE/health" "$TEST_STATE/health_after" "$TEST_STATE/nohook" "$TEST_STATE/sessions" "$TEST_STATE/status" "$TEST_STATE/verdict" "$TEST_STATE/active_mr" "$bin_dir"
   mkdir -p "$GT_TOWN_ROOT/gastown/polecats" "$GT_TOWN_ROOT/deacon"
   printf '{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}\n' > "$GT_TOWN_ROOT/rigs.json"
   : > "$TEST_STATE/mail.log"
@@ -419,6 +426,38 @@ test_mass_death_skips_actions() {
   assert_file_contains "$TEST_STATE/output.log" "Skipping per-agent restart/kill actions" "mass death: action loops skipped"
 }
 
+test_mass_death_recheck_suppresses_recovered() {
+  setup_case
+  # Three polecats look dead during the enumeration scan...
+  add_polecat alpha agent-dead
+  add_polecat beta agent-dead
+  add_polecat gamma agent-dead
+  # ...but two recover (e.g. the witness restarted them) by the time the
+  # pre-escalation live re-check runs.
+  printf 'healthy\n' > "$TEST_STATE/health_after/gt-beta"
+  printf 'healthy\n' > "$TEST_STATE/health_after/gt-gamma"
+  run_script
+
+  assert_file_empty "$TEST_STATE/escalate.log" "recheck: recovered agents drop below threshold, no mass-death escalation"
+  assert_file_contains "$TEST_STATE/output.log" "dropped to 1 after live re-check" "recheck: logged the drop below threshold"
+  assert_file_contains "$TEST_STATE/output.log" "recovered before mass-death escalation" "recheck: noted the recovered agents"
+  # The one still-down agent is restarted normally instead of being suppressed.
+  assert_file_contains "$TEST_STATE/mail.log" "RESTART_POLECAT: gastown/alpha" "recheck: still-down agent restarted normally"
+}
+
+test_mass_death_recheck_confirms_persistent() {
+  setup_case
+  # All three remain dead through the re-check (no health_after overrides).
+  add_polecat alpha agent-dead
+  add_polecat beta agent-dead
+  add_polecat gamma agent-dead
+  run_script
+
+  assert_line_count "$TEST_STATE/escalate.log" 1 "persistent mass death: one escalation after re-check"
+  assert_file_contains "$TEST_STATE/escalate.log" "Mass agent death: 3 agents down" "persistent mass death: confirmed count in title"
+  assert_file_empty "$TEST_STATE/mail.log" "persistent mass death: restarts suppressed"
+}
+
 test_healthy_runtime opencode
 test_healthy_runtime bun
 test_healthy_runtime node
@@ -433,6 +472,8 @@ test_needs_recovery_still_restarts
 test_open_active_mr_skips_restart
 test_merged_active_mr_does_not_skip
 test_mass_death_skips_actions
+test_mass_death_recheck_suppresses_recovered
+test_mass_death_recheck_confirms_persistent
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

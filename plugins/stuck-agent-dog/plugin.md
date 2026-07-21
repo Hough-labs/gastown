@@ -264,14 +264,28 @@ issue (Dolt outage, OOM, etc.). Escalate instead of blindly restarting all.
 The executable script checks this before per-agent actions and skips all
 restart/kill loops for that cycle.
 
+Because the enumeration scan is not instantaneous and the witness may restart a
+crashed polecat mid-scan, the script re-probes each candidate's live health once
+the raw threshold is reached and escalates only on the still-confirmed-down
+count. Agents that recovered during the scan drop out and restart normally
+instead of dragging the town into a restart-suppressing CRITICAL escalation on
+stale data.
+
 ```bash
 TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
 MASS_DEATH=0
 if [ "$TOTAL_ISSUES" -ge "${GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD:-3}" ]; then
-  MASS_DEATH=1
-  echo "MASS DEATH: $TOTAL_ISSUES agents down in same cycle — escalating"
-  gt escalate "Mass agent death: $TOTAL_ISSUES agents down" -s CRITICAL
-  echo "Skipping per-agent restart/kill actions during mass-death escalation"
+  confirm_polecat_outages                         # re-probe live health
+  CRASHED=(...confirmed...); STUCK=(...confirmed...)
+  CONFIRMED_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
+  if [ "$CONFIRMED_TOTAL" -ge "${GT_STUCK_AGENT_DOG_MASS_DEATH_THRESHOLD:-3}" ]; then
+    MASS_DEATH=1
+    echo "MASS DEATH: $CONFIRMED_TOTAL agents down confirmed — escalating"
+    gt escalate "Mass agent death: $CONFIRMED_TOTAL agents down" -s CRITICAL
+    echo "Skipping per-agent restart/kill actions during mass-death escalation"
+  else
+    echo "NOTICE: candidates dropped to $CONFIRMED_TOTAL after re-check; no escalation"
+  fi
 fi
 ```
 

@@ -193,6 +193,64 @@ session_health_status() {
   printf '%s\n' "$status"
 }
 
+# --- Mass-death re-check ------------------------------------------------------
+# Before firing a CRITICAL mass-death escalation (which SUPPRESSES every restart
+# this cycle), re-probe each candidate's live health. The enumeration scan is not
+# instantaneous across a large town, and the witness may restart a crashed
+# polecat mid-scan; without a second look the dog escalates on stale data and
+# then wedges the whole town by suppressing the very restarts that would recover
+# it. Only agents STILL confirmed down after the re-check count toward mass death;
+# recovered ones fall out of CRASHED/STUCK so they are neither escalated nor
+# needlessly restarted. Ported from upstream 329633fc, adapted to reuse this
+# fork's helpers (rig_hook_bead/bead_restartable) and the check-recovery
+# "done != crashed" guard (polecat_completed_not_crashed, hq-2eqe) that upstream
+# lacks — so the re-check inherits the same completed-work exemption as the scan.
+confirm_current_polecat_outage() {
+  local session="$1" rig="$2" pcat="$3" health_status="" hook_bead=""
+
+  health_status=$(session_health_status "$session" || true)
+  case "$health_status" in
+    session-dead|session_dead|agent-dead|agent_dead)
+      if polecat_completed_not_crashed "$rig" "$pcat"; then
+        log "  NOTICE: $session completed work (MR pending or reusable) — not a crash"
+        return 0
+      fi
+      hook_bead=$(rig_hook_bead "$rig" "$pcat")
+      [ -n "$hook_bead" ] || return 0
+      bead_restartable "$session" "$rig" "$hook_bead" || return 0
+      case "$health_status" in
+        session-dead|session_dead) CONFIRMED_CRASHED+=("$session|$rig|$pcat|$hook_bead") ;;
+        *) CONFIRMED_STUCK+=("$session|$rig|$pcat|$hook_bead|agent_dead") ;;
+      esac
+      ;;
+    healthy|agent-hung|agent_hung)
+      log "  NOTICE: $session recovered before mass-death escalation (health=$health_status)"
+      ;;
+    *)
+      log "  NOTICE: $session not confirmed before mass-death escalation (health=${health_status:-unknown})"
+      ;;
+  esac
+}
+
+confirm_polecat_outages() {
+  local entry="" session="" rig="" pcat="" _hook="" _reason=""
+
+  CONFIRMED_CRASHED=()
+  CONFIRMED_STUCK=()
+
+  for entry in ${CRASHED[@]+"${CRASHED[@]}"}; do
+    [ -n "$entry" ] || continue
+    IFS='|' read -r session rig pcat _hook <<< "$entry"
+    confirm_current_polecat_outage "$session" "$rig" "$pcat"
+  done
+
+  for entry in ${STUCK[@]+"${STUCK[@]}"}; do
+    [ -n "$entry" ] || continue
+    IFS='|' read -r session rig pcat _hook _reason <<< "$entry"
+    confirm_current_polecat_outage "$session" "$rig" "$pcat"
+  done
+}
+
 # --- Enumerate agents ---------------------------------------------------------
 
 log "=== Checking agent health ==="
@@ -342,50 +400,65 @@ fi
 TOTAL_ISSUES=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
 MASS_DEATH=0
 if [ "$TOTAL_ISSUES" -ge "$MASS_DEATH_THRESHOLD" ]; then
-  MASS_DEATH=1
+  # Re-probe live health before escalating (see confirm_polecat_outages above):
+  # an agent the witness restarts mid-scan must not drag the whole town into a
+  # restart-suppressing CRITICAL escalation on stale enumeration data. Rebuild
+  # CRASHED/STUCK from only the still-down set so a recovered agent is neither
+  # escalated here nor needlessly restarted in the action section below.
   log ""
-  log "MASS DEATH: $TOTAL_ISSUES agents down — escalating instead of restarting"
+  log "Mass-death candidate threshold reached ($TOTAL_ISSUES); re-checking live health before escalation"
+  confirm_polecat_outages
+  CRASHED=(${CONFIRMED_CRASHED[@]+"${CONFIRMED_CRASHED[@]}"})
+  STUCK=(${CONFIRMED_STUCK[@]+"${CONFIRMED_STUCK[@]}"})
+  CONFIRMED_TOTAL=$(( ${#CRASHED[@]} + ${#STUCK[@]} ))
 
-  # feryn-l0ga: this escalation used to fire with an EMPTY body and NO
-  # --fingerprint, so (1) the mayor had to investigate blind which agents were
-  # "down", and (2) every 5m patrol that re-observed the same persistent
-  # crashed/stuck set spawned a BRAND-NEW CRITICAL escalation — a self-
-  # perpetuating storm (restarts are suppressed below, so the condition never
-  # self-clears, so it re-fires forever). A stable --fingerprint collapses the
-  # repeated detections into a single open escalation (same dedup the sibling
-  # deacon escalation already uses), and the body now names the offending
-  # agents + per-agent reason so the response is actionable.
-  {
-    echo "$TOTAL_ISSUES agent(s) down (>= mass-death threshold $MASS_DEATH_THRESHOLD)."
-    echo "Per-agent restarts are SUPPRESSED this cycle to avoid a restart storm."
-    echo "A count this high often means a systemic cause (OOM, dolt outage, host pressure) rather than independent crashes — investigate that first."
-    echo ""
-    echo "Crashed (session dead, work still on hook):"
-    if [ "${#CRASHED[@]}" -eq 0 ]; then
-      echo "  (none)"
-    else
-      for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
-        IFS='|' read -r C_SESSION C_RIG C_PCAT C_HOOK <<< "$ENTRY"
-        echo "  - $C_RIG/polecats/$C_PCAT (session=$C_SESSION, hook=$C_HOOK): session-dead"
-      done
-    fi
-    echo ""
-    echo "Stuck/zombie (runtime dead, work still on hook):"
-    if [ "${#STUCK[@]}" -eq 0 ]; then
-      echo "  (none)"
-    else
-      for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
-        IFS='|' read -r S_SESSION S_RIG S_PCAT S_HOOK S_REASON <<< "$ENTRY"
-        echo "  - $S_RIG/polecats/$S_PCAT (session=$S_SESSION, hook=$S_HOOK): ${S_REASON:-zombie}"
-      done
-    fi
-    echo ""
-    echo "Action: rule out a systemic cause, then recover the stranded work (gt deacon redispatch <bead> or witness recovery). Restarts stay suppressed until this clears; close the escalation once capacity is restored."
-  } | gt escalate "Mass agent death: $TOTAL_ISSUES agents down" \
-    -s CRITICAL \
-    --source "plugin:stuck-agent-dog" \
-    --fingerprint "stuck-agent-dog:mass-death" \
-    --stdin 2>/dev/null || true
+  if [ "$CONFIRMED_TOTAL" -lt "$MASS_DEATH_THRESHOLD" ]; then
+    log "NOTICE: mass-death candidates dropped to $CONFIRMED_TOTAL after live re-check; no CRITICAL escalation — any still-down agents restart normally below"
+  else
+    MASS_DEATH=1
+    log "MASS DEATH: $CONFIRMED_TOTAL agents down confirmed — escalating instead of restarting"
+
+    # feryn-l0ga: this escalation used to fire with an EMPTY body and NO
+    # --fingerprint, so (1) the mayor had to investigate blind which agents were
+    # "down", and (2) every 5m patrol that re-observed the same persistent
+    # crashed/stuck set spawned a BRAND-NEW CRITICAL escalation — a self-
+    # perpetuating storm (restarts are suppressed below, so the condition never
+    # self-clears, so it re-fires forever). A stable --fingerprint collapses the
+    # repeated detections into a single open escalation (same dedup the sibling
+    # deacon escalation already uses), and the body now names the offending
+    # agents + per-agent reason so the response is actionable.
+    {
+      echo "$CONFIRMED_TOTAL agent(s) confirmed down after a live re-check (>= mass-death threshold $MASS_DEATH_THRESHOLD)."
+      echo "Per-agent restarts are SUPPRESSED this cycle to avoid a restart storm."
+      echo "A count this high often means a systemic cause (OOM, dolt outage, host pressure) rather than independent crashes — investigate that first."
+      echo ""
+      echo "Crashed (session dead, work still on hook):"
+      if [ "${#CRASHED[@]}" -eq 0 ]; then
+        echo "  (none)"
+      else
+        for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
+          IFS='|' read -r C_SESSION C_RIG C_PCAT C_HOOK <<< "$ENTRY"
+          echo "  - $C_RIG/polecats/$C_PCAT (session=$C_SESSION, hook=$C_HOOK): session-dead"
+        done
+      fi
+      echo ""
+      echo "Stuck/zombie (runtime dead, work still on hook):"
+      if [ "${#STUCK[@]}" -eq 0 ]; then
+        echo "  (none)"
+      else
+        for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
+          IFS='|' read -r S_SESSION S_RIG S_PCAT S_HOOK S_REASON <<< "$ENTRY"
+          echo "  - $S_RIG/polecats/$S_PCAT (session=$S_SESSION, hook=$S_HOOK): ${S_REASON:-zombie}"
+        done
+      fi
+      echo ""
+      echo "Action: rule out a systemic cause, then recover the stranded work (gt deacon redispatch <bead> or witness recovery). Restarts stay suppressed until this clears; close the escalation once capacity is restored."
+    } | gt escalate "Mass agent death: $CONFIRMED_TOTAL agents down" \
+      -s CRITICAL \
+      --source "plugin:stuck-agent-dog" \
+      --fingerprint "stuck-agent-dog:mass-death" \
+      --stdin 2>/dev/null || true
+  fi
 fi
 
 # --- Take action --------------------------------------------------------------
