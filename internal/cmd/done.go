@@ -293,6 +293,20 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
 		if reviewOnlyPRHasFreshDecision(attachment, reviewDecisionFreshnessBaseline(issue, assignmentAt)) {
 			return "", false
 		}
+		// gfork-21p: when the PR MERGES during `gt done` (observed ~1s between
+		// merge and escalate), two things break the checks above: the local
+		// worktree HEAD advances to the merge commit so the head-anchored
+		// evidence comment no longer matches, and reviewOnlyPRHasFreshDecision
+		// races merge finalization on GitHub and fails safe to false. A merged PR
+		// trivially proves the review passed — merge safety is enforced
+		// independently by the merge gate (git.IsPullRequestApproved / refinery
+		// rejectMRBeforeMerge; see done.go's decision-freshness note above) — so
+		// close the review task cleanly instead of false-escalating. This is the
+		// PR-merge-completes-during-close variant distinct from 0070's renovate
+		// rebase; CHANGES_REQUESTED PRs never reach MERGED, so that gate is intact.
+		if reviewOnlyPRMerged(attachment) {
+			return "", false
+		}
 		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
 	}
 	return "", false
@@ -348,6 +362,31 @@ func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, since time
 		return false
 	}
 	return ok
+}
+
+// reviewOnlyPRMerged reports whether the PR referenced by a review-only bead's
+// pr_url var has already MERGED. A merged PR is proof the review passed, so the
+// review-only close gate can close the task cleanly without fresh bead-comment
+// evidence (gfork-21p). Returns false — never closes on this basis — when
+// pr_url is absent, the cwd cannot be resolved, or the gh lookup fails, so the
+// caller falls through to the escalate-and-hold path rather than false-closing.
+func reviewOnlyPRMerged(attachment *beads.AttachmentFields) bool {
+	if attachment == nil {
+		return false
+	}
+	prURL := attachedVarValue(attachment.AttachedVars, "pr_url")
+	if prURL == "" {
+		return false
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	merged, err := git.NewGit(cwd).IsPullRequestMerged(&git.PullRequestInfo{URL: prURL})
+	if err != nil {
+		return false
+	}
+	return merged
 }
 
 // attachedVarValue returns the value of a key=value entry in a bead's

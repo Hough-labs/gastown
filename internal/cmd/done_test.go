@@ -304,6 +304,77 @@ func TestReviewDecisionFreshnessBaseline(t *testing.T) {
 	}
 }
 
+// installMergedRacePRGHStub writes a fake `gh` that reproduces the PR-merge race
+// at close time: the review-decision query (`pr view --json reviews`) returns no
+// decisions (as if the query raced merge finalization), while the merged-state
+// query (`pr view --json state`) reports MERGED. Prepended to PATH.
+func installMergedRacePRGHStub(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	// `gh pr view <selector> --json <fields>`: $4 == "--json", $5 == fields.
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
+		"  case \"$*\" in\n" +
+		"    *state*) printf '%s\\n' '{\"state\":\"MERGED\"}'; exit 0 ;;\n" +
+		"    *reviews*) printf '%s\\n' '{\"reviews\":[]}'; exit 0 ;;\n" +
+		"  esac\n" +
+		"fi\n" +
+		"echo 'unexpected gh args' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// gfork-21p: a review-only bead whose PR MERGES during `gt done` must CLOSE, not
+// escalate. The merge advances the local HEAD (so the head-anchored comment
+// evidence misses) and the GitHub review-decision fallback races merge
+// finalization and finds nothing — yet the PR is merged, which proves the review
+// passed. The merged-state short-circuit closes the task cleanly.
+func TestReviewOnlyCloseAllowsMergedPRDuringCloseRace(t *testing.T) {
+	installMergedRacePRGHStub(t)
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		CreatedAt:   "2026-07-01T12:00:00Z",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
+		Assignee:    "gastown/polecats/nitro",
+		// No fresh bead-comment evidence; head advanced to the merge commit.
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "mergecommit")
+	if reason != "" || fatal {
+		t.Fatalf("merged PR must close the review task, not escalate: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+// A review-only bead whose PR is NOT merged and carries no fresh evidence must
+// still escalate — the merged short-circuit must not weaken the gate for open
+// PRs (e.g. a genuine CHANGES_REQUESTED that never reached MERGED).
+func TestReviewOnlyCloseUnmergedNoEvidenceStillEscalates(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n" +
+		"  case \"$*\" in\n" +
+		"    *state*) printf '%s\\n' '{\"state\":\"OPEN\"}'; exit 0 ;;\n" +
+		"    *reviews*) printf '%s\\n' '{\"reviews\":[]}'; exit 0 ;;\n" +
+		"  esac\n" +
+		"fi\n" +
+		"echo 'unexpected gh args' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0755); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		CreatedAt:   "2026-07-01T12:00:00Z",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/243\"]\n",
+		Assignee:    "gastown/polecats/nitro",
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("unmerged PR with no evidence must still escalate: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
 // Without a pr_url var there is nothing to check on GitHub; the gate falls back
 // to the existing evidence-missing escalation.
 func TestReviewOnlyCloseNoPRURLFallsThrough(t *testing.T) {

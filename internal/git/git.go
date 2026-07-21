@@ -1679,6 +1679,41 @@ func (g *Git) HasReviewDecisionSince(pr *PullRequestInfo, since time.Time) (bool
 	return false, nil
 }
 
+// IsPullRequestMerged reports whether the PR has been merged on GitHub.
+//
+// Used by the review-only close gate (gfork-21p): when a PR merges DURING
+// `gt done`, the reviewer's local worktree HEAD advances to the merge commit
+// (so the head-anchored bead-comment evidence check misses) and the
+// HasReviewDecisionSince fallback races merge finalization and fails safe to
+// false — together producing a spurious "no fresh review evidence" escalation
+// for a review that plainly succeeded. A merged PR is proof the review passed:
+// the merge gate (IsPullRequestApproved / refinery rejectMRBeforeMerge)
+// enforces approval independently before any merge. Kept deliberately narrow
+// (state only) and mirrors HasReviewDecisionSince's direct-selector query so it
+// needs no target-repo resolution.
+func (g *Git) IsPullRequestMerged(pr *PullRequestInfo) (bool, error) {
+	if pr == nil || (pr.Number == 0 && pr.URL == "") {
+		return false, fmt.Errorf("pull request identity is missing")
+	}
+	args := []string{"pr", "view", pullRequestSelector(pr), "--json", "state"}
+	if pr.BaseRepo != "" {
+		args = append(args, "--repo", pr.BaseRepo)
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("gh pr view failed: %w", err)
+	}
+	var result struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &result); err != nil {
+		return false, fmt.Errorf("failed to parse gh pr view output: %w", err)
+	}
+	return strings.EqualFold(result.State, "MERGED"), nil
+}
+
 // parseGitHubTime parses a GitHub RFC3339 timestamp, tolerating optional
 // fractional seconds.
 func parseGitHubTime(ts string) (time.Time, error) {
