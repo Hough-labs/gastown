@@ -225,6 +225,85 @@ func TestReviewOnlyCloseRejectsStaleGitHubDecision(t *testing.T) {
 	}
 }
 
+// feryn-5sa6: a renovate/auto-updating PR advances its head between review and
+// close; the witness re-hooks this same review bead, advancing attached_at PAST
+// the genuine review decision. Anchoring the decision-freshness check on the
+// immutable created_at keeps the completed review valid so the reviewer is not
+// looped. CHANGES_REQUESTED proves the review happened just as APPROVED does —
+// both close the review TASK (the merge gate keeps the PR blocked separately).
+func TestReviewOnlyCloseSurvivesReHookAfterReview(t *testing.T) {
+	for _, verdict := range []string{"APPROVED", "CHANGES_REQUESTED"} {
+		t.Run(verdict, func(t *testing.T) {
+			// Review submitted 12:05 — AFTER creation (12:00) but BEFORE the
+			// re-hook that advanced attached_at to 13:00 on the renovate head move.
+			installReviewGHStub(t, `[{"state":"`+verdict+`","submittedAt":"2026-07-01T12:05:00Z"}]`)
+			issue := &beads.Issue{
+				ID:          "gt-review",
+				CreatedAt:   "2026-07-01T12:00:00Z",
+				Description: "review_only: true\nattached_at: 2026-07-01T13:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/269\"]\n",
+				Assignee:    "gastown/polecats/nitro",
+			}
+			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "newhead")
+			if reason != "" || fatal {
+				t.Fatalf("re-hook after %s review must still close the task: reason=%q fatal=%v", verdict, reason, fatal)
+			}
+		})
+	}
+}
+
+// A decision that predates even the bead's creation is not evidence for THIS
+// review task — the relaxed created_at baseline must not false-close on an
+// ancient review left on a long-lived PR.
+func TestReviewOnlyClosePreCreationDecisionStillRejected(t *testing.T) {
+	installReviewGHStub(t, `[{"state":"APPROVED","submittedAt":"2026-06-01T00:00:00Z"}]`)
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		CreatedAt:   "2026-07-01T12:00:00Z",
+		Description: "review_only: true\nattached_at: 2026-07-01T13:00:00Z\nattached_vars: [\"pr_url=https://github.com/upstream/repo/pull/269\"]\n",
+		Assignee:    "gastown/polecats/nitro",
+	}
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "newhead")
+	if reason == "" || !fatal {
+		t.Fatalf("pre-creation review must not satisfy the task: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+func TestReviewDecisionFreshnessBaseline(t *testing.T) {
+	mustTime := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			t.Fatalf("parse %q: %v", s, err)
+		}
+		return ts
+	}
+	assign := mustTime("2026-07-01T13:00:00Z")
+
+	cases := []struct {
+		name  string
+		issue *beads.Issue
+		want  time.Time
+	}{
+		// Re-hook case: created_at precedes the advanced attached_at → use created_at.
+		{"created before assignment", &beads.Issue{CreatedAt: "2026-07-01T12:00:00Z"}, mustTime("2026-07-01T12:00:00Z")},
+		// Missing created_at → fall back to assignment.
+		{"missing created_at", &beads.Issue{}, assign},
+		// Unparseable created_at → fall back to assignment.
+		{"garbage created_at", &beads.Issue{CreatedAt: "not-a-time"}, assign},
+		// Clock skew: created_at after assignment → take the earlier (assignment).
+		{"created after assignment", &beads.Issue{CreatedAt: "2026-07-01T14:00:00Z"}, assign},
+		// Nil issue → assignment.
+		{"nil issue", nil, assign},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reviewDecisionFreshnessBaseline(tc.issue, assign)
+			if !got.Equal(tc.want) {
+				t.Fatalf("reviewDecisionFreshnessBaseline = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Without a pr_url var there is nothing to check on GitHub; the gate falls back
 // to the existing evidence-missing escalation.
 func TestReviewOnlyCloseNoPRURLFallsThrough(t *testing.T) {

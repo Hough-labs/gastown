@@ -1,7 +1,7 @@
 From 90c7b1e6ff124bb515731c54b8cf6d00df8eaf56 Mon Sep 17 00:00:00 2001
 From: Hunter B Hough <git@hough.ink>
 Date: Fri, 10 Jul 2026 00:05:14 -0400
-Subject: [PATCH 39/69] fix(test): materialize routed rig dir so
+Subject: [PATCH 39/70] fix(test): materialize routed rig dir so
  hasAssignedOpenWork test is macOS-hermetic (gfork-1bw)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

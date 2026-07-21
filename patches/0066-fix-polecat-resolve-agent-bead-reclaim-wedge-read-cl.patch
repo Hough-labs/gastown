@@ -1,7 +1,7 @@
 From 7ed899477d221ffb3406f6c225da5d88cb6be464 Mon Sep 17 00:00:00 2001
 From: mayor <git@hough.ink>
 Date: Mon, 20 Jul 2026 16:56:58 -0400
-Subject: [PATCH 66/69] =?UTF-8?q?fix(polecat):=20resolve=20agent-bead=20re?=
+Subject: [PATCH 66/70] =?UTF-8?q?fix(polecat):=20resolve=20agent-bead=20re?=
  =?UTF-8?q?claim=20wedge=20=E2=80=94=20read=20cleanup=5Fstatus=20from=20to?=
  =?UTF-8?q?wn=20store=20+=20reconcile=20empty/done?=
 MIME-Version: 1.0

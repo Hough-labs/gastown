@@ -278,7 +278,19 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
 		// head advances mid-review). Fall back to the PR's review decisions before
 		// declaring no evidence. Fails safe: a missing pr_url or any gh error
 		// yields no GitHub evidence and preserves the escalate-and-hold behavior.
-		if reviewOnlyPRHasFreshDecision(attachment, assignmentAt) {
+		//
+		// feryn-5sa6: anchor that fallback on the STABLE created_at baseline, not
+		// the assignment timestamp. Renovate/auto-updating PRs advance their head
+		// (rebase) between review and close; the witness re-hooks this same review
+		// bead on the head move, advancing attached_at PAST a genuine prior review
+		// decision (APPROVED or CHANGES_REQUESTED). Keyed on attached_at, that
+		// completed review then reads as "stale" -> re-dispatch -> loop (escalation
+		// spam + RESTART_POLECAT storms). A decision after the task was CREATED
+		// proves the review happened for THIS task. Merge safety is unaffected:
+		// closing the review TASK never merges the PR, and the merge gate
+		// (git.IsPullRequestApproved / refinery rejectMRBeforeMerge) still blocks
+		// CHANGES_REQUESTED and un-reviewed heads independently.
+		if reviewOnlyPRHasFreshDecision(attachment, reviewDecisionFreshnessBaseline(issue, assignmentAt)) {
 			return "", false
 		}
 		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
@@ -286,12 +298,40 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
 	return "", false
 }
 
+// reviewDecisionFreshnessBaseline returns the timestamp after which a GitHub
+// review decision proves THIS review task was performed: the earlier of the
+// bead's creation time and its assignment (attached_at) time.
+//
+// feryn-5sa6: attached_at advances every time the witness re-hooks a review
+// bead — which it does whenever a renovate/auto-updating PR rebases to a new
+// head. Anchoring the decision-freshness check on attached_at therefore
+// invalidates a genuine, already-completed review the moment the head moves,
+// looping the reviewer. created_at is immutable across re-hooks, so it is the
+// stable "this task exists since" anchor. Requiring the decision to still be
+// after created_at (rather than accepting any decision) keeps an ancient review
+// left on a long-lived PR from false-closing a freshly-created review task.
+// Falls back to assignmentAt when created_at is absent or unparseable.
+func reviewDecisionFreshnessBaseline(issue *beads.Issue, assignmentAt time.Time) time.Time {
+	if issue == nil {
+		return assignmentAt
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(issue.CreatedAt))
+	if err != nil {
+		return assignmentAt
+	}
+	if createdAt.Before(assignmentAt) {
+		return createdAt
+	}
+	return assignmentAt
+}
+
 // reviewOnlyPRHasFreshDecision reports whether the PR referenced by a
 // review-only bead's pr_url var carries a review decision submitted after the
-// bead was assigned (feryn-19i0). Returns false — never blocks — when pr_url is
-// absent, the cwd cannot be resolved, or gh fails, so the caller falls through
-// to the existing evidence-missing handling rather than false-closing.
-func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, assignmentAt time.Time) bool {
+// given baseline (feryn-19i0; baseline stabilized in feryn-5sa6). Returns
+// false — never blocks — when pr_url is absent, the cwd cannot be resolved, or
+// gh fails, so the caller falls through to the existing evidence-missing
+// handling rather than false-closing.
+func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, since time.Time) bool {
 	if attachment == nil {
 		return false
 	}
@@ -303,7 +343,7 @@ func reviewOnlyPRHasFreshDecision(attachment *beads.AttachmentFields, assignment
 	if err != nil {
 		return false
 	}
-	ok, err := git.NewGit(cwd).HasReviewDecisionSince(&git.PullRequestInfo{URL: prURL}, assignmentAt)
+	ok, err := git.NewGit(cwd).HasReviewDecisionSince(&git.PullRequestInfo{URL: prURL}, since)
 	if err != nil {
 		return false
 	}
